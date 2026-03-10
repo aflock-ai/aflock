@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aflock-ai/aflock/pkg/aflock/hook-output",
+  "$ref": "#/$defs/HookOutput",
+  "$defs": {
+    "DecisionOutput": {
+      "properties": {
+        "behavior": {
+          "type": "string"
+        },
+        "updatedInput": true,
+        "message": {
+          "type": "string"
+        },
+        "interrupt": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "behavior"
+      ]
+    },
+    "HookOutput": {
+      "properties": {
+        "continue": {
+          "type": "boolean"
+        },
+        "stopReason": {
+          "type": "string"
+        },
+        "suppressOutput": {
+          "type": "boolean"
+        },
+        "systemMessage": {
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "hookSpecificOutput": {
+          "$ref": "#/$defs/HookSpecificOutput"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "HookSpecificOutput": {
+      "properties": {
+        "hookEventName": {
+          "type": "string"
+        },
+        "permissionDecision": {
+          "type": "string"
+        },
+        "permissionDecisionReason": {
+          "type": "string"
+        },
+        "updatedInput": true,
+        "additionalContext": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/DecisionOutput"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "hookEventName"
+      ]
+    }
+  },
+  "title": "hook-output"
+}

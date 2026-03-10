@@ -1,182 +1,7 @@
----
-sidebar_position: 1
----
-
-# Policy Schema
-
-Complete reference for the `.aflock` policy file format.
-
-## Full Schema
-
-```json
-{
-  "version": "1.0",
-  "name": "string (required)",
-  "expires": "ISO-8601 datetime (optional)",
-
-  "identity": {
-    "allowedModels": ["glob-pattern", ...],
-    "allowedEnvironments": ["glob-pattern", ...],
-    "requiredTools": ["tool-name", ...]
-  },
-
-  "limits": {
-    "maxSpendUSD": { "value": 0.00, "enforcement": "fail-fast|post-hoc" },
-    "maxTokensIn": { "value": 0, "enforcement": "fail-fast|post-hoc" },
-    "maxTokensOut": { "value": 0, "enforcement": "fail-fast|post-hoc" },
-    "maxTurns": { "value": 0, "enforcement": "fail-fast|post-hoc" },
-    "maxWallTimeSeconds": { "value": 0, "enforcement": "fail-fast|post-hoc" },
-    "maxToolCalls": { "value": 0, "enforcement": "fail-fast|post-hoc" }
-  },
-
-  "tools": {
-    "allow": ["tool-name|glob", ...],
-    "deny": ["tool-name|glob", ...],
-    "requireApproval": ["tool:pattern", ...]
-  },
-
-  "files": {
-    "allow": ["glob-pattern", ...],
-    "deny": ["glob-pattern", ...],
-    "readOnly": ["glob-pattern", ...]
-  },
-
-  "domains": {
-    "allow": ["domain|glob", ...],
-    "deny": ["domain|glob", ...]
-  },
-
-  "grants": {
-    "secrets": { "allow": ["pattern", ...], "deny": ["pattern", ...] },
-    "apis": { "allow": ["url-pattern", ...] },
-    "storage": { "allow": ["uri-pattern", ...] }
-  },
-
-  "dataFlow": {
-    "classify": {
-      "label": ["source-pattern", ...]
-    },
-    "flowRules": [
-      { "deny": "source->destination", "message": "string" }
-    ]
-  },
-
-  "materialsFrom": {
-    "session": {
-      "path": "string",
-      "algorithm": "sha256",
-      "merkleTree": true
-    },
-    "git": {
-      "treeHash": "string",
-      "branch": "string"
-    }
-  },
-
-  "requiredAttestations": ["attestation-name", ...],
-
-  "evaluators": {
-    "rego": [
-      { "name": "string", "policy": "rego-source" }
-    ],
-    "ai": [
-      { "name": "string", "prompt": "string", "model": "string" }
-    ],
-    "grpc": [
-      { "name": "string", "endpoint": "host:port" }
-    ]
-  },
-
-  "sublayouts": [
-    {
-      "name": "string",
-      "policy": "path-to-policy",
-      "limits": { ... },
-      "inherit": ["section-name", ...],
-      "attestationPrefix": "string"
-    }
-  ],
-
-  "functionaries": [
-    {
-      "type": "publickey|keyless|x509|spiffe",
-      "...type-specific-fields": "..."
-    }
-  ]
-}
-```
-
-## Field Reference
-
-### Top-Level Fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `version` | string | Yes | Schema version. Currently `"1.0"` |
-| `name` | string | Yes | Human-readable policy name |
-| `expires` | string | No | ISO-8601 expiration datetime |
-
-### Limits
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `maxSpendUSD` | Limit | Maximum USD spend |
-| `maxTokensIn` | Limit | Maximum input tokens |
-| `maxTokensOut` | Limit | Maximum output tokens |
-| `maxTurns` | Limit | Maximum conversation turns |
-| `maxWallTimeSeconds` | Limit | Maximum wall clock time |
-| `maxToolCalls` | Limit | Maximum tool invocations |
-
-Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-hoc" }`
-
-### Enforcement Modes
-
-| Mode | Behavior | Check Timing |
-|------|----------|-------------|
-| `fail-fast` | Abort immediately | Every action |
-| `post-hoc` | Verify at end | Final verification |
-
-### Functionary Types
-
-**Public Key:**
-```json
-{ "type": "publickey", "publickeyid": "SHA256_OF_KEY" }
-```
-
-**Keyless (Sigstore):**
-```json
-{
-  "type": "keyless",
-  "issuer": "https://accounts.google.com",
-  "subject": "user@example.com"
-}
-```
-
-**SPIFFE:**
-```json
-{
-  "type": "spiffe",
-  "trustDomain": "aflock.ai",
-  "spiffeIdPattern": "spiffe://aflock.ai/agent/claude-*"
-}
-```
-
-**X.509:**
-```json
-{
-  "type": "x509",
-  "commonName": "*.example.com",
-  "organizations": ["Example Corp"]
-}
-```
-
-
-## Schema
-```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/aflock-ai/aflock/pkg/aflock/policy",
-  "$ref": "#/$defs/Policy",
+  "$id": "https://github.com/aflock-ai/aflock/pkg/aflock/session-state",
+  "$ref": "#/$defs/SessionState",
   "$defs": {
     "AIEvaluator": {
       "properties": {
@@ -195,6 +20,35 @@ Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-
       "required": [
         "name",
         "prompt"
+      ]
+    },
+    "ActionRecord": {
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "tool_input": true,
+        "decision": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "timestamp",
+        "tool_name",
+        "tool_use_id",
+        "decision"
       ]
     },
     "AllowDenyPolicy": {
@@ -510,6 +364,33 @@ Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-
       "additionalProperties": false,
       "type": "object"
     },
+    "MaterialClassification": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "digest": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "label",
+        "source",
+        "timestamp"
+      ]
+    },
     "MaterialsPolicy": {
       "properties": {
         "session": {
@@ -676,6 +557,101 @@ Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-
       "additionalProperties": false,
       "type": "object"
     },
+    "SessionMetrics": {
+      "properties": {
+        "tokensIn": {
+          "type": "integer"
+        },
+        "tokensOut": {
+          "type": "integer"
+        },
+        "costUSD": {
+          "type": "number"
+        },
+        "turns": {
+          "type": "integer"
+        },
+        "toolCalls": {
+          "type": "integer"
+        },
+        "tools": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "filesRead": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "filesWritten": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "tokensIn",
+        "tokensOut",
+        "costUSD",
+        "turns",
+        "toolCalls",
+        "tools"
+      ]
+    },
+    "SessionState": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "policy": {
+          "$ref": "#/$defs/Policy"
+        },
+        "policy_path": {
+          "type": "string"
+        },
+        "metrics": {
+          "$ref": "#/$defs/SessionMetrics"
+        },
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/ActionRecord"
+          },
+          "type": "array"
+        },
+        "materials": {
+          "items": {
+            "$ref": "#/$defs/MaterialClassification"
+          },
+          "type": "array"
+        },
+        "parent_session_id": {
+          "type": "string"
+        },
+        "child_session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "session_id",
+        "started_at",
+        "metrics"
+      ]
+    },
     "Step": {
       "properties": {
         "name": {
@@ -808,6 +784,6 @@ Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-
       "additionalProperties": false,
       "type": "object"
     }
-  }
+  },
+  "title": "session"
 }
-```

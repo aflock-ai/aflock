@@ -1,4 +1,4 @@
-.PHONY: build test clean pre-commit check-all unit-tests integration-tests lint coverage install-hooks help
+.PHONY: build test clean pre-commit check-all unit-tests integration-tests lint coverage install-hooks help docgen
 
 # Build variables
 BINARY_NAME=aflock
@@ -128,6 +128,17 @@ clean:
 
 tidy:
 	$(GOMOD) tidy
+
+#############################################################################
+# Documentation Generation
+#############################################################################
+
+docgen: ## Generate CLI reference and JSON schemas
+	go run ./docgen
+	@echo "$(GREEN)Documentation generated in docs/$(NC)"
+
+docgen-verify: ## Verify generated docs are up-to-date (for CI)
+	./docgen/verify.sh
 
 #############################################################################
 # Plugin Packaging

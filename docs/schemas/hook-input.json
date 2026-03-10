@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aflock-ai/aflock/pkg/aflock/hook-input",
+  "$ref": "#/$defs/HookInput",
+  "$defs": {
+    "HookInput": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "transcript_path": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "permission_mode": {
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_input": true,
+        "tool_response": true,
+        "tool_use_id": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "stop_hook_active": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "hook_event_name"
+      ]
+    }
+  },
+  "title": "hook-input"
+}
