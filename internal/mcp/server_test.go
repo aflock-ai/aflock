@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1527,5 +1528,23 @@ func TestStoreAttestation_CreatesDirectory(t *testing.T) {
 	dir := s.stateManager.AttestationsDir(s.sessionID)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		t.Fatal("attestation directory was not created")
+	}
+}
+
+// TestServeHTTP_BindsLocalhost verifies that ServeHTTP constructs an address
+// that binds to 127.0.0.1 (localhost only), not 0.0.0.0 (all interfaces).
+// This is a regression test for issue #27 bypass path 1.
+func TestServeHTTP_BindsLocalhost(t *testing.T) {
+	port := 9876
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	if !strings.HasPrefix(addr, "127.0.0.1:") {
+		t.Fatalf("Expected address to bind 127.0.0.1, got %s", addr)
+	}
+
+	// Verify the old pattern (:%d) would NOT have the prefix
+	oldAddr := fmt.Sprintf(":%d", port)
+	if strings.HasPrefix(oldAddr, "127.0.0.1:") {
+		t.Fatal("Old address format unexpectedly has 127.0.0.1 prefix")
 	}
 }

@@ -267,8 +267,8 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	sseServer := server.NewSSEServer(s.mcpServer)
 
 	// Set up HTTP handler
-	addr := fmt.Sprintf(":%d", port)
-	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://localhost%s/sse\n", addr)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://%s/sse\n", addr)
 	fmt.Fprintf(os.Stderr, "[aflock] Session ID: %s (state will persist across calls)\n", s.sessionID)
 
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP

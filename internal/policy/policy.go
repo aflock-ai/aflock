@@ -3,12 +3,19 @@ package policy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
+
+// ErrPolicyNotFound is returned when no policy file exists in the search path.
+// Callers should distinguish this from parse errors: a missing policy means
+// the user hasn't opted in (allow), while a malformed policy means the user
+// intended enforcement but the file is broken (deny).
+var ErrPolicyNotFound = fmt.Errorf("no policy file found")
 
 // DefaultPolicyNames are the filenames to search for policies.
 var DefaultPolicyNames = []string{
@@ -31,6 +38,9 @@ func Load(path string) (*aflock.Policy, string, error) {
 	// If path is a directory, search for policy files
 	info, err := os.Stat(path) //nolint:gosec // G703: path traversal taint from CLI config, not user-controlled
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, "", fmt.Errorf("stat path: %w: %w", err, ErrPolicyNotFound)
+		}
 		return nil, "", fmt.Errorf("stat path: %w", err)
 	}
 
@@ -65,7 +75,7 @@ func findPolicy(dir string) (string, error) {
 			return path, nil
 		}
 	}
-	return "", fmt.Errorf("no policy file found in %s (tried: %v)", dir, DefaultPolicyNames)
+	return "", fmt.Errorf("%w in %s (tried: %v)", ErrPolicyNotFound, dir, DefaultPolicyNames)
 }
 
 // LoadFromEnv loads a policy from the AFLOCK_POLICY environment variable path.

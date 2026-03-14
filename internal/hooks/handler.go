@@ -4,6 +4,7 @@ package hooks
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -95,8 +96,13 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	}
 
 	if err != nil {
-		// No policy found - this is OK, we just won't enforce
-		return output.WriteEmpty()
+		if errors.Is(err, policy.ErrPolicyNotFound) {
+			// No policy file exists — opt-in model, allow everything
+			return output.WriteEmpty()
+		}
+		// Policy file exists but is malformed — fail closed
+		output.ExitWithError(fmt.Sprintf("[aflock] Failed to load policy: %v", err))
+		return nil
 	}
 
 	if pol != nil && pol.IsExpired() {
@@ -235,8 +241,19 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 
 		if loadErr != nil {
-			// No policy found - allow everything
-			return output.Write(output.PreToolUseAllow())
+			if errors.Is(loadErr, policy.ErrPolicyNotFound) {
+				// No policy file exists — opt-in model, allow everything
+				return output.Write(output.PreToolUseAllow())
+			}
+			// Policy file exists but is malformed — fail closed
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] Failed to load policy: %v", loadErr)))
+		}
+		// Deny if policy has identity constraints but SessionStart was skipped —
+		// identity was never verified, so we cannot trust the agent.
+		if pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
+			return output.Write(output.PreToolUseDeny(
+				"[aflock] BLOCKED: policy requires identity verification but SessionStart was not called"))
 		}
 		if pol.IsExpired() {
 			return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
@@ -485,8 +502,17 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
 		if exceeded {
-			// Log warning but don't block session end
 			fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
+			// Record the violation in session state for audit trail
+			h.stateManager.RecordAction(sessionState, aflock.ActionRecord{
+				Timestamp: time.Now(),
+				ToolName:  "SessionEnd",
+				Decision:  string(aflock.DecisionDeny),
+				Reason:    fmt.Sprintf("post-hoc limit exceeded: %s - %s", limitName, msg),
+			})
+			if err := h.stateManager.Save(sessionState); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
+			}
 		}
 	}
 
@@ -509,10 +535,11 @@ func (h *Handler) handlePreCompact(_ *aflock.HookInput) error {
 	return output.WriteEmpty()
 }
 
-// findAttestation checks if an attestation file exists for the given name.
+// findAttestation checks if a structurally valid attestation file exists for the given name.
 // It first checks for exact filename matches (name.json, name.intoto.json),
 // then scans all .intoto.json files in the directory and checks if any
-// attestation's tool name matches the required name.
+// attestation's tool name matches the required name. Files must pass
+// structural validation (valid DSSE envelope with non-empty signatures).
 func findAttestation(dir, name string) bool {
 	// First try exact filename match
 	exactPaths := []string{
@@ -521,7 +548,10 @@ func findAttestation(dir, name string) bool {
 	}
 	for _, p := range exactPaths {
 		if _, err := os.Stat(p); err == nil {
-			return true
+			if validateAttestationIntegrity(p) {
+				return true
+			}
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation file %s exists but failed structural validation\n", p)
 		}
 	}
 
@@ -537,12 +567,55 @@ func findAttestation(dir, name string) bool {
 		if entry.IsDir() || !isAttestationFile(entry.Name()) {
 			continue
 		}
-		if attestationMatchesName(filepath.Join(dir, entry.Name()), name) {
-			return true
+		p := filepath.Join(dir, entry.Name())
+		if attestationMatchesName(p, name) {
+			if validateAttestationIntegrity(p) {
+				return true
+			}
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation file %s matches name %q but failed structural validation\n", p, name)
 		}
 	}
 
 	return false
+}
+
+// validateAttestationIntegrity performs structural validation on an attestation file.
+// It checks that the file is a valid DSSE envelope with:
+//   - A non-empty "payload" field
+//   - A non-empty "payloadType" field
+//   - A non-empty "signatures" array
+//
+// This does NOT perform cryptographic signature verification (that requires
+// trusted roots), but prevents accepting fake/empty/malformed attestation files.
+func validateAttestationIntegrity(path string) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation file path from state directory
+	if err != nil {
+		return false
+	}
+
+	var envelope struct {
+		Payload     string `json:"payload"`
+		PayloadType string `json:"payloadType"`
+		Signatures  []struct {
+			KeyID string `json:"keyid"`
+			Sig   string `json:"sig"`
+		} `json:"signatures"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	if envelope.Payload == "" {
+		return false
+	}
+	if envelope.PayloadType == "" {
+		return false
+	}
+	if len(envelope.Signatures) == 0 {
+		return false
+	}
+
+	return true
 }
 
 // isAttestationFile checks if a filename looks like an attestation file.
