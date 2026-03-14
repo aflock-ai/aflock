@@ -570,3 +570,68 @@ func TestBashAnalyzer_LegitimateCommands(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ExtractFileArgs – newly added file-reading commands (issue #25)
+// ---------------------------------------------------------------------------
+
+func TestExtractFileArgs_NewCommands(t *testing.T) {
+	analyzer := NewBashAnalyzer()
+
+	tests := []struct {
+		name    string
+		command string
+		want    []string
+	}{
+		{
+			name:    "grep extracts pattern and file path",
+			command: "grep pattern /etc/secret",
+			want:    []string{"pattern", "/etc/secret"},
+		},
+		{
+			name:    "sed extracts file arg",
+			command: "sed -i 's/x/y/' config.json",
+			want:    []string{"'s/x/y/'", "config.json"},
+		},
+		{
+			name:    "awk extracts file arg",
+			command: "awk '{print}' data.csv",
+			want:    []string{"'{print}'", "data.csv"},
+		},
+		{
+			name:    "cp extracts both source and destination",
+			command: "cp secrets/key.pem /tmp/",
+			want:    []string{"secrets/key.pem", "/tmp/"},
+		},
+		{
+			name:    "diff extracts both file paths",
+			command: "diff file1.txt file2.txt",
+			want:    []string{"file1.txt", "file2.txt"},
+		},
+		{
+			name:    "jq extracts filter and file path",
+			command: "jq '.key' config.json",
+			want:    []string{"'.key'", "config.json"},
+		},
+		// NOTE: dd uses if=/of= syntax (e.g. "dd if=/dev/zero of=output.bin").
+		// The current extractFileArgsFromSingleCmd implementation extracts
+		// non-flag arguments, so dd's if=/of= parameters are not correctly
+		// parsed as file paths. This is a known limitation.
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := analyzer.ExtractFileArgs(tt.command)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ExtractFileArgs(%q) = %v (len %d), want %v (len %d)",
+					tt.command, got, len(got), tt.want, len(tt.want))
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("ExtractFileArgs(%q)[%d] = %q, want %q",
+						tt.command, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

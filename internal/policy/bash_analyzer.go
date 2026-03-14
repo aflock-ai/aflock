@@ -532,6 +532,9 @@ var fileReadingCommands = map[string]bool{
 	"xxd": true, "strings": true, "od": true, "hexdump": true, "file": true,
 	"wc": true, "stat": true, "base64": true, "tac": true, "nl": true,
 	"sort": true, "uniq": true, "cut": true,
+	"grep": true, "sed": true, "awk": true, "gawk": true,
+	"cp": true, "mv": true, "jq": true, "diff": true,
+	"dd": true, "tar": true, "zip": true, "curl": true,
 }
 
 // ExtractFileArgs extracts file path arguments from a bash command string.

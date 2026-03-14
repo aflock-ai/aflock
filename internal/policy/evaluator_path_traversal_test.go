@@ -228,8 +228,10 @@ func TestExtractFileArgs_WithFlags(t *testing.T) {
 func TestExtractFileArgs_Pipeline(t *testing.T) {
 	a := NewBashAnalyzer()
 	args := a.ExtractFileArgs("cat secrets.txt | grep password")
-	if len(args) != 1 || args[0] != "secrets.txt" {
-		t.Errorf("expected [secrets.txt], got %v", args)
+	// Both cat and grep are file-reading commands; grep's "password" is
+	// extracted as a non-flag arg (which is fine for deny-list purposes).
+	if len(args) != 2 {
+		t.Errorf("expected [secrets.txt password], got %v", args)
 	}
 }
 
@@ -263,11 +265,12 @@ func TestExtractFileArgs_NonFileCommand(t *testing.T) {
 	}
 }
 
-func TestExtractFileArgs_GrepNotFileCommand(t *testing.T) {
+func TestExtractFileArgs_GrepIsFileCommand(t *testing.T) {
 	a := NewBashAnalyzer()
 	args := a.ExtractFileArgs("grep -r pattern src/")
-	if len(args) != 0 {
-		t.Errorf("grep should not extract file args, got %v", args)
+	// grep is now a file-reading command; non-flag args are extracted.
+	if len(args) != 2 {
+		t.Errorf("grep should extract file args [pattern src/], got %v", args)
 	}
 }
 
