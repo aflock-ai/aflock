@@ -287,6 +287,15 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 	// First evaluate tool/file access
 	decision, reason := evaluator.EvaluatePreToolUse(input.ToolName, input.ToolInput)
 
+	// If tool is allowed, check grants enforcement
+	if decision == aflock.DecisionAllow && pol.Grants != nil {
+		grantsDecision, grantsReason := evaluator.EvaluateGrants(input.ToolName, input.ToolInput)
+		if grantsDecision != aflock.DecisionAllow {
+			decision = grantsDecision
+			reason = grantsReason
+		}
+	}
+
 	// If tool is allowed, also check data flow rules
 	if decision == aflock.DecisionAllow {
 		flowDecision, flowReason, newMaterial := evaluator.EvaluateDataFlow(

