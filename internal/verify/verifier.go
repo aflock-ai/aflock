@@ -247,9 +247,9 @@ func (v *Verifier) VerifyAttestation(envelopePath string, pol *aflock.Policy) er
 		return fmt.Errorf("parse statement: %w", err)
 	}
 
-	// Verify statement type — accept both v1 (used by aflock signer) and v0.1 (used by witness workflow)
-	if statement.Type != attestation.StatementType && statement.Type != "https://in-toto.io/Statement/v0.1" {
-		return fmt.Errorf("invalid statement type: %s (expected %s or v0.1)", statement.Type, attestation.StatementType)
+	// Verify statement type — only accept v1 (v0.1 is deprecated and could allow downgrade attacks)
+	if statement.Type != attestation.StatementType {
+		return fmt.Errorf("invalid statement type: %s (expected %s)", statement.Type, attestation.StatementType)
 	}
 
 	// Verify signature against trusted certificates from policy roots
