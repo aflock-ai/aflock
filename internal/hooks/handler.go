@@ -99,6 +99,11 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return output.WriteEmpty()
 	}
 
+	if pol != nil && pol.IsExpired() {
+		output.ExitWithError(fmt.Sprintf("[aflock] Policy '%s' has expired (expired at %s)", pol.Name, pol.Expires.Format(time.RFC3339)))
+		return nil
+	}
+
 	// Discover agent identity
 	agentIdentity, err := identity.DiscoverAgentIdentity()
 	if err != nil {
@@ -233,11 +238,17 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 			// No policy found - allow everything
 			return output.Write(output.PreToolUseAllow())
 		}
+		if pol.IsExpired() {
+			return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
+		}
 		// Create ephemeral session state
 		sessionState = h.stateManager.Initialize(input.SessionID, pol, policyPath)
 	}
 
 	pol := sessionState.Policy
+	if pol.IsExpired() {
+		return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
+	}
 	// Use cwd as projectRoot when policy path is outside cwd (e.g., AFLOCK_POLICY env var
 	// pointing to a tenant-specific policy in a subdirectory). Otherwise use the policy
 	// file's directory (standard case where .aflock is at project root).
