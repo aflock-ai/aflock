@@ -444,6 +444,22 @@ type SessionState struct {
 	ParentSessionID string `json:"parent_session_id,omitempty"`
 	// ChildSessionIDs tracks subagent sessions spawned from this session
 	ChildSessionIDs []string `json:"child_session_ids,omitempty"`
+	// AgentIdentityMeta stores identity discovered at SessionStart for reuse in PostToolUse
+	AgentIdentityMeta *AgentIdentityMeta `json:"agent_identity_meta,omitempty"`
+}
+
+// AgentIdentityMeta stores agent identity metadata in session state.
+// This is a serializable subset of identity.AgentIdentity, saved at SessionStart
+// and reused in PostToolUse to avoid re-discovering identity per tool call.
+type AgentIdentityMeta struct {
+	Model        string `json:"model"`
+	ModelVersion string `json:"model_version,omitempty"`
+	BinaryName   string `json:"binary_name,omitempty"`
+	BinaryVer    string `json:"binary_version,omitempty"`
+	BinaryDigest string `json:"binary_digest,omitempty"`
+	Environment  string `json:"environment,omitempty"`
+	PolicyDigest string `json:"policy_digest,omitempty"`
+	IdentityHash string `json:"identity_hash"`
 }
 
 // PropagationRecord is written by a parent session's PreToolUse(Agent) hook

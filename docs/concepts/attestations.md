@@ -4,8 +4,8 @@ sidebar_position: 2
 
 # Attestations
 
-:::caution Active Development
-Attestation signing using DSSE envelopes is implemented. However, **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) and the **JWT + Signing Key Separation** model described below are not yet implemented — the current implementation has the agent directly holding the signing key. **Attestation generation in hooks mode** is also WIP ([#17](https://github.com/aflock-ai/aflock/issues/17)). Session Merkle trees are designed but not yet implemented. **We're looking for contributors in these areas.**
+:::info Implementation Status
+Attestation signing using DSSE envelopes is implemented in both **MCP server mode** and **hooks mode** ([#17](https://github.com/aflock-ai/aflock/issues/17)). Every `PostToolUse` hook generates a signed in-toto v1 attestation with the `action/v0.1` predicate type. Signing uses SPIRE X509-SVIDs when available, or an ephemeral ECDSA key as fallback. **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) and the **JWT + Signing Key Separation** model described below are not yet implemented. Session Merkle trees are designed but not yet implemented. **We're looking for contributors in these areas.**
 :::
 
 Every agent action produces a **cryptographically signed attestation** — an unforgeable record of what happened. aflock uses the [in-toto](https://in-toto.io/) attestation format wrapped in DSSE envelopes.

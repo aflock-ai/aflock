@@ -4,8 +4,8 @@ sidebar_position: 1
 
 # Claude Code Integration
 
-:::caution Active Development
-Hook-based constraint enforcement (tool allowlists, file access, limits) is working. **Attestation generation in hooks mode** is not yet implemented ([#17](https://github.com/aflock-ai/aflock/issues/17)). The MCP server exposes tools and identity discovery, but note that HTTP mode currently has no authentication ([#27](https://github.com/aflock-ai/aflock/issues/27)) — use stdio mode for now. Policy expiration is not yet enforced at runtime ([#18](https://github.com/aflock-ai/aflock/issues/18)).
+:::info Implementation Status
+Hook-based constraint enforcement (tool allowlists, file access, limits) and **attestation generation** are working. Every allowed tool call produces a signed in-toto v1 attestation stored in `~/.aflock/sessions/<id>/attestations/`. The MCP server exposes tools and identity discovery, but note that HTTP mode currently has no authentication ([#27](https://github.com/aflock-ai/aflock/issues/27)) — use stdio mode for now.
 :::
 
 aflock integrates with Claude Code through two mechanisms: **hooks** and **MCP server**. This tutorial covers both approaches.
@@ -26,7 +26,7 @@ PreToolUse         Check: tool allowed? file access OK? limits OK?
      |
 [Tool Executes]
      |
-PostToolUse        Record attestation for the action
+PostToolUse        Sign & store in-toto attestation for the action
      |
 PermissionRequest  Auto-approve/deny based on policy
      |
