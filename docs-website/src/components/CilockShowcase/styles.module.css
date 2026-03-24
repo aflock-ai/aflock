@@ -1,0 +1,91 @@
+.showcase {
+  padding: 4rem 0;
+  background: var(--ifm-background-surface-color);
+}
+
+.header {
+  text-align: center;
+  margin-bottom: 2.5rem;
+}
+
+.sectionTitle {
+  font-size: 2.2rem;
+  font-weight: 800;
+  margin-bottom: 0.25rem;
+}
+
+.sectionLead {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--ifm-color-primary);
+  margin-bottom: 1rem;
+}
+
+.sectionSubtitle {
+  max-width: 720px;
+  margin: 0 auto;
+  font-size: 1.05rem;
+  line-height: 1.7;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.layerCard {
+  padding: 1.5rem;
+  border-radius: 8px;
+  background: var(--ifm-background-color);
+  border: 1px solid var(--ifm-color-emphasis-200);
+  height: 100%;
+}
+
+.layerTitle {
+  font-size: 1.15rem;
+  margin-bottom: 0.5rem;
+}
+
+.attestationNote {
+  text-align: center;
+  margin-top: 2rem;
+  padding: 1.25rem 2rem;
+  border-radius: 8px;
+  background: var(--ifm-background-color);
+  border-left: 4px solid var(--ifm-color-primary);
+}
+
+.attestationNote p {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.tagline {
+  margin-top: 0.75rem !important;
+  font-weight: 600;
+  font-style: italic;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 2rem;
+  flex-wrap: wrap;
+}
+
+@media screen and (max-width: 996px) {
+  .showcase {
+    padding: 2rem 1rem;
+  }
+
+  .sectionTitle {
+    font-size: 1.8rem;
+  }
+
+  .layerCard {
+    margin-bottom: 1rem;
+  }
+
+  .links {
+    flex-direction: column;
+  }
+}

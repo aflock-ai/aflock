@@ -147,6 +147,10 @@ const config = {
                 label: 'Rookery',
                 href: 'https://github.com/aflock-ai/rookery',
               },
+              {
+                label: 'cilock',
+                href: 'https://github.com/aflock-ai/cilock-action',
+              },
             ],
           },
         ],
