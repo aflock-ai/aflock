@@ -4,8 +4,12 @@ sidebar_position: 1
 
 # Claude Code Integration
 
+:::info What's Working
+Hook-based constraint enforcement (tool allowlists, file access, limits), **attestation generation**, and **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) are implemented. Every allowed tool call produces a signed in-toto v1 attestation stored in `~/.aflock/sessions/<id>/attestations/`. The MCP server issues ES256 JWTs at session start, scoped to policy grants and validated per-request. Note that HTTP mode currently has no authentication ([#27](https://github.com/aflock-ai/aflock/issues/27)) — use stdio mode for now.
+:::
+
 :::caution Active Development
-Hook-based constraint enforcement (tool allowlists, file access, limits) is working. **Attestation generation in hooks mode** is not yet implemented ([#17](https://github.com/aflock-ai/aflock/issues/17)). The MCP server exposes tools and identity discovery, but note that HTTP mode currently has no authentication ([#27](https://github.com/aflock-ai/aflock/issues/27)) — use stdio mode for now. Policy expiration is not yet enforced at runtime ([#18](https://github.com/aflock-ai/aflock/issues/18)).
+Policy expiration is not yet enforced at runtime ([#18](https://github.com/aflock-ai/aflock/issues/18)).
 :::
 
 aflock integrates with Claude Code through two mechanisms: **hooks** and **MCP server**. This tutorial covers both approaches.
@@ -26,7 +30,7 @@ PreToolUse         Check: tool allowed? file access OK? limits OK?
      |
 [Tool Executes]
      |
-PostToolUse        Record attestation for the action
+PostToolUse        Sign & store in-toto attestation for the action
      |
 PermissionRequest  Auto-approve/deny based on policy
      |
@@ -106,11 +110,17 @@ aflock serve --policy .aflock
 |------|---------|
 | `get_identity` | Return the derived agent identity hash |
 | `get_policy` | Return the loaded policy document |
+| `get_token` | Get a JWT authorization token for this session |
 | `check_tool` | Pre-check whether a tool call would be allowed |
 | `bash` | Execute commands with policy enforcement |
 | `read_file` | Read files with access control |
 | `write_file` | Write files with access control |
 | `get_session` | Return current session metrics |
+| `sign_attestation` | Sign an attestation using SPIRE identity |
+
+### JWT Authorization in MCP Mode
+
+The MCP server initializes a JWT token issuer on startup. Call `get_token` to receive a session-scoped JWT, then include it as `_token` in all subsequent tool calls. See the [JWT Authorization tutorial](/docs/docs/tutorials/jwt-authorization) for a hands-on walkthrough.
 
 ### MCP vs Hooks
 

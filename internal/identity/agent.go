@@ -557,13 +557,17 @@ type Functionary struct {
 }
 
 // MatchesFunctionary checks if this agent identity matches a functionary constraint.
+// Note: keyless functionaries are verified at the attestation/signature level
+// (Fulcio cert extensions checked during DSSE signature verification in verify/keyless.go),
+// not at the agent identity level. This method only handles identity-based matching.
 func (a *AgentIdentity) MatchesFunctionary(f Functionary) bool {
 	// Check SPIFFE type functionary
 	if f.Type == "spiffe" {
 		return a.matchesSPIFFEFunctionary(f)
 	}
 
-	// For other types, we don't have the necessary info to match
+	// For other types (keyless, publickey, x509), matching happens at the
+	// signature/certificate level, not the agent identity level.
 	return false
 }
 

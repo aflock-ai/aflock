@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -15,10 +16,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"time"
 
 	"github.com/aflock-ai/rookery/attestation"
 	"github.com/aflock-ai/rookery/attestation/cryptoutil"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -35,9 +38,10 @@ const (
 
 // Signer creates and signs attestations.
 type Signer struct {
-	spireClient *identity.SpireClient
-	identity    *identity.Identity
-	modelName   string
+	spireClient      *identity.SpireClient
+	identity         *identity.Identity
+	modelName        string
+	fulcioX509Signer *cryptoutil.X509Signer // Non-nil when using Fulcio keyless signing
 }
 
 // NewSigner creates a new attestation signer.
@@ -60,6 +64,46 @@ func (s *Signer) Initialize(ctx context.Context) error {
 	}
 
 	s.identity = id
+	return nil
+}
+
+// InitializeEphemeral creates an ephemeral ECDSA signing key for environments
+// where SPIRE is not available. The key is generated fresh and not persisted.
+// This enables attestation signing in hooks mode without requiring SPIRE infrastructure.
+func (s *Signer) InitializeEphemeral(agentIdentityHash string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate ephemeral key: %w", err)
+	}
+
+	// Create a self-signed certificate for the ephemeral key
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return fmt.Errorf("create ephemeral certificate: %w", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return fmt.Errorf("parse ephemeral certificate: %w", err)
+	}
+
+	// Use agent identity hash as SPIFFE ID path
+	spiffeID, err := spiffeid.FromString(fmt.Sprintf("spiffe://aflock.ai/agent/ephemeral/%s", agentIdentityHash))
+	if err != nil {
+		spiffeID = spiffeid.RequireFromString("spiffe://aflock.ai/agent/ephemeral/unknown")
+	}
+
+	s.identity = &identity.Identity{
+		SPIFFEID:    spiffeID,
+		Certificate: cert,
+		PrivateKey:  key,
+		ExpiresAt:   template.NotAfter,
+	}
 	return nil
 }
 
@@ -229,16 +273,21 @@ func (s *Signer) CreateActionAttestation(
 
 // Sign signs a statement and returns a DSSE envelope.
 func (s *Signer) Sign(ctx context.Context, statement Statement) (*Envelope, error) {
-	// Get the appropriate signing identity (delegated or aflock's)
-	signingIdentity, _ := s.GetSigningIdentity()
-	if signingIdentity == nil {
-		return nil, fmt.Errorf("no signing identity available")
-	}
-
 	// Serialize statement
 	payload, err := json.Marshal(statement)
 	if err != nil {
 		return nil, fmt.Errorf("marshal statement: %w", err)
+	}
+
+	// Use Fulcio signing path if available (rookery signer handles its own hashing)
+	if s.IsFulcioSigning() {
+		return s.signFulcioEnvelope(PayloadType, payload)
+	}
+
+	// Get the appropriate signing identity (delegated or aflock's)
+	signingIdentity, _ := s.GetSigningIdentity()
+	if signingIdentity == nil {
+		return nil, fmt.Errorf("no signing identity available")
 	}
 
 	// Base64 encode payload

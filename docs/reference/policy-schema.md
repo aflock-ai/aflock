@@ -5,7 +5,7 @@ sidebar_position: 1
 # Policy Schema
 
 :::info Implementation Status
-The schema below represents the full target format. Fields that are parsed but **not yet enforced at runtime**: `expires` ([#18](https://github.com/aflock-ai/aflock/issues/18)), `grants` ([#22](https://github.com/aflock-ai/aflock/issues/22)), `evaluators.grpc` ([#21](https://github.com/aflock-ai/aflock/issues/21)), `evaluators.rego` and `evaluators.ai` at verification time ([#16](https://github.com/aflock-ai/aflock/issues/16)), `materialsFrom.session.merkleTree`, and `sublayouts.inherit`/`sublayouts.attestationPrefix` ([#26](https://github.com/aflock-ai/aflock/issues/26)). Functionary type `keyless` (Sigstore) is not yet implemented ([#20](https://github.com/aflock-ai/aflock/issues/20)).
+The schema below represents the full target format. Fields that are parsed but **not yet enforced at runtime**: `expires` ([#18](https://github.com/aflock-ai/aflock/issues/18)), `grants` ([#22](https://github.com/aflock-ai/aflock/issues/22)), `evaluators.grpc` ([#21](https://github.com/aflock-ai/aflock/issues/21)), `evaluators.rego` and `evaluators.ai` at verification time ([#16](https://github.com/aflock-ai/aflock/issues/16)), `materialsFrom.session.merkleTree`, and `sublayouts.inherit`/`sublayouts.attestationPrefix` ([#26](https://github.com/aflock-ai/aflock/issues/26)).
 :::
 
 Complete reference for the `.aflock` policy file format.

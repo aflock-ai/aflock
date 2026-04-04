@@ -1529,7 +1529,7 @@ func TestVerifyAttestation_WrongStatementType(t *testing.T) {
 	}
 }
 
-func TestVerifyAttestation_V01StatementType(t *testing.T) {
+func TestVerifyAttestation_V01StatementTypeRejected(t *testing.T) {
 	caCert, caKey := generateTestCA(t)
 
 	statement := map[string]interface{}{
@@ -1557,8 +1557,14 @@ func TestVerifyAttestation_V01StatementType(t *testing.T) {
 
 	v := NewVerifier()
 	err := v.VerifyAttestation(envelopePath, pol)
-	if err != nil {
-		t.Fatalf("VerifyAttestation with v0.1 type should succeed: %v", err)
+	if err == nil {
+		t.Fatal("Expected error for deprecated v0.1 statement type")
+	}
+	if !strings.Contains(err.Error(), "invalid statement type") {
+		t.Errorf("Error = %q, expected 'invalid statement type'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "v0.1") {
+		t.Errorf("Error = %q, expected it to mention the v0.1 type", err.Error())
 	}
 }
 

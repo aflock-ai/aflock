@@ -176,9 +176,32 @@ type Step struct {
 
 // StepFunctionary defines who can sign attestations for a step.
 type StepFunctionary struct {
-	Type           string          `json:"type"` // "root", "publickey"
+	Type           string          `json:"type"` // "root", "publickey", "keyless"
 	CertConstraint *CertConstraint `json:"certConstraint,omitempty"`
 	PublicKeyID    string          `json:"publickeyid,omitempty"`
+
+	// Keyless/Sigstore verification constraints (for type: "keyless")
+	// Issuer is the expected OIDC issuer URL embedded in the Fulcio certificate
+	// (e.g., "https://token.actions.githubusercontent.com")
+	Issuer string `json:"issuer,omitempty"`
+	// Subject is the expected OIDC subject (email or URI SAN), supports glob patterns
+	// (e.g., "https://github.com/aflock-ai/aflock/.github/workflows/*")
+	Subject string `json:"subject,omitempty"`
+	// FulcioExtensions constrains Fulcio-specific certificate extensions (GitHub Actions fields)
+	FulcioExtensions *FulcioExtensions `json:"fulcioExtensions,omitempty"`
+}
+
+// FulcioExtensions defines constraints on Fulcio certificate extensions.
+// All non-empty fields must match (AND logic). Supports glob patterns.
+type FulcioExtensions struct {
+	Issuer                   string `json:"issuer,omitempty"`
+	BuildTrigger             string `json:"buildTrigger,omitempty"`
+	SourceRepositoryURI      string `json:"sourceRepositoryURI,omitempty"`
+	SourceRepositoryRef      string `json:"sourceRepositoryRef,omitempty"`
+	SourceRepositoryOwnerURI string `json:"sourceRepositoryOwnerURI,omitempty"`
+	RunnerEnvironment        string `json:"runnerEnvironment,omitempty"`
+	BuildSignerURI           string `json:"buildSignerURI,omitempty"`
+	BuildSignerDigest        string `json:"buildSignerDigest,omitempty"`
 }
 
 // CertConstraint defines constraints on certificate attributes.
@@ -332,9 +355,11 @@ type RegoEvaluator struct {
 
 // AIEvaluator defines an AI-based evaluator.
 type AIEvaluator struct {
-	Name   string `json:"name"`
-	Prompt string `json:"prompt"`
-	Model  string `json:"model,omitempty"`
+	Name     string `json:"name"`
+	Prompt   string `json:"prompt"`
+	Model    string `json:"model,omitempty"`
+	Backend  string `json:"backend,omitempty"`  // "anthropic" (default) or "ollama"
+	Endpoint string `json:"endpoint,omitempty"` // Ollama server URL (default: http://localhost:11434)
 }
 
 // GRPCEvaluator defines a gRPC-based evaluator.
@@ -444,6 +469,25 @@ type SessionState struct {
 	ParentSessionID string `json:"parent_session_id,omitempty"`
 	// ChildSessionIDs tracks subagent sessions spawned from this session
 	ChildSessionIDs []string `json:"child_session_ids,omitempty"`
+	// AgentIdentityMeta stores identity discovered at SessionStart for reuse in PostToolUse
+	AgentIdentityMeta *AgentIdentityMeta `json:"agent_identity_meta,omitempty"`
+	// AuthToken is the JWT issued at SessionStart for request-level authorization.
+	// Scoped to the session, agent identity, and policy grants.
+	AuthToken string `json:"auth_token,omitempty"`
+}
+
+// AgentIdentityMeta stores agent identity metadata in session state.
+// This is a serializable subset of identity.AgentIdentity, saved at SessionStart
+// and reused in PostToolUse to avoid re-discovering identity per tool call.
+type AgentIdentityMeta struct {
+	Model        string `json:"model"`
+	ModelVersion string `json:"model_version,omitempty"`
+	BinaryName   string `json:"binary_name,omitempty"`
+	BinaryVer    string `json:"binary_version,omitempty"`
+	BinaryDigest string `json:"binary_digest,omitempty"`
+	Environment  string `json:"environment,omitempty"`
+	PolicyDigest string `json:"policy_digest,omitempty"`
+	IdentityHash string `json:"identity_hash"`
 }
 
 // PropagationRecord is written by a parent session's PreToolUse(Agent) hook

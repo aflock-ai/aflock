@@ -172,40 +172,37 @@ Agents receive a **JWT** for authentication, but attestations are signed by a **
 
 ![Credential Model](/img/diagrams/credential-model.svg)
 
-**JWT Structure:**
+**JWT Structure (Implemented):**
 
 ```json
 {
   "header": {
     "alg": "ES256",
     "typ": "JWT",
-    "kid": "aflock-issuer-key-1"
+    "kid": "ephemeral-ecdsa-p256"
   },
   "payload": {
     "iss": "aflock",
-    "sub": "agent:sha256:abc123...",
-    "aud": "aflock-server",
+    "sub": "spiffe://aflock.ai/agent/claude-opus/4.5/abc123",
+    "aud": ["session-uuid"],
     "exp": 1737244800,
     "iat": 1737241200,
+    "jti": "session-uuid",
 
-    "agent": {
-      "identity": "sha256:abc123...",
-      "model": "claude-opus-4-5-20251101",
-      "environment": "container:ghcr.io/org/runner",
-      "tools": ["Read", "Edit", "Bash"],
-      "policyDigest": "sha256:def456..."
+    "agent_id": "spiffe://aflock.ai/agent/claude-opus/4.5/abc123",
+    "identity_hash": "sha256:abc123...",
+
+    "allowed_tools": ["Read", "Edit", "Bash"],
+    "denied_tools": ["Task"],
+    "limits": {
+      "maxSpendUSD": { "value": 5.00, "enforcement": "fail-fast" }
     },
-
-    "grants": {
-      "secrets": ["vault:secret/data/readonly/*"],
-      "apis": ["https://api.anthropic.com/*"],
-      "storage": ["s3://attestations/${RUN_ID}/*"]
-    },
-
-    "scopes": ["attest", "sign", "verify"]
+    "policy_digest": "sha256:def456..."
   }
 }
 ```
+
+> **Note:** The `grants` (secrets/APIs/storage) and `scopes` fields from the original design are not yet in the JWT claims. Grant enforcement is handled by the policy evaluator at the server level ([#22](https://github.com/aflock-ai/aflock/issues/22)). Future iterations may embed grant scopes in the JWT for per-request enforcement.
 
 **Flow:**
 
@@ -229,26 +226,33 @@ Agents receive a **JWT** for authentication, but attestations are signed by a **
 4. **Identity binding**: JWT is bound to verified identity hash
 5. **Revocation**: Server can reject JWT before expiration
 
-**JWT Issuance:**
+**JWT Issuance (Implemented — `internal/auth/jwt.go`):**
 
 ```go
-// On MCP connection, after PID introspection
-func (s *Server) issueAgentJWT(identity *AgentIdentity, policy *Policy) (string, error) {
-    claims := &AgentClaims{
-        RegisteredClaims: jwt.RegisteredClaims{
-            Issuer:    "aflock",
-            Subject:   fmt.Sprintf("agent:%s", identity.Hash()),
-            Audience:  []string{"aflock-server"},
-            ExpiresAt: jwt.NewNumericDate(time.Now().Add(1 * time.Hour)),
-            IssuedAt:  jwt.NewNumericDate(time.Now()),
-        },
-        Agent:  identity,
-        Grants: policy.Grants,
-        Scopes: []string{"attest", "sign", "verify"},
-    }
+// TokenIssuer generates and validates session JWTs using ECDSA P-256.
+issuer, _ := auth.NewTokenIssuer() // Ephemeral key, never persisted
 
-    return jwt.NewWithClaims(jwt.SigningMethodES256, claims).
-        SignedString(s.jwtSigningKey)
+tokenStr, _ := issuer.IssueToken(
+    sessionID,                          // Bound to session (aud claim)
+    agentIdentity.ToSPIFFEID("aflock.ai"), // SPIFFE ID (sub claim)
+    agentIdentity.IdentityHash,         // Identity hash for verification
+    policy,                             // Scoped tools/limits from policy
+    1*time.Hour,                        // TTL (or policy maxWallTimeSeconds)
+)
+```
+
+**JWT Validation (per-request):**
+
+```go
+// Validate token signature, expiry, issuer, and session binding
+claims, err := issuer.ValidateTokenForSession(tokenStr, sessionID)
+if err != nil {
+    return fmt.Errorf("auth failed: %w", err)
+}
+
+// Check tool-level authorization from token scope
+if !auth.IsToolAllowed(toolName, claims.AllowedTools, claims.DeniedTools) {
+    return fmt.Errorf("tool %q not permitted by token scope", toolName)
 }
 ```
 
@@ -258,22 +262,13 @@ func (s *Server) issueAgentJWT(identity *AgentIdentity, policy *Policy) (string,
 // Agent requests signing, server performs it
 func (s *Server) signAttestation(jwt string, attestation *intoto.Statement) (*dsse.Envelope, error) {
     // Verify JWT
-    claims, err := s.verifyJWT(jwt)
+    claims, err := s.tokenIssuer.ValidateTokenForSession(jwt, s.sessionID)
     if err != nil {
         return nil, fmt.Errorf("invalid JWT: %w", err)
     }
 
-    // Get signing key for this agent identity
-    signingKey, err := s.getSigningKey(claims.Agent.Identity)
-    if err != nil {
-        return nil, fmt.Errorf("no signing key for agent: %w", err)
-    }
-
-    // Add identity to attestation
-    attestation.Predicate.Agent = claims.Agent
-
-    // Sign with server-held key
-    return dsse.Sign(attestation, signingKey)
+    // Sign with server-held key (agent never sees this key)
+    return s.signer.Sign(ctx, attestation)
 }
 ```
 

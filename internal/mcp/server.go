@@ -20,6 +20,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/aflock-ai/aflock/internal/attestation"
+	"github.com/aflock-ai/aflock/internal/auth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
@@ -42,6 +43,9 @@ type Server struct {
 	signingEnabled bool
 	attestDir      string     // Directory for storing step attestations by git tree hash
 	sessionMu      sync.Mutex // Protects session state access for dataFlow tracking
+
+	// JWT authorization
+	tokenIssuer *auth.TokenIssuer
 }
 
 // NewServer creates a new aflock MCP server.
@@ -139,6 +143,14 @@ func (s *Server) registerTools() {
 		s.handleGetSession,
 	)
 
+	// get_token - Get a JWT for authenticated MCP calls
+	s.mcpServer.AddTool(
+		mcp.NewTool("get_token",
+			mcp.WithDescription("Get a JWT authorization token for this session. The token encodes agent identity, policy scope, and allowed tools."),
+		),
+		s.handleGetToken,
+	)
+
 	// sign_attestation - Sign an attestation for arbitrary data
 	s.mcpServer.AddTool(
 		mcp.NewTool("sign_attestation",
@@ -207,6 +219,13 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
+	// Initialize JWT authorization
+	if err := s.initAuth(); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] JWT authorization enabled\n")
+	}
+
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
@@ -252,6 +271,13 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		}
 	}
 
+	// Initialize JWT authorization
+	if err := s.initAuth(); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] JWT authorization enabled\n")
+	}
+
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
@@ -267,8 +293,8 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	sseServer := server.NewSSEServer(s.mcpServer)
 
 	// Set up HTTP handler
-	addr := fmt.Sprintf(":%d", port)
-	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://localhost%s/sse\n", addr)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://%s/sse\n", addr)
 	fmt.Fprintf(os.Stderr, "[aflock] Session ID: %s (state will persist across calls)\n", s.sessionID)
 
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
@@ -285,6 +311,101 @@ func (s *Server) computePolicyDigest() string {
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+// initAuth initializes the JWT token issuer. If SPIRE is available and provides
+// a signing key, it is used; otherwise an ephemeral ECDSA P-256 key is generated.
+func (s *Server) initAuth() error {
+	// For now, always use ephemeral key. When SPIRE integration provides a
+	// crypto.Signer, use auth.NewTokenIssuerFromSigner instead.
+	issuer, err := auth.NewTokenIssuer()
+	if err != nil {
+		return fmt.Errorf("create token issuer: %w", err)
+	}
+	s.tokenIssuer = issuer
+	return nil
+}
+
+// handleGetToken issues a JWT for the current session.
+func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if s.tokenIssuer == nil {
+		return mcp.NewToolResultError("Token issuer not initialized"), nil
+	}
+
+	ttl := 1 * time.Hour
+	if s.policy != nil && s.policy.Limits != nil && s.policy.Limits.MaxWallTimeSeconds != nil {
+		ttl = time.Duration(s.policy.Limits.MaxWallTimeSeconds.Value) * time.Second
+	}
+
+	agentID := "unknown"
+	identityHash := ""
+	if s.agentIdentity != nil {
+		if spiffeID, err := s.agentIdentity.ToSPIFFEID("aflock.ai"); err == nil {
+			agentID = spiffeID.String()
+		}
+		identityHash = s.agentIdentity.IdentityHash
+	}
+
+	tokenStr, err := s.tokenIssuer.IssueToken(
+		s.sessionID,
+		agentID,
+		identityHash,
+		s.policy,
+		ttl,
+	)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to issue token: %v", err)), nil
+	}
+
+	// Also store in session state
+	s.sessionMu.Lock()
+	sessionState, _ := s.stateManager.Load(s.sessionID)
+	if sessionState != nil {
+		sessionState.AuthToken = tokenStr
+		_ = s.stateManager.Save(sessionState)
+	}
+	s.sessionMu.Unlock()
+
+	result := map[string]any{
+		"token":     tokenStr,
+		"expiresIn": ttl.String(),
+		"sessionId": s.sessionID,
+	}
+	data, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+// validateJWT validates a JWT token from a tool call request.
+// Returns the claims if valid, nil if auth is not active, or an error if the
+// token is present but invalid. Auth is only enforced when a token has been
+// issued for the session (graceful adoption — existing clients without tokens
+// continue to work until they call get_token).
+func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, error) {
+	if s.tokenIssuer == nil {
+		return nil, nil // Auth not initialized, skip validation
+	}
+
+	tokenStr, _ := request.GetArguments()["_token"].(string)
+	if tokenStr == "" {
+		// Check if a token has been issued for this session.
+		// If no token was issued yet, allow unauthenticated access (graceful adoption).
+		s.sessionMu.Lock()
+		sessionState, _ := s.stateManager.Load(s.sessionID)
+		hasToken := sessionState != nil && sessionState.AuthToken != ""
+		s.sessionMu.Unlock()
+
+		if hasToken {
+			return nil, fmt.Errorf("missing auth token (_token parameter)")
+		}
+		return nil, nil // No token issued yet, skip enforcement
+	}
+
+	claims, err := s.tokenIssuer.ValidateTokenForSession(tokenStr, s.sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("auth failed: %w", err)
+	}
+
+	return claims, nil
 }
 
 // signAndStoreAttestation creates a signed attestation for an action and stores it to disk.
@@ -400,6 +521,13 @@ func (s *Server) handleCheckTool(ctx context.Context, request mcp.CallToolReques
 
 // handleBash executes a command with policy enforcement.
 func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit,gocyclo,funlen // bash handler requires complex policy + execution logic
+	// JWT authorization check
+	if claims, err := s.validateJWT(request); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
+	} else if claims != nil && !auth.IsToolAllowed("Bash", claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError("Authorization denied: tool 'Bash' not permitted by token scope"), nil
+	}
+
 	command := request.GetString("command", "")
 	timeoutSec := request.GetFloat("timeout", 30)
 	workdir := request.GetString("workdir", "")
@@ -646,6 +774,13 @@ func (s *Server) storeStepAttestation(envelope any, treeHash, step string) error
 
 // handleReadFile reads a file with policy enforcement.
 func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// JWT authorization check
+	if claims, err := s.validateJWT(request); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
+	} else if claims != nil && !auth.IsToolAllowed("Read", claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError("Authorization denied: tool 'Read' not permitted by token scope"), nil
+	}
+
 	filePath := request.GetString("path", "")
 
 	// Resolve path
@@ -731,6 +866,13 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 
 // handleWriteFile writes content to a file with policy enforcement.
 func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit,funlen // file write handler has complex policy + attestation logic
+	// JWT authorization check
+	if claims, err := s.validateJWT(request); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
+	} else if claims != nil && !auth.IsToolAllowed("Write", claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError("Authorization denied: tool 'Write' not permitted by token scope"), nil
+	}
+
 	filePath := request.GetString("path", "")
 	content := request.GetString("content", "")
 
@@ -878,6 +1020,13 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 
 // handleSignAttestation signs an attestation for arbitrary data.
 func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit // attestation signing requires complex validation
+	// JWT authorization check — signing is the most sensitive operation
+	if claims, err := s.validateJWT(request); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
+	} else if claims != nil && !auth.IsToolAllowed("sign_attestation", claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError("Authorization denied: tool 'sign_attestation' not permitted by token scope"), nil
+	}
+
 	if !s.signingEnabled {
 		return mcp.NewToolResultError("Attestation signing not available (SPIRE not connected)"), nil
 	}

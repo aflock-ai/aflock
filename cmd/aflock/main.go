@@ -21,6 +21,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/mcp"
 	"github.com/aflock-ai/aflock/internal/plan"
 	"github.com/aflock-ai/aflock/internal/policy"
+	"github.com/aflock-ai/aflock/internal/replay"
 	"github.com/aflock-ai/aflock/internal/verify"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -103,22 +104,42 @@ var initCmd = &cobra.Command{
 var verifyPolicyPath string
 var verifyAttestDir string
 var verifyTreeHash string
+var verifySessionID string
+var verifySkipAI bool
 
 var verifyCmd = &cobra.Command{
 	Use:   "verify",
 	Short: "Verify step attestations against policy",
-	Long: `Verify step attestations for a git tree hash against a policy.
+	Long: `Verify attestations against a policy.
 
-Uses the current git tree hash if --tree-hash is not specified.
-
-The policy defines required steps (e.g., lint, test, build) and the
-verify command checks that attestations exist and are valid for each step.
+Supports two verification modes:
+  - Step-based: Verify step attestations for a git tree hash (default)
+  - Session-based: Verify a session's compliance with policy constraints
 
 Examples:
   aflock verify --policy .aflock                     # Verify steps for current git HEAD
   aflock verify --policy .aflock --tree-hash abc123  # Verify specific tree hash
+  aflock verify --session <session-id>               # Verify a session (Phase 2-4)
   aflock verify -p policy.json -a ./attestations     # Custom attestation directory`,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, args []string) { //nolint:gocyclo // verify command handles two modes
+		// Session-based verification mode
+		if verifySessionID != "" {
+			verifier := verify.NewVerifier()
+			verifier.SkipAI = verifySkipAI
+			result, err := verifier.VerifySession(verifySessionID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Session verification failed: %v\n", err)
+				os.Exit(1)
+			}
+			output, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(output))
+			if !result.Success {
+				os.Exit(1)
+			}
+			return
+		}
+
+		// Step-based verification mode (default)
 		if verifyPolicyPath == "" {
 			// Try to find policy in current directory
 			cwd, _ := os.Getwd()
@@ -502,6 +523,103 @@ Examples:
 	},
 }
 
+var replaySessionPath string
+var replayPolicyPath string
+var replayFormat string
+var replaySimulate bool
+
+var replayCmd = &cobra.Command{
+	Use:   "replay",
+	Short: "Replay a Claude session against an aflock policy",
+	Long: `Replay a recorded Claude Code session (.jsonl) against an aflock policy.
+
+Parses every tool call from the session and evaluates it against the policy
+deterministically. Shows which actions would be allowed, denied, or require
+approval.
+
+Examples:
+  aflock replay --session ~/.claude/projects/.../session.jsonl --policy .aflock
+  aflock replay --session session.jsonl --policy strict.aflock --format json
+  aflock replay --session session.jsonl --policy .aflock --simulate`,
+	Run: func(cmd *cobra.Command, args []string) {
+		if replaySessionPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: --session is required")
+			fmt.Fprintln(os.Stderr, "Usage: aflock replay --session <session.jsonl> --policy <policy.aflock>")
+			os.Exit(1)
+		}
+
+		// Parse session
+		session, err := replay.ParseSession(replaySessionPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing session: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(session.Actions) == 0 {
+			fmt.Fprintln(os.Stderr, "No tool calls found in session file.")
+			os.Exit(0)
+		}
+
+		// Load policy
+		polPath := replayPolicyPath
+		if polPath == "" {
+			cwd, _ := os.Getwd()
+			polPath = cwd
+		}
+
+		pol, resolvedPath, err := policy.Load(polPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading policy: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Simulate mode: full hook lifecycle with attestations
+		if replaySimulate {
+			simReport, err := replay.Simulate(session, pol, resolvedPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error running simulation: %v\n", err)
+				os.Exit(1)
+			}
+
+			switch replayFormat {
+			case "json":
+				output, err := simReport.FormatJSON()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error formatting JSON: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println(output)
+			default:
+				fmt.Print(simReport.FormatSimulateText())
+			}
+
+			if simReport.DenyCount > 0 {
+				os.Exit(1)
+			}
+			return
+		}
+
+		// Validator mode: report only
+		report := replay.Run(session, pol, resolvedPath)
+
+		switch replayFormat {
+		case "json":
+			output, err := report.FormatJSON()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error formatting JSON: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(output)
+		default:
+			fmt.Print(report.FormatText())
+		}
+
+		if report.DenyCount > 0 {
+			os.Exit(1)
+		}
+	},
+}
+
 var servePolicyPath string
 var serveHTTPPort int
 
@@ -557,6 +675,7 @@ func init() {
 	rootCmd.AddCommand(signCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(planToPolicyCmd)
+	rootCmd.AddCommand(replayCmd)
 
 	// Add --hook flag as alternative to hook subcommand for backwards compatibility
 	rootCmd.Flags().StringVar(&hookFlag, "hook", "", "Hook event to handle (alternative to 'hook' subcommand)")
@@ -565,6 +684,8 @@ func init() {
 	verifyCmd.Flags().StringVarP(&verifyPolicyPath, "policy", "p", "", "Path to .aflock policy file (enables step-based verification)")
 	verifyCmd.Flags().StringVarP(&verifyAttestDir, "attestations", "a", "", "Attestations directory (default: ~/.aflock/attestations)")
 	verifyCmd.Flags().StringVar(&verifyTreeHash, "tree-hash", "", "Git tree hash to verify (default: current HEAD)")
+	verifyCmd.Flags().StringVar(&verifySessionID, "session", "", "Session ID to verify (session-based verification mode)")
+	verifyCmd.Flags().BoolVar(&verifySkipAI, "skip-ai", false, "Skip Phase 5 (AI Evaluation) — saves cost, no network needed")
 
 	// Sign command flags
 	signCmd.Flags().StringVarP(&signKeyPath, "key", "k", "", "Path to ECDSA private key PEM file (or set AFLOCK_SIGNING_KEY)")
@@ -578,6 +699,12 @@ func init() {
 	planToPolicyCmd.Flags().BoolVar(&planLimits, "limits", false, "Add default spend/turn limits")
 	planToPolicyCmd.Flags().StringVar(&planModel, "model", "", "AI evaluator model (default: claude-opus-4-5-20251101)")
 	planToPolicyCmd.Flags().BoolVar(&planList, "list", false, "List available plans from .claude/plans/ (project) and ~/.claude/plans/ (global)")
+
+	// Replay command flags
+	replayCmd.Flags().StringVar(&replaySessionPath, "session", "", "Path to Claude session .jsonl file (required)")
+	replayCmd.Flags().StringVar(&replayPolicyPath, "policy", "", "Path to .aflock policy file (default: .aflock in current directory)")
+	replayCmd.Flags().StringVar(&replayFormat, "format", "text", "Output format: text or json")
+	replayCmd.Flags().BoolVar(&replaySimulate, "simulate", false, "Run full simulation: produce session state + signed attestations")
 
 	// Serve command flags
 	serveCmd.Flags().StringVarP(&servePolicyPath, "policy", "p", "", "Path to .aflock policy file")

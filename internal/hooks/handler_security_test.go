@@ -525,7 +525,7 @@ func TestSecurity_R3_286_CorruptedSessionPolicyFailsOpen(t *testing.T) {
 // This means an attacker who corrupts the policy file gets zero enforcement.
 // =============================================================================
 
-func TestSecurity_R3_287_MalformedPolicyFileFailsOpen(t *testing.T) {
+func TestSecurity_R3_287_MalformedPolicyFileFailsClosed(t *testing.T) {
 	// Create a directory with a malformed .aflock file
 	policyDir := t.TempDir()
 	os.WriteFile(
@@ -536,50 +536,69 @@ func TestSecurity_R3_287_MalformedPolicyFileFailsOpen(t *testing.T) {
 
 	h := newTestHandler(t)
 
-	// handleSessionStart tries to load policy from cwd
+	// Test handlePreToolUse with malformed policy — should DENY
 	input := &aflock.HookInput{
 		SessionID: "session-malformed-policy",
 		Cwd:       policyDir,
-	}
-
-	got := captureStdout(t, func() {
-		if err := h.handleSessionStart(input); err != nil {
-			t.Fatalf("handleSessionStart: %v", err)
-		}
-	})
-
-	// The handler returns empty JSON (no policy loaded, no enforcement)
-	if got != "{}" {
-		t.Logf("Output: %s", got)
-	}
-
-	// Now verify that subsequent PreToolUse calls get no enforcement
-	input2 := &aflock.HookInput{
-		SessionID: "session-malformed-policy",
-		Cwd:       policyDir, // Still has malformed .aflock
 		ToolName:  "Bash",
 		ToolInput: json.RawMessage(`{"command": "rm -rf /"}`),
 	}
 
-	// The ephemeral session path will also fail to load the malformed policy
-	got2 := captureStdout(t, func() {
-		if err := h.handlePreToolUse(input2); err != nil {
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(input); err != nil {
 			t.Fatalf("handlePreToolUse: %v", err)
 		}
 	})
 
 	var out aflock.HookOutput
-	if err := json.Unmarshal([]byte(got2), &out); err != nil {
-		t.Fatalf("parse: %v (raw: %s)", err, got2)
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
 	}
 
-	// BUG: Tool is allowed because policy.Load failed on malformed JSON
+	// FIX: Malformed policy now fails closed — tool is DENIED
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Fatalf("Expected malformed policy to deny Bash, got %s",
+			out.HookSpecificOutput.PermissionDecision)
+	}
+
+	t.Logf("FIXED R3-287: Malformed .aflock file now fails closed (decision=%s)",
+		out.HookSpecificOutput.PermissionDecision)
+}
+
+// TestSecurity_R3_287_NoPolicyFileAllows verifies that the opt-in model
+// is preserved: when no .aflock file exists, tools are allowed.
+func TestSecurity_R3_287_NoPolicyFileAllows(t *testing.T) {
+	// Create an empty directory — no .aflock file
+	emptyDir := t.TempDir()
+
+	h := newTestHandler(t)
+
+	input := &aflock.HookInput{
+		SessionID: "session-no-policy",
+		Cwd:       emptyDir,
+		ToolName:  "Bash",
+		ToolInput: json.RawMessage(`{"command": "echo hello"}`),
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(input); err != nil {
+			t.Fatalf("handlePreToolUse: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+
+	// No policy file = opt-in model = allow
 	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionAllow {
-		t.Skipf("Malformed policy now blocks -- got %s", out.HookSpecificOutput.PermissionDecision)
+		t.Fatalf("Expected no-policy directory to allow Bash, got %s",
+			out.HookSpecificOutput.PermissionDecision)
 	}
 
-	t.Logf("SECURITY BUG R3-287: Malformed .aflock file causes fail-open "+
-		"(Bash rm -rf / allowed, decision=%s)", out.HookSpecificOutput.PermissionDecision)
+	t.Logf("Opt-in model preserved: no .aflock file → allow (decision=%s)",
+		out.HookSpecificOutput.PermissionDecision)
 }
 
 // =============================================================================

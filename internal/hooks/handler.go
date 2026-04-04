@@ -2,8 +2,10 @@
 package hooks
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aflock-ai/aflock/internal/attestation"
+	"github.com/aflock-ai/aflock/internal/auth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
@@ -95,8 +99,13 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	}
 
 	if err != nil {
-		// No policy found - this is OK, we just won't enforce
-		return output.WriteEmpty()
+		if errors.Is(err, policy.ErrPolicyNotFound) {
+			// No policy file exists — opt-in model, allow everything
+			return output.WriteEmpty()
+		}
+		// Policy file exists but is malformed — fail closed
+		output.ExitWithError(fmt.Sprintf("[aflock] Failed to load policy: %v", err))
+		return nil
 	}
 
 	if pol != nil && pol.IsExpired() {
@@ -123,6 +132,25 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	// Initialize session state
 	sessionState := h.stateManager.Initialize(input.SessionID, pol, policyPath)
 
+	// Save agent identity metadata for reuse in PostToolUse attestations
+	sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
+		Model:        agentIdentity.Model,
+		ModelVersion: agentIdentity.ModelVersion,
+		IdentityHash: agentIdentity.IdentityHash,
+		PolicyDigest: agentIdentity.PolicyDigest,
+		Environment: func() string {
+			if agentIdentity.Environment != nil {
+				return agentIdentity.Environment.Type
+			}
+			return ""
+		}(),
+	}
+	if agentIdentity.Binary != nil {
+		sessionState.AgentIdentityMeta.BinaryName = agentIdentity.Binary.Name
+		sessionState.AgentIdentityMeta.BinaryVer = agentIdentity.Binary.Version
+		sessionState.AgentIdentityMeta.BinaryDigest = agentIdentity.Binary.Digest
+	}
+
 	// Check for propagation from a parent session (sublayout delegation).
 	// If found, inherit materials and attenuate limits.
 	if prop, propErr := h.stateManager.ReadPropagation(policyPath); propErr != nil {
@@ -136,6 +164,35 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		}
 		fmt.Fprintf(os.Stderr, "[aflock] Inherited %d materials from parent session %s\n",
 			len(prop.Materials), prop.ParentSessionID)
+	}
+
+	// Issue JWT for this session — binds agent identity, policy, and grants
+	issuer, jwtErr := auth.NewTokenIssuer()
+	if jwtErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to create token issuer: %v\n", jwtErr)
+	} else {
+		ttl := 1 * time.Hour
+		if pol.Limits != nil && pol.Limits.MaxWallTimeSeconds != nil {
+			ttl = time.Duration(pol.Limits.MaxWallTimeSeconds.Value) * time.Second
+		}
+
+		agentSPIFFEID := "unknown"
+		if spiffeID, spiffeErr := agentIdentity.ToSPIFFEID("aflock.ai"); spiffeErr == nil {
+			agentSPIFFEID = spiffeID.String()
+		}
+		token, tokenErr := issuer.IssueToken(
+			input.SessionID,
+			agentSPIFFEID,
+			agentIdentity.IdentityHash,
+			pol,
+			ttl,
+		)
+		if tokenErr != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to issue JWT: %v\n", tokenErr)
+		} else {
+			sessionState.AuthToken = token
+			fmt.Fprintf(os.Stderr, "[aflock] JWT issued for session %s (ttl=%s)\n", input.SessionID, ttl)
+		}
 	}
 
 	if err := h.stateManager.Save(sessionState); err != nil {
@@ -235,8 +292,19 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 
 		if loadErr != nil {
-			// No policy found - allow everything
-			return output.Write(output.PreToolUseAllow())
+			if errors.Is(loadErr, policy.ErrPolicyNotFound) {
+				// No policy file exists — opt-in model, allow everything
+				return output.Write(output.PreToolUseAllow())
+			}
+			// Policy file exists but is malformed — fail closed
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] Failed to load policy: %v", loadErr)))
+		}
+		// Deny if policy has identity constraints but SessionStart was skipped —
+		// identity was never verified, so we cannot trust the agent.
+		if pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
+			return output.Write(output.PreToolUseDeny(
+				"[aflock] BLOCKED: policy requires identity verification but SessionStart was not called"))
 		}
 		if pol.IsExpired() {
 			return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
@@ -269,6 +337,15 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 
 	// First evaluate tool/file access
 	decision, reason := evaluator.EvaluatePreToolUse(input.ToolName, input.ToolInput)
+
+	// If tool is allowed, check grants enforcement
+	if decision == aflock.DecisionAllow && pol.Grants != nil {
+		grantsDecision, grantsReason := evaluator.EvaluateGrants(input.ToolName, input.ToolInput)
+		if grantsDecision != aflock.DecisionAllow {
+			decision = grantsDecision
+			reason = grantsReason
+		}
+	}
 
 	// If tool is allowed, also check data flow rules
 	if decision == aflock.DecisionAllow {
@@ -358,7 +435,148 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// Create and store attestation for this tool call
+	h.createAttestation(sessionState, input)
+
 	return output.WriteEmpty()
+}
+
+// createAttestation creates a signed attestation for a tool call and stores it on disk.
+// Failures are logged as warnings — attestation is evidence, not enforcement.
+// Uses identity metadata saved in session state from SessionStart to avoid
+// re-discovering identity (and the noisy PID-walking warnings) on every tool call.
+func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *aflock.HookInput) {
+	if sessionState == nil || sessionState.Policy == nil {
+		return
+	}
+
+	// Reconstruct agent identity from session state (saved at SessionStart)
+	// instead of re-discovering via PID walking on every PostToolUse call.
+	// If the saved model is "unknown", try re-discovering — SessionStart may
+	// have failed to find the model (e.g., new project with no session files)
+	// but PostToolUse might succeed if Claude session files now exist.
+	var agentIdentity *identity.AgentIdentity
+	if meta := sessionState.AgentIdentityMeta; meta != nil && meta.Model != "" && meta.Model != "unknown" {
+		agentIdentity = &identity.AgentIdentity{
+			Model:        meta.Model,
+			ModelVersion: meta.ModelVersion,
+			IdentityHash: meta.IdentityHash,
+			PolicyDigest: meta.PolicyDigest,
+		}
+		if meta.BinaryName != "" {
+			agentIdentity.Binary = &identity.BinaryIdentity{
+				Name:    meta.BinaryName,
+				Version: meta.BinaryVer,
+				Digest:  meta.BinaryDigest,
+			}
+		}
+		if meta.Environment != "" {
+			agentIdentity.Environment = &identity.EnvironmentIdentity{
+				Type: meta.Environment,
+			}
+		}
+	} else {
+		// Saved identity has unknown model — try fresh discovery
+		agentIdentity, _ = identity.DiscoverAgentIdentity()
+
+		// Persist re-discovered identity back to session state so state.json
+		// stays consistent with attestations (fixes "unknown" model lingering).
+		if agentIdentity != nil && agentIdentity.Model != "" && agentIdentity.Model != "unknown" {
+			sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
+				Model:        agentIdentity.Model,
+				ModelVersion: agentIdentity.ModelVersion,
+				IdentityHash: agentIdentity.IdentityHash,
+				PolicyDigest: agentIdentity.PolicyDigest,
+				Environment: func() string {
+					if agentIdentity.Environment != nil {
+						return agentIdentity.Environment.Type
+					}
+					return ""
+				}(),
+			}
+			if agentIdentity.Binary != nil {
+				sessionState.AgentIdentityMeta.BinaryName = agentIdentity.Binary.Name
+				sessionState.AgentIdentityMeta.BinaryVer = agentIdentity.Binary.Version
+				sessionState.AgentIdentityMeta.BinaryDigest = agentIdentity.Binary.Digest
+			}
+			if err := h.stateManager.Save(sessionState); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to persist re-discovered identity: %v\n", err)
+			}
+		}
+	}
+
+	// Create signer — try SPIRE first, then Fulcio keyless, fall back to ephemeral key
+	signer := attestation.NewSigner("")
+	if err := signer.Initialize(context.Background()); err != nil {
+		// SPIRE not available — try Fulcio keyless (CI/CD environments with OIDC)
+		if fulcioErr := signer.InitializeFulcio(context.Background()); fulcioErr != nil {
+			// Fulcio not available — use ephemeral key
+			identityHash := ""
+			if agentIdentity != nil {
+				identityHash = agentIdentity.IdentityHash
+			}
+			if err := signer.InitializeEphemeral(identityHash); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable: %v\n", err)
+				return
+			}
+		}
+	}
+	defer signer.Close() //nolint:errcheck // best-effort cleanup
+
+	// Build action record
+	toolUseID := input.ToolUseID
+	if toolUseID == "" {
+		toolUseID = fmt.Sprintf("%s-%d", input.ToolName, time.Now().UnixNano())
+	}
+
+	record := aflock.ActionRecord{
+		Timestamp: time.Now(),
+		ToolName:  input.ToolName,
+		ToolUseID: toolUseID,
+		ToolInput: input.ToolInput,
+		Decision:  "allow",
+	}
+
+	// Create signed attestation
+	envelope, err := signer.CreateActionAttestation(
+		context.Background(),
+		record,
+		sessionState.SessionID,
+		sessionState.Metrics,
+		agentIdentity,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation creation failed: %v\n", err)
+		return
+	}
+
+	// Store attestation to disk
+	attestDir := h.stateManager.AttestationsDir(sessionState.SessionID)
+	if err := os.MkdirAll(attestDir, 0750); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: create attestation dir: %v\n", err)
+		return
+	}
+
+	ts := time.Now().Format("20060102-150405")
+	prefix := toolUseID
+	if len(prefix) > 8 {
+		prefix = prefix[:8]
+	}
+	filename := fmt.Sprintf("%s-%s.intoto.json", ts, prefix)
+	path := filepath.Join(attestDir, filename)
+
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal attestation: %v\n", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0640); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write attestation: %v\n", err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "[aflock] Attestation signed: %s\n", filename)
 }
 
 // handlePermissionRequest auto-approves or denies based on policy.
@@ -412,18 +630,28 @@ func (h *Handler) handleStop(input *aflock.HookInput) error {
 		return output.Write(output.StopAllow())
 	}
 
-	// Check if required attestations are present
+	// Check required attestations — only for tools that were actually used.
+	// Policy constrains what must be attested, it doesn't instruct the agent
+	// to use tools it wasn't asked to use. If the user never used Bash,
+	// don't block Stop for a missing Bash attestation.
 	if len(sessionState.Policy.RequiredAttestations) > 0 {
+		usedTools := make(map[string]bool)
+		for _, action := range sessionState.Actions {
+			if action.Decision == "allow" {
+				usedTools[action.ToolName] = true
+			}
+		}
+
 		attestDir := h.stateManager.AttestationsDir(input.SessionID)
 		var missing []string
 		for _, required := range sessionState.Policy.RequiredAttestations {
-			if !findAttestation(attestDir, required) {
+			if usedTools[required] && !findAttestation(attestDir, required) {
 				missing = append(missing, required)
 			}
 		}
 		if len(missing) > 0 {
 			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Cannot stop: missing required attestations: %v", missing)))
+				fmt.Sprintf("[aflock] Cannot stop: missing attestations for used tools: %v", missing)))
 		}
 	}
 
@@ -485,8 +713,17 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
 		if exceeded {
-			// Log warning but don't block session end
 			fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
+			// Record the violation in session state for audit trail
+			h.stateManager.RecordAction(sessionState, aflock.ActionRecord{
+				Timestamp: time.Now(),
+				ToolName:  "SessionEnd",
+				Decision:  string(aflock.DecisionDeny),
+				Reason:    fmt.Sprintf("post-hoc limit exceeded: %s - %s", limitName, msg),
+			})
+			if err := h.stateManager.Save(sessionState); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
+			}
 		}
 	}
 
@@ -509,10 +746,11 @@ func (h *Handler) handlePreCompact(_ *aflock.HookInput) error {
 	return output.WriteEmpty()
 }
 
-// findAttestation checks if an attestation file exists for the given name.
+// findAttestation checks if a structurally valid attestation file exists for the given name.
 // It first checks for exact filename matches (name.json, name.intoto.json),
 // then scans all .intoto.json files in the directory and checks if any
-// attestation's tool name matches the required name.
+// attestation's tool name matches the required name. Files must pass
+// structural validation (valid DSSE envelope with non-empty signatures).
 func findAttestation(dir, name string) bool {
 	// First try exact filename match
 	exactPaths := []string{
@@ -521,7 +759,10 @@ func findAttestation(dir, name string) bool {
 	}
 	for _, p := range exactPaths {
 		if _, err := os.Stat(p); err == nil {
-			return true
+			if validateAttestationIntegrity(p) {
+				return true
+			}
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation file %s exists but failed structural validation\n", p)
 		}
 	}
 
@@ -537,12 +778,55 @@ func findAttestation(dir, name string) bool {
 		if entry.IsDir() || !isAttestationFile(entry.Name()) {
 			continue
 		}
-		if attestationMatchesName(filepath.Join(dir, entry.Name()), name) {
-			return true
+		p := filepath.Join(dir, entry.Name())
+		if attestationMatchesName(p, name) {
+			if validateAttestationIntegrity(p) {
+				return true
+			}
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation file %s matches name %q but failed structural validation\n", p, name)
 		}
 	}
 
 	return false
+}
+
+// validateAttestationIntegrity performs structural validation on an attestation file.
+// It checks that the file is a valid DSSE envelope with:
+//   - A non-empty "payload" field
+//   - A non-empty "payloadType" field
+//   - A non-empty "signatures" array
+//
+// This does NOT perform cryptographic signature verification (that requires
+// trusted roots), but prevents accepting fake/empty/malformed attestation files.
+func validateAttestationIntegrity(path string) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation file path from state directory
+	if err != nil {
+		return false
+	}
+
+	var envelope struct {
+		Payload     string `json:"payload"`
+		PayloadType string `json:"payloadType"`
+		Signatures  []struct {
+			KeyID string `json:"keyid"`
+			Sig   string `json:"sig"`
+		} `json:"signatures"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	if envelope.Payload == "" {
+		return false
+	}
+	if envelope.PayloadType == "" {
+		return false
+	}
+	if len(envelope.Signatures) == 0 {
+		return false
+	}
+
+	return true
 }
 
 // isAttestationFile checks if a filename looks like an attestation file.

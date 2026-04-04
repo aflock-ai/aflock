@@ -4,15 +4,20 @@ sidebar_position: 2
 
 # Attestations
 
+:::info What's Working
+- **Attestation signing** using DSSE envelopes is implemented in both **MCP server mode** and **hooks mode** ([#17](https://github.com/aflock-ai/aflock/issues/17)). Every `PostToolUse` hook generates a signed in-toto v1 attestation with the `action/v0.1` predicate type. Signing uses SPIRE X509-SVIDs when available, or an ephemeral ECDSA key as fallback.
+- **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) — ES256 tokens issued at session start, scoped to policy grants, validated per-request
+:::
+
 :::caution Active Development
-Attestation signing using DSSE envelopes is implemented. However, **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) and the **JWT + Signing Key Separation** model described below are not yet implemented — the current implementation has the agent directly holding the signing key. **Attestation generation in hooks mode** is also WIP ([#17](https://github.com/aflock-ai/aflock/issues/17)). Session Merkle trees are designed but not yet implemented. **We're looking for contributors in these areas.**
+**JWT + Signing Key full separation** (server-only signing key, agent holds JWT only) is partially implemented — the agent still holds an ephemeral signing key for attestation in some paths. Session Merkle trees are designed but not yet implemented.
 :::
 
 Every agent action produces a **cryptographically signed attestation** — an unforgeable record of what happened. aflock uses the [in-toto](https://in-toto.io/) attestation format wrapped in DSSE envelopes.
 
-## JWT and Signing Key Separation
+## JWT-based Agent Authorization
 
-> **Status: Not yet implemented** — Currently the agent directly holds the signing key. See [#19](https://github.com/aflock-ai/aflock/issues/19).
+> **Status: Implemented** — See [#19](https://github.com/aflock-ai/aflock/issues/19). JWT tokens are issued at session start and validated on each MCP tool call.
 
 A critical security property is the separation between **authorization** (what the agent is allowed to do) and **attestation** (proof of what the agent did):
 
@@ -23,20 +28,46 @@ A critical security property is the separation between **authorization** (what t
 
 The agent presents its JWT when requesting actions, but all attestations are signed by a key the agent never sees. This ensures that **even a compromised agent cannot forge attestations** claiming compliant behavior.
 
-### JWT Structure
+### JWT Claims Structure
+
+Tokens use **ES256** (ECDSA P-256) exclusively — HMAC and RSA are rejected to prevent algorithm confusion attacks.
 
 ```json
 {
-  "sub": "sha256:a1b2c3...",
-  "iat": 1737200000,
-  "exp": 1737203600,
-  "grants": {
-    "tools": ["Read", "Edit", "Bash"],
-    "files": { "allow": ["src/**"], "deny": ["**/.env"] },
-    "limits": { "maxSpendUSD": 10.00 }
-  }
+  "iss": "aflock",
+  "sub": "spiffe://aflock.ai/agent/claude-opus/4.5/abc123",
+  "aud": ["session-uuid-here"],
+  "exp": 1737244800,
+  "iat": 1737241200,
+  "jti": "session-uuid-here",
+  "agent_id": "spiffe://aflock.ai/agent/claude-opus/4.5/abc123",
+  "identity_hash": "sha256:abc123...",
+  "allowed_tools": ["Read", "Edit", "Bash"],
+  "denied_tools": ["Task"],
+  "limits": {
+    "maxSpendUSD": { "value": 5.00, "enforcement": "fail-fast" },
+    "maxTurns": { "value": 30, "enforcement": "post-hoc" }
+  },
+  "policy_digest": "sha256:def456..."
 }
 ```
+
+### Security Properties
+
+| Property | How It Works |
+|----------|-------------|
+| **Algorithm confusion prevention** | Only ES256 accepted; `token.Method` checked before key use |
+| **Session binding** | `aud` claim = session ID; cross-session replay rejected |
+| **Policy binding** | `policy_digest` = SHA-256 of serialized policy; token invalidated if policy changes |
+| **Tool-level scoping** | `allowed_tools`/`denied_tools` enforced per-request |
+| **Ephemeral keys** | ECDSA P-256 key per process, never persisted to disk |
+| **Graceful adoption** | Enforcement only activates after `get_token` is called |
+
+### How It Works
+
+1. **SessionStart** (hooks mode) or **server init** (MCP mode): An ephemeral ECDSA P-256 keypair is generated. A JWT is issued with the agent's verified identity, session ID, and policy-derived scopes.
+2. **Tool calls**: Each tool handler validates the `_token` parameter — checks signature, expiry, issuer, session binding, and tool-level authorization.
+3. **Token refresh**: Call the `get_token` MCP tool to get a new token (e.g., after policy changes).
 
 ## Attestation Format
 

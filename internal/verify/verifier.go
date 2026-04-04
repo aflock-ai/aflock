@@ -2,6 +2,7 @@
 package verify
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -18,8 +19,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aflock-ai/aflock/internal/aieval"
 	"github.com/aflock-ai/aflock/internal/attestation"
+	aflockMerkle "github.com/aflock-ai/aflock/internal/merkle"
 	"github.com/aflock-ai/aflock/internal/policy"
+	aflockRego "github.com/aflock-ai/aflock/internal/rego"
 	"github.com/aflock-ai/aflock/internal/state"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -61,6 +65,7 @@ type MetricsSummary struct {
 // Verifier verifies session attestations against policy.
 type Verifier struct {
 	stateManager *state.Manager
+	SkipAI       bool // Skip Phase 5 (AI Evaluation)
 }
 
 // NewVerifier creates a new verifier.
@@ -100,6 +105,111 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 			TotalTokensOut: sessionState.Metrics.TokensOut,
 			TotalCostUSD:   sessionState.Metrics.CostUSD,
 			Duration:       time.Since(sessionState.StartedAt).Round(time.Second).String(),
+		}
+	}
+
+	// Check 0: Identity verification (Phase 2)
+	if sessionState.Policy.Identity != nil {
+		id := IdentityFields{}
+		if sessionState.AgentIdentityMeta != nil {
+			id.Model = sessionState.AgentIdentityMeta.Model
+			id.Environment = sessionState.AgentIdentityMeta.Environment
+		}
+		// Extract tools from session metrics (tool names that were used)
+		if sessionState.Metrics != nil && sessionState.Metrics.Tools != nil {
+			for toolName := range sessionState.Metrics.Tools {
+				id.Tools = append(id.Tools, toolName)
+			}
+			sort.Strings(id.Tools)
+		}
+		identityErrors := verifyIdentityConstraints(id, sessionState.Policy.Identity)
+		if len(identityErrors) > 0 {
+			result.Success = false
+			for _, msg := range identityErrors {
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "identity",
+					Passed:  false,
+					Message: msg,
+				})
+				result.Errors = append(result.Errors, msg)
+			}
+		} else {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:   "identity",
+				Passed: true,
+			})
+		}
+	}
+
+	// Check 0.5: Materials binding / Merkle tree (Phase 3)
+	if sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil {
+		merkleErrors := verifySessionMerkle(sessionState)
+		if len(merkleErrors) > 0 {
+			result.Success = false
+			for _, msg := range merkleErrors {
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "materials:merkle",
+					Passed:  false,
+					Message: msg,
+				})
+				result.Errors = append(result.Errors, msg)
+			}
+		} else {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:   "materials:merkle",
+				Passed: true,
+			})
+		}
+	}
+
+	// Check 0.7: Rego constraint evaluation (Phase 4)
+	if sessionState.Policy.Evaluators != nil && len(sessionState.Policy.Evaluators.Rego) > 0 {
+		regoErrors := evaluateSessionRego(sessionState)
+		if len(regoErrors) > 0 {
+			result.Success = false
+			for _, msg := range regoErrors {
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "rego",
+					Passed:  false,
+					Message: msg,
+				})
+				result.Errors = append(result.Errors, msg)
+			}
+		} else {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:   "rego",
+				Passed: true,
+			})
+		}
+	}
+
+	// Check 0.8: AI Evaluation (Phase 5)
+	if sessionState.Policy.Evaluators != nil && len(sessionState.Policy.Evaluators.AI) > 0 {
+		if v.SkipAI {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:    "ai",
+				Passed:  true,
+				Message: "Skipped: --skip-ai flag set",
+			})
+			result.Warnings = append(result.Warnings, "Phase 5 (AI Evaluation) skipped: --skip-ai flag set")
+		} else {
+			aiErrors := evaluateSessionAI(sessionState)
+			if len(aiErrors) > 0 {
+				result.Success = false
+				for _, msg := range aiErrors {
+					result.Checks = append(result.Checks, CheckResult{
+						Name:    "ai",
+						Passed:  false,
+						Message: msg,
+					})
+					result.Errors = append(result.Errors, msg)
+				}
+			} else {
+				result.Checks = append(result.Checks, CheckResult{
+					Name:   "ai",
+					Passed: true,
+				})
+			}
 		}
 	}
 
@@ -183,6 +293,27 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 		Message: fmt.Sprintf("%d total actions, %d blocked", len(sessionState.Actions), deniedCount),
 	})
 
+	// Check 5: Sublayout recursion (Phase 6)
+	if len(sessionState.Policy.Sublayouts) > 0 && len(sessionState.ChildSessionIDs) > 0 {
+		sublayoutErrors := v.verifySublayouts(sessionState)
+		if len(sublayoutErrors) > 0 {
+			result.Success = false
+			for _, msg := range sublayoutErrors {
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "sublayout",
+					Passed:  false,
+					Message: msg,
+				})
+				result.Errors = append(result.Errors, msg)
+			}
+		} else {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:   "sublayout",
+				Passed: true,
+			})
+		}
+	}
+
 	return result, nil
 }
 
@@ -247,9 +378,9 @@ func (v *Verifier) VerifyAttestation(envelopePath string, pol *aflock.Policy) er
 		return fmt.Errorf("parse statement: %w", err)
 	}
 
-	// Verify statement type — accept both v1 (used by aflock signer) and v0.1 (used by witness workflow)
-	if statement.Type != attestation.StatementType && statement.Type != "https://in-toto.io/Statement/v0.1" {
-		return fmt.Errorf("invalid statement type: %s (expected %s or v0.1)", statement.Type, attestation.StatementType)
+	// Verify statement type — only accept v1 (v0.1 is deprecated and could allow downgrade attacks)
+	if statement.Type != attestation.StatementType {
+		return fmt.Errorf("invalid statement type: %s (expected %s)", statement.Type, attestation.StatementType)
 	}
 
 	// Verify signature against trusted certificates from policy roots
@@ -457,6 +588,20 @@ func (v *Verifier) VerifySteps(pol *aflock.Policy, attestDir, treeHash string) (
 				result.Success = false
 			} else {
 				stepResult.SignatureValid = true
+			}
+		}
+
+		// Check identity constraints (Phase 2) if attestation was found
+		if stepResult.Found && pol.Identity != nil {
+			if id, err := extractIdentityFromAttestation(attestPath); err != nil {
+				stepResult.Errors = append(stepResult.Errors, fmt.Sprintf("Identity extraction failed: %v", err))
+				result.Success = false
+			} else if id != nil {
+				identityErrors := verifyIdentityConstraints(*id, pol.Identity)
+				for _, msg := range identityErrors {
+					stepResult.Errors = append(stepResult.Errors, msg)
+					result.Success = false
+				}
 			}
 		}
 
@@ -676,13 +821,30 @@ func (v *Verifier) verifyStepAttestation(attestPath string, step *aflock.Step, p
 	}
 
 	// Verify signatures against functionaries
-	if len(pol.Roots) == 0 {
+	// Allow keyless-only policies without explicit roots
+	hasKeyless := false
+	for _, f := range step.Functionaries {
+		if f.Type == "keyless" {
+			hasKeyless = true
+			break
+		}
+	}
+
+	if len(pol.Roots) == 0 && !hasKeyless {
 		return fmt.Errorf("policy has no trusted roots: signature verification cannot be performed")
 	}
 
 	trustedCerts, err := loadRootCertificates(pol.Roots)
 	if err != nil {
 		return fmt.Errorf("load root certificates: %w", err)
+	}
+
+	// Add Fulcio public root CA if any functionary is keyless
+	if hasKeyless {
+		fulcioRoot, err := loadFulcioRoot()
+		if err == nil {
+			trustedCerts = append(trustedCerts, fulcioRoot)
+		}
 	}
 
 	if len(trustedCerts) == 0 {
@@ -809,6 +971,13 @@ func matchesFunctionary(cert *x509.Certificate, keyID string, step *aflock.Step)
 				return true
 			}
 		}
+
+		// Keyless/Sigstore match: verify Fulcio certificate extensions against OIDC constraints
+		if f.Type == "keyless" {
+			if matchesKeylessFunctionary(cert, f) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -924,6 +1093,410 @@ func topoSortSteps(steps map[string]aflock.Step) []string {
 	}
 
 	return sorted
+}
+
+// verifySublayouts checks child sessions against sublayout policies (Phase 6).
+// For each sublayout defined in the parent policy, it:
+//  1. Verifies attenuation (sub-limits ≤ parent limits)
+//  2. Finds the matching child session
+//  3. Recursively verifies the child session against the sublayout's policy
+//  4. Accumulates child spend toward parent metrics
+//
+//nolint:gocognit // sublayout verification requires many checks
+func (v *Verifier) verifySublayouts(parentState *aflock.SessionState) []string {
+	if len(parentState.Policy.Sublayouts) == 0 {
+		return nil
+	}
+
+	var errors []string
+
+	for _, sub := range parentState.Policy.Sublayouts {
+		// 1. Verify attenuation: sub-agent limits must be ≤ parent limits
+		if attErrors := verifyAttenuation(parentState.Policy.Limits, sub.Limits); len(attErrors) > 0 {
+			for _, msg := range attErrors {
+				errors = append(errors, fmt.Sprintf("sublayout %q: attenuation violation: %s", sub.Name, msg))
+			}
+			continue // Don't verify child if attenuation is violated — policy itself is invalid
+		}
+
+		// 2. Find matching child session(s) for this sublayout
+		childFound := false
+		for _, childID := range parentState.ChildSessionIDs {
+			childState, err := v.stateManager.Load(childID)
+			if err != nil || childState == nil {
+				continue
+			}
+
+			// Match child to sublayout by policy name or attestation prefix
+			if !matchesSublayout(childState, &sub) {
+				continue
+			}
+
+			childFound = true
+
+			// 3. Recursively verify the child session
+			childResult, err := v.VerifySession(childID)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("sublayout %q: verify child %s: %v", sub.Name, childID, err))
+				continue
+			}
+
+			if !childResult.Success {
+				for _, e := range childResult.Errors {
+					errors = append(errors, fmt.Sprintf("sublayout %q [%s]: %s", sub.Name, childID, e))
+				}
+			}
+
+			// 4. Accumulate child spend toward parent (for Rego cross-check)
+			if childResult.Metrics != nil && parentState.Metrics != nil {
+				parentState.Metrics.CostUSD += childResult.Metrics.TotalCostUSD
+				parentState.Metrics.TokensIn += childResult.Metrics.TotalTokensIn
+				parentState.Metrics.TokensOut += childResult.Metrics.TotalTokensOut
+			}
+		}
+
+		if !childFound {
+			errors = append(errors, fmt.Sprintf("sublayout %q: no matching child session found", sub.Name))
+		}
+	}
+
+	return errors
+}
+
+// matchesSublayout checks if a child session matches a sublayout definition.
+// Matches by policy name or attestation prefix.
+func matchesSublayout(child *aflock.SessionState, sub *aflock.Sublayout) bool {
+	if child.Policy == nil {
+		return false
+	}
+	// Match by policy name
+	if child.Policy.Name == sub.Name {
+		return true
+	}
+	// Match by attestation prefix (if set)
+	if sub.AttestationPrefix != "" && child.Policy.Name == sub.AttestationPrefix {
+		return true
+	}
+	// Match by parent session reference
+	if child.ParentSessionID != "" {
+		return true // Child was spawned by this parent — assume it matches
+	}
+	return false
+}
+
+// verifyAttenuation checks that sub-agent limits are ≤ parent limits.
+// This prevents privilege escalation: a sub-agent cannot have higher limits than its parent.
+// Returns a list of violations. Empty list = attenuation is valid.
+func verifyAttenuation(parent, child *aflock.LimitsPolicy) []string {
+	if child == nil {
+		return nil // No child limits = inherits parent (always valid)
+	}
+	if parent == nil {
+		return nil // No parent limits = no constraints to violate
+	}
+
+	var violations []string
+
+	checkLimit := func(name string, parentLimit, childLimit *aflock.Limit) {
+		if childLimit == nil || parentLimit == nil {
+			return // No limit set on one side = no violation
+		}
+		if childLimit.Value > parentLimit.Value {
+			violations = append(violations, fmt.Sprintf(
+				"%s: child %.2f > parent %.2f",
+				name, childLimit.Value, parentLimit.Value))
+		}
+	}
+
+	checkLimit("maxSpendUSD", parent.MaxSpendUSD, child.MaxSpendUSD)
+	checkLimit("maxTokensIn", parent.MaxTokensIn, child.MaxTokensIn)
+	checkLimit("maxTokensOut", parent.MaxTokensOut, child.MaxTokensOut)
+	checkLimit("maxTurns", parent.MaxTurns, child.MaxTurns)
+	checkLimit("maxWallTimeSeconds", parent.MaxWallTimeSeconds, child.MaxWallTimeSeconds)
+	checkLimit("maxToolCalls", parent.MaxToolCalls, child.MaxToolCalls)
+
+	return violations
+}
+
+// evaluateSessionAI runs AI evaluators against session data (Phase 5).
+// The materials passed to the AI include session actions, metrics, and policy context.
+func evaluateSessionAI(sessionState *aflock.SessionState) []string {
+	if sessionState.Policy.Evaluators == nil || len(sessionState.Policy.Evaluators.AI) == 0 {
+		return nil
+	}
+
+	// Build materials context for the AI evaluator
+	materials := map[string]any{
+		"policy":  sessionState.Policy,
+		"actions": sessionState.Actions,
+		"metrics": sessionState.Metrics,
+	}
+
+	materialsJSON, err := json.Marshal(materials)
+	if err != nil {
+		return []string{fmt.Sprintf("AI evaluation failed: marshal materials: %v", err)}
+	}
+
+	// Convert aflock evaluators to aieval.Policy
+	policies := make([]aieval.Policy, len(sessionState.Policy.Evaluators.AI))
+	for i, eval := range sessionState.Policy.Evaluators.AI {
+		policies[i] = aieval.Policy{
+			Name:     eval.Name,
+			Prompt:   eval.Prompt,
+			Model:    eval.Model,
+			Backend:  eval.Backend,
+			Endpoint: eval.Endpoint,
+		}
+	}
+
+	ctx := context.Background()
+	results, err := aieval.Evaluate(ctx, policies, materialsJSON)
+	if err != nil {
+		return []string{fmt.Sprintf("AI evaluation failed: %v", err)}
+	}
+
+	var errors []string
+	for _, r := range results {
+		if !r.Passed {
+			errors = append(errors, fmt.Sprintf("AI evaluator %q: [%s] %s", r.Name, r.Status, r.Reason))
+		}
+	}
+	return errors
+}
+
+// evaluateSessionRego runs top-level Rego evaluators against session data (Phase 4).
+// The input to each Rego policy is:
+//
+//	{
+//	  "policy": { ... policy fields ... },
+//	  "actions": [ ... session actions ... ],
+//	  "metrics": { ... session metrics ... }
+//	}
+//
+// Each Rego module must define a `deny` rule returning denial reason strings.
+func evaluateSessionRego(sessionState *aflock.SessionState) []string {
+	if sessionState.Policy.Evaluators == nil || len(sessionState.Policy.Evaluators.Rego) == 0 {
+		return nil
+	}
+
+	// Build the input for Rego evaluation
+	input := map[string]any{
+		"policy":  sessionState.Policy,
+		"actions": sessionState.Actions,
+		"metrics": sessionState.Metrics,
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return []string{fmt.Sprintf("Rego evaluation failed: marshal input: %v", err)}
+	}
+
+	// Convert aflock evaluators to rego.Policy
+	policies := make([]aflockRego.Policy, len(sessionState.Policy.Evaluators.Rego))
+	for i, eval := range sessionState.Policy.Evaluators.Rego {
+		policies[i] = aflockRego.Policy{
+			Name:   eval.Name,
+			Module: eval.Policy,
+		}
+	}
+
+	results, err := aflockRego.Evaluate(policies, inputJSON)
+	if err != nil {
+		return []string{fmt.Sprintf("Rego evaluation failed: %v", err)}
+	}
+
+	var errors []string
+	for _, r := range results {
+		if !r.Passed {
+			for _, reason := range r.Reasons {
+				errors = append(errors, fmt.Sprintf("Rego evaluator %q: %s", r.Name, reason))
+			}
+		}
+	}
+	return errors
+}
+
+// verifySessionMerkle checks the Merkle tree root over session actions (Phase 3).
+// It serializes each ActionRecord to JSON, builds a Merkle tree using RFC 6962 hashing
+// with JCS canonicalization, and compares the computed root against the expected root
+// stored in policy.MaterialsFrom.Session.MerkleRoot.
+func verifySessionMerkle(sessionState *aflock.SessionState) []string {
+	if sessionState.Policy.MaterialsFrom == nil || sessionState.Policy.MaterialsFrom.Session == nil {
+		return nil
+	}
+
+	expectedRoot := sessionState.Policy.MaterialsFrom.Session.MerkleRoot
+	if expectedRoot == "" {
+		return nil // No expected root — nothing to verify
+	}
+
+	if len(sessionState.Actions) == 0 {
+		return []string{"Materials binding failed: no session actions to build Merkle tree"}
+	}
+
+	// Serialize each action record to JSON for Merkle leaf computation
+	entries := make([][]byte, 0, len(sessionState.Actions))
+	for i, action := range sessionState.Actions {
+		data, err := json.Marshal(action)
+		if err != nil {
+			return []string{fmt.Sprintf("Materials binding failed: marshal action %d: %v", i, err)}
+		}
+		entries = append(entries, data)
+	}
+
+	if err := aflockMerkle.VerifyRoot(entries, expectedRoot); err != nil {
+		return []string{fmt.Sprintf("Materials binding failed: %v", err)}
+	}
+
+	return nil
+}
+
+// IdentityFields holds the identity fields extracted from an attestation or session
+// for verification against policy identity constraints.
+type IdentityFields struct {
+	Model       string
+	Environment string
+	Tools       []string // may be nil if not available (e.g., step-based verification)
+}
+
+// verifyIdentityConstraints checks identity fields against policy identity constraints.
+// Returns a list of errors for each constraint that fails. Returns nil if all pass
+// or if no identity policy is defined (no constraints = all identities allowed).
+func verifyIdentityConstraints(id IdentityFields, identityPolicy *aflock.IdentityPolicy) []string {
+	if identityPolicy == nil {
+		return nil
+	}
+
+	var errors []string
+
+	// Check allowedModels — model must match at least one glob pattern
+	if len(identityPolicy.AllowedModels) > 0 && id.Model != "" {
+		matched := false
+		for _, pattern := range identityPolicy.AllowedModels {
+			if matchIdentityGlob(pattern, id.Model) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			errors = append(errors, fmt.Sprintf(
+				"Identity mismatch: model %q does not match allowedModels %v",
+				id.Model, identityPolicy.AllowedModels))
+		}
+	}
+
+	// Check allowedEnvironments — environment must match at least one glob pattern
+	if len(identityPolicy.AllowedEnvironments) > 0 && id.Environment != "" {
+		matched := false
+		for _, pattern := range identityPolicy.AllowedEnvironments {
+			if matchIdentityGlob(pattern, id.Environment) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			errors = append(errors, fmt.Sprintf(
+				"Identity mismatch: environment %q does not match allowedEnvironments %v",
+				id.Environment, identityPolicy.AllowedEnvironments))
+		}
+	}
+
+	// Check requiredTools — each required tool must be present in the agent's tools
+	if len(identityPolicy.RequiredTools) > 0 && id.Tools != nil {
+		toolSet := make(map[string]bool, len(id.Tools))
+		for _, t := range id.Tools {
+			toolSet[t] = true
+		}
+		for _, required := range identityPolicy.RequiredTools {
+			if !toolSet[required] {
+				errors = append(errors, fmt.Sprintf(
+					"Identity mismatch: required tool %q not available to agent",
+					required))
+			}
+		}
+	}
+
+	return errors
+}
+
+// matchIdentityGlob performs glob matching for identity constraints.
+// Supports * as wildcard for any characters (uses filepath.Match semantics).
+func matchIdentityGlob(pattern, value string) bool {
+	if pattern == "*" {
+		return true
+	}
+	// filepath.Match handles * for single path segments. For identity matching
+	// we want * to match any sequence, so use HasPrefix for trailing * patterns.
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(value, pattern[:len(pattern)-1])
+	}
+	matched, err := filepath.Match(pattern, value)
+	return err == nil && matched
+}
+
+// extractIdentityFromAttestation extracts the TransitiveIdentity from an attestation
+// envelope's predicate. Returns nil fields if identity is not present.
+func extractIdentityFromAttestation(attestPath string) (*IdentityFields, error) {
+	data, err := os.ReadFile(attestPath) //nolint:gosec // G304: attestation path from state directory
+	if err != nil {
+		return nil, fmt.Errorf("read attestation: %w", err)
+	}
+
+	var envelope struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, fmt.Errorf("parse envelope: %w", err)
+	}
+
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode payload: %w", err)
+	}
+
+	// Parse statement → predicate → collection → attestations → find action attestation
+	var statement struct {
+		Predicate json.RawMessage `json:"predicate"`
+	}
+	if err := json.Unmarshal(payload, &statement); err != nil {
+		return nil, fmt.Errorf("parse statement: %w", err)
+	}
+
+	var collection struct {
+		Attestations []struct {
+			Type        string          `json:"type"`
+			Attestation json.RawMessage `json:"attestation"`
+		} `json:"attestations"`
+	}
+	if err := json.Unmarshal(statement.Predicate, &collection); err != nil {
+		return nil, fmt.Errorf("parse collection: %w", err)
+	}
+
+	// Look for action attestation which contains the agent identity
+	for _, att := range collection.Attestations {
+		if att.Type != "https://aflock.ai/attestations/action/v0.1" {
+			continue
+		}
+
+		var action struct {
+			AgentIdentity *struct {
+				Model       string `json:"model"`
+				Environment string `json:"environment"`
+			} `json:"agentIdentity"`
+		}
+		if err := json.Unmarshal(att.Attestation, &action); err != nil {
+			continue
+		}
+		if action.AgentIdentity != nil {
+			return &IdentityFields{
+				Model:       action.AgentIdentity.Model,
+				Environment: action.AgentIdentity.Environment,
+			}, nil
+		}
+	}
+
+	// No identity found — not an error, just no identity to verify
+	return nil, nil
 }
 
 // VerifyTreeHash gets the current git tree hash and verifies all steps.

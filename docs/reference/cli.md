@@ -108,8 +108,31 @@ aflock serve [flags]
 |------|-------------|
 | `get_identity` | Return derived agent identity |
 | `get_policy` | Return loaded policy |
+| `get_token` | Get a JWT authorization token for this session |
 | `check_tool` | Pre-check tool authorization |
 | `bash` | Execute commands with enforcement |
 | `read_file` | Read files with access control |
 | `write_file` | Write files with access control |
 | `get_session` | Return session metrics |
+| `sign_attestation` | Sign an attestation using SPIRE identity |
+
+#### JWT Authorization
+
+When the MCP server starts, it initializes a JWT token issuer with an ephemeral ECDSA P-256 key. Clients can call `get_token` to receive a session-scoped JWT, then pass it as `_token` in subsequent tool calls:
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "bash",
+    "arguments": {
+      "command": "echo hello",
+      "_token": "<jwt-from-get_token>"
+    }
+  }
+}
+```
+
+Once a token has been issued for a session, **all tool calls must include `_token`**. Calls without a token are rejected with an authorization error. Before `get_token` is called, tools work without authentication (graceful adoption).
+
+The JWT encodes: agent identity, session binding, allowed/denied tools, policy limits, and policy digest. See the [JWT Authorization tutorial](/docs/docs/tutorials/jwt-authorization) for a hands-on walkthrough.

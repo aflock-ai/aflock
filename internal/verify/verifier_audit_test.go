@@ -543,9 +543,8 @@ func TestMatchSPIFFEPattern_PlatformDependence(t *testing.T) {
 	}
 }
 
-// BUG-VERIFY-15: VerifyAttestation accepts both v1 and v0.1 statement types.
-// This is noted in comments but could allow downgrade attacks if v0.1
-// has weaker security properties.
+// BUG-VERIFY-15: VerifyAttestation previously accepted both v1 and v0.1 statement types.
+// This was fixed to reject v0.1 to prevent downgrade attacks.
 func TestVerifyAttestation_StatementTypeDowngrade(t *testing.T) {
 	caCert, caKey := generateTestCA(t)
 
@@ -572,10 +571,12 @@ func TestVerifyAttestation_StatementTypeDowngrade(t *testing.T) {
 	v := NewVerifier()
 	err := v.VerifyAttestation(envelopePath, pol)
 	if err == nil {
-		t.Log("BUG-VERIFY-15: v0.1 statement type accepted - potential downgrade attack vector")
-	} else {
-		t.Logf("v0.1 rejected (good): %v", err)
+		t.Fatal("BUG-VERIFY-15 regression: v0.1 statement type should be rejected")
 	}
+	if !strings.Contains(err.Error(), "invalid statement type") {
+		t.Errorf("Expected 'invalid statement type' error, got: %v", err)
+	}
+	t.Logf("BUG-VERIFY-15 fixed: v0.1 correctly rejected: %v", err)
 }
 
 // Helper to create PEM from cert (duplicated since the original is in the main test file)

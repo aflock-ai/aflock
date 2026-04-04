@@ -180,4 +180,4 @@ Define who can sign the policy:
 
 Supported types: `publickey`, `keyless` (Sigstore/OIDC), `x509`, `spiffe`.
 
-> **Note:** `publickey` and `x509` functionaries are implemented. `keyless` (Sigstore) signing is not yet implemented ([#20](https://github.com/aflock-ai/aflock/issues/20)). `spiffe` functionaries work for X509-SVIDs; JWT-SVID support is not yet available.
+> **Note:** `publickey`, `x509`, and `keyless` (Sigstore/Fulcio) functionaries are implemented. `spiffe` functionaries work for X509-SVIDs; JWT-SVID support is not yet available.

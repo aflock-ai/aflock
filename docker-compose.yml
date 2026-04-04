@@ -7,7 +7,8 @@ services:
     hostname: spire-server
     volumes:
       - ./docker/spire/server:/opt/spire/conf/server
-      - spire-data:/opt/spire/data
+    tmpfs:
+      - /opt/spire/data:uid=0,gid=0
     command: ["-config", "/opt/spire/conf/server/server.conf"]
     ports:
       - "8081:8081"
@@ -26,9 +27,10 @@ services:
         condition: service_healthy
     volumes:
       - ./docker/spire/agent:/opt/spire/conf/agent
-      - spire-socket:/tmp/spire-agent/public
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: ["-config", "/opt/spire/conf/agent/agent.conf"]
+      - /tmp/spire-agent/public:/tmp/spire-agent/public
+    tmpfs:
+      - /opt/spire/data:uid=0,gid=0
+    command: ["-config", "/opt/spire/conf/agent/agent.conf", "-joinToken", "${SPIRE_JOIN_TOKEN:-}"]
     pid: "host"
     healthcheck:
       test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/tmp/spire-agent/public/api.sock"]

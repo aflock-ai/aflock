@@ -1,0 +1,17 @@
+{
+  "version": "1.0",
+  "name": "attestation-demo",
+  "tools": {
+    "allow": ["Read", "Bash", "Edit", "Glob", "Grep"],
+    "deny": ["Task"]
+  },
+  "files": {
+    "allow": ["src/**", "tests/**", "README.md"],
+    "deny": ["**/.env", "**/secrets/**"]
+  },
+  "limits": {
+    "maxSpendUSD": { "value": 5.00, "enforcement": "fail-fast" },
+    "maxTurns": { "value": 20, "enforcement": "post-hoc" }
+  },
+  "requiredAttestations": ["Read", "Bash"]
+}

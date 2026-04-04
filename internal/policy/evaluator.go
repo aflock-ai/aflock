@@ -444,6 +444,18 @@ func (e *Evaluator) evaluateFileAccess(toolName string, toolInput json.RawMessag
 			}
 		}
 
+		// ReadOnly files are implicitly allowed for read operations.
+		// If a file is in readOnly, the user clearly intends it to be readable —
+		// requiring it to also be in files.allow is redundant and error-prone.
+		if !allowed && isReadOperation(toolName) {
+			for _, pattern := range e.policy.Files.ReadOnly {
+				if e.matchFilePattern(pattern, variants) {
+					allowed = true
+					break
+				}
+			}
+		}
+
 		// For directory tools (Glob, Grep), if the path is the project root (".")
 		// or resolves to it, allow the search. These tools scan directories and return
 		// results — they don't write or modify files. The deny patterns above already
@@ -699,6 +711,189 @@ func containsString(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// EvaluateGrants checks tool inputs against grants allow/deny patterns for
+// secrets, APIs, and storage. Each grant category is only evaluated when the
+// tool input contains values relevant to that category (determined by pattern
+// prefixes). String values are extracted from the JSON input so that glob
+// patterns match against individual values, not the raw JSON.
+func (e *Evaluator) EvaluateGrants(toolName string, toolInput json.RawMessage) (aflock.PermissionDecision, string) {
+	if e.policy.Grants == nil {
+		return aflock.DecisionAllow, ""
+	}
+
+	values := extractStringValues(toolInput)
+
+	// Check secrets grants — only when input has values relevant to secret patterns
+	if e.policy.Grants.Secrets != nil && e.categoryRelevant(values, e.policy.Grants.Secrets) {
+		if decision, reason := e.evaluateGrantCategory(values, e.policy.Grants.Secrets, "secret"); decision != aflock.DecisionAllow {
+			return decision, reason
+		}
+	}
+
+	// Check API grants — only when input has values relevant to API patterns
+	if e.policy.Grants.APIs != nil && e.categoryRelevant(values, e.policy.Grants.APIs) {
+		if decision, reason := e.evaluateGrantCategory(values, e.policy.Grants.APIs, "API"); decision != aflock.DecisionAllow {
+			return decision, reason
+		}
+	}
+
+	// Check storage grants — only when input has values relevant to storage patterns
+	if e.policy.Grants.Storage != nil && e.categoryRelevant(values, e.policy.Grants.Storage) {
+		if decision, reason := e.evaluateGrantCategory(values, e.policy.Grants.Storage, "storage"); decision != aflock.DecisionAllow {
+			return decision, reason
+		}
+	}
+
+	return aflock.DecisionAllow, ""
+}
+
+// categoryRelevant returns true if any extracted value looks like it could be
+// relevant to this grant category. A category is relevant if any value (or any
+// word within a value) shares a common prefix scheme with the category's
+// allow/deny patterns (e.g. "vault:", "https://", "s3://"), or matches a deny
+// pattern via substring.
+func (e *Evaluator) categoryRelevant(values []string, adPolicy *aflock.AllowDenyPolicy) bool {
+	prefixes := grantPrefixes(adPolicy)
+	if len(prefixes) == 0 {
+		// No patterns have recognizable prefixes; fall back to always checking
+		return true
+	}
+	for _, v := range values {
+		for _, pfx := range prefixes {
+			// Check the value itself and also each word within it
+			// (for Bash commands like "aws s3 cp s3://bucket/key .")
+			if strings.HasPrefix(v, pfx) || strings.Contains(v, " "+pfx) {
+				return true
+			}
+		}
+		// Also check deny patterns via substring (for literal patterns like "AWS_SECRET_KEY")
+		for _, dp := range adPolicy.Deny {
+			if strings.Contains(v, dp) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// grantPrefixes extracts scheme-like prefixes from grant patterns.
+// For example, "vault:secret/data/*" → "vault:", "https://api.example.com/*" → "https://",
+// "s3://bucket/*" → "s3://".
+func grantPrefixes(adPolicy *aflock.AllowDenyPolicy) []string {
+	seen := map[string]bool{}
+	var prefixes []string
+	for _, patterns := range [][]string{adPolicy.Allow, adPolicy.Deny} {
+		for _, p := range patterns {
+			if idx := strings.Index(p, "://"); idx > 0 && idx < 10 {
+				pfx := p[:idx+3]
+				if !seen[pfx] {
+					seen[pfx] = true
+					prefixes = append(prefixes, pfx)
+				}
+			} else if idx := strings.IndexByte(p, ':'); idx > 0 && idx < 20 {
+				pfx := p[:idx+1]
+				if !seen[pfx] {
+					seen[pfx] = true
+					prefixes = append(prefixes, pfx)
+				}
+			}
+		}
+	}
+	return prefixes
+}
+
+// evaluateGrantCategory checks a single grant category (secrets, APIs, or storage)
+// against extracted string values. Deny patterns are checked first; if allow patterns
+// exist, at least one value must match at least one allow pattern.
+func (e *Evaluator) evaluateGrantCategory(values []string, adPolicy *aflock.AllowDenyPolicy, category string) (aflock.PermissionDecision, string) {
+	// Check deny patterns first
+	for _, v := range values {
+		if matched, pattern := matchGrantPattern(v, adPolicy.Deny); matched {
+			return aflock.DecisionDeny, fmt.Sprintf("tool input matches denied %s pattern: %s", category, pattern)
+		}
+	}
+
+	// Check allow patterns (if specified, at least one value must match)
+	if len(adPolicy.Allow) > 0 {
+		for _, v := range values {
+			if matched, _ := matchGrantPattern(v, adPolicy.Allow); matched {
+				return aflock.DecisionAllow, ""
+			}
+		}
+		return aflock.DecisionDeny, fmt.Sprintf("tool input does not match any allowed %s pattern", category)
+	}
+
+	return aflock.DecisionAllow, ""
+}
+
+// extractStringValues pulls all string values from a JSON object, recursively.
+// For {"command": "echo hello", "path": "vault:secret/key"} it returns
+// ["echo hello", "vault:secret/key"].
+func extractStringValues(data json.RawMessage) []string {
+	var values []string
+
+	// Try as object
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) == nil {
+		for _, v := range obj {
+			values = append(values, extractStringValues(v)...)
+		}
+		return values
+	}
+
+	// Try as array
+	var arr []json.RawMessage
+	if json.Unmarshal(data, &arr) == nil {
+		for _, v := range arr {
+			values = append(values, extractStringValues(v)...)
+		}
+		return values
+	}
+
+	// Try as string
+	var s string
+	if json.Unmarshal(data, &s) == nil && s != "" {
+		values = append(values, s)
+	}
+
+	return values
+}
+
+// matchGrantPattern checks if a value matches any of the given patterns.
+// It tries the value directly, and also splits the value into words to handle
+// URIs embedded in Bash commands (e.g. "aws s3 cp s3://bucket/key .").
+func matchGrantPattern(value string, patterns []string) (bool, string) {
+	// Collect candidates: the full value + individual words
+	candidates := []string{value}
+	if strings.Contains(value, " ") {
+		candidates = append(candidates, strings.Fields(value)...)
+	}
+
+	for _, pattern := range patterns {
+		for _, candidate := range candidates {
+			// Try glob match
+			if matched, _ := filepath.Match(pattern, candidate); matched {
+				return true, pattern
+			}
+			// For patterns with wildcards, try prefix matching:
+			// "https://api.example.com/*" should match "https://api.example.com/v1/foo"
+			if strings.Contains(pattern, "*") {
+				prefix := strings.SplitN(pattern, "*", 2)[0]
+				if prefix != "" && strings.HasPrefix(candidate, prefix) {
+					return true, pattern
+				}
+			}
+		}
+		// Substring match for literal patterns (e.g., "AWS_SECRET_KEY")
+		if !strings.Contains(pattern, "*") && !strings.Contains(pattern, "?") {
+			if strings.Contains(value, pattern) {
+				return true, pattern
+			}
+		}
+	}
+	return false, ""
 }
 
 // CheckLimits checks if cumulative metrics exceed policy limits.
