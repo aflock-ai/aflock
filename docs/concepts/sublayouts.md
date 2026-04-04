@@ -4,6 +4,10 @@ sidebar_position: 4
 
 # Sublayouts
 
+:::caution Active Development
+The sublayout security model is partially implemented. **Numeric limit attenuation** (invariant 1) and **metric accumulation** (invariant 2) work. **Attestation namespacing** (invariant 3), **recursive verification** (invariant 4), the `inherit` field, and constraint enforcement during sub-agent execution are not yet implemented. See [#26](https://github.com/aflock-ai/aflock/issues/26). **We're looking for contributors in this area.**
+:::
+
 Inspired by [in-toto sublayouts](https://github.com/in-toto/specification), aflock supports **hierarchical sub-agent delegation** with mandatory constraint attenuation.
 
 ## The Problem

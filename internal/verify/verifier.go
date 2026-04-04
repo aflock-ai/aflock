@@ -615,8 +615,9 @@ func (v *Verifier) verifyStepAttestation(attestPath string, step *aflock.Step, p
 		PayloadType string `json:"payloadType"`
 		Payload     string `json:"payload"`
 		Signatures  []struct {
-			KeyID string `json:"keyid"`
-			Sig   string `json:"sig"`
+			KeyID       string `json:"keyid"`
+			Sig         string `json:"sig"`
+			Certificate string `json:"certificate,omitempty"`
 		} `json:"signatures"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
@@ -701,8 +702,9 @@ func (v *Verifier) verifyStepAttestation(attestPath string, step *aflock.Step, p
 // Signatures are verified against leaf certificates (from the envelope or matched by KeyID),
 // and the leaf certificate chain is validated up to a trusted root.
 func verifyDSSESignatures(payloadType string, payload []byte, signatures []struct {
-	KeyID string `json:"keyid"`
-	Sig   string `json:"sig"`
+	KeyID       string `json:"keyid"`
+	Sig         string `json:"sig"`
+	Certificate string `json:"certificate,omitempty"`
 }, trustedCerts []*x509.Certificate, step *aflock.Step) error {
 	// Create PAE (Pre-Authentication Encoding)
 	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
@@ -723,7 +725,18 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 
 		// Collect candidate verification certs: trusted certs themselves (for self-signed/direct trust)
 		// plus any leaf certs embedded in the signature
-		candidates := trustedCerts
+		candidates := make([]*x509.Certificate, len(trustedCerts))
+		copy(candidates, trustedCerts)
+
+		// Parse leaf certificate from the signature if present
+		if sig.Certificate != "" {
+			block, _ := pem.Decode([]byte(sig.Certificate))
+			if block != nil {
+				if leafCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					candidates = append(candidates, leafCert)
+				}
+			}
+		}
 
 		// Verify the signature against each candidate cert
 		for _, cert := range candidates {
@@ -731,17 +744,16 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 				continue
 			}
 
-			// Signature is cryptographically valid. Now validate the cert chain.
-			// For root CAs that are directly trusted and self-signed, chain validation
-			// succeeds trivially. For leaf certs, this validates up to a trusted root.
-			if !cert.IsCA {
-				// Leaf cert — validate chain to a trusted root
-				_, chainErr := cert.Verify(x509.VerifyOptions{
-					Roots: rootPool,
-				})
-				if chainErr != nil {
-					continue // valid sig but untrusted cert chain
-				}
+			// Signature is cryptographically valid. Now validate the cert chain
+			// against the trusted root pool for ALL certificates, including CAs.
+			// This prevents an attacker from embedding a self-signed CA cert
+			// in the signature to bypass chain validation.
+			_, chainErr := cert.Verify(x509.VerifyOptions{
+				Roots:     rootPool,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+			})
+			if chainErr != nil {
+				continue // valid sig but untrusted cert chain
 			}
 
 			// Signature is valid and cert is trusted. Check functionary constraints.

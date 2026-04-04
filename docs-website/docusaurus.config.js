@@ -47,6 +47,12 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
+      announcementBar: {
+        id: 'alpha_notice',
+        content:
+          '🚧 <b>Early Alpha</b> · aflock has not had a stable release yet and is under active development. Some documented features are still work-in-progress. <a href="https://github.com/aflock-ai/aflock/issues">Open issues</a> · <a href="https://github.com/aflock-ai/aflock#contributing">Contributions welcome</a> · ⭐ <a href="https://github.com/aflock-ai/aflock">Star us on GitHub</a>',
+        isCloseable: false,
+      },
       image: 'img/aflock-og.png',
       navbar: {
         title: 'aflock',
@@ -116,6 +122,14 @@ const config = {
                 label: 'Witness',
                 href: 'https://witness.dev',
               },
+              {
+                label: 'TestifySec',
+                href: 'https://testifysec.com',
+              },
+              {
+                label: 'Discussions',
+                href: 'https://github.com/orgs/aflock-ai/discussions',
+              },
             ],
           },
           {
@@ -128,6 +142,10 @@ const config = {
               {
                 label: 'Specification',
                 to: 'docs/docs/reference/policy-schema',
+              },
+              {
+                label: 'Rookery',
+                href: 'https://github.com/aflock-ai/rookery',
               },
             ],
           },

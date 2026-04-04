@@ -4,9 +4,15 @@ sidebar_position: 2
 
 # Attestations
 
+:::caution Active Development
+Attestation signing using DSSE envelopes is implemented. However, **JWT-based agent authorization** ([#19](https://github.com/aflock-ai/aflock/issues/19)) and the **JWT + Signing Key Separation** model described below are not yet implemented — the current implementation has the agent directly holding the signing key. **Attestation generation in hooks mode** is also WIP ([#17](https://github.com/aflock-ai/aflock/issues/17)). Session Merkle trees are designed but not yet implemented. **We're looking for contributors in these areas.**
+:::
+
 Every agent action produces a **cryptographically signed attestation** — an unforgeable record of what happened. aflock uses the [in-toto](https://in-toto.io/) attestation format wrapped in DSSE envelopes.
 
 ## JWT and Signing Key Separation
+
+> **Status: Not yet implemented** — Currently the agent directly holds the signing key. See [#19](https://github.com/aflock-ai/aflock/issues/19).
 
 A critical security property is the separation between **authorization** (what the agent is allowed to do) and **attestation** (proof of what the agent did):
 
@@ -85,6 +91,8 @@ Attestations are wrapped in a Dead Simple Signing Envelope:
 ```
 
 ## Session Merkle Trees
+
+> **Status: Not yet implemented** — Merkle tree construction is designed but no code exists yet. See [#16](https://github.com/aflock-ai/aflock/issues/16).
 
 By constructing a merkle tree over the session JSONL, aflock can cryptographically prove:
 

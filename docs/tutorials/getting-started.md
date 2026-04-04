@@ -4,6 +4,10 @@ sidebar_position: 0
 
 # Getting Started
 
+:::caution Alpha Software
+aflock is under active development. Policy creation, signing, hooks integration, and resource limit enforcement are working. The 6-phase verification pipeline is partially implemented (Phase 1 only). See the [open issues](https://github.com/aflock-ai/aflock/issues) for current status.
+:::
+
 This tutorial walks you through creating your first `.aflock` policy, integrating it with Claude Code, and verifying agent compliance.
 
 ## Prerequisites
@@ -120,14 +124,14 @@ After a session completes, verify the attestations:
 aflock verify --policy .aflock
 ```
 
-This runs the 6-phase verification algorithm:
+This runs the verification algorithm. Currently Phase 1 (Signature Verification) is implemented. The full 6-phase pipeline is in active development ([#16](https://github.com/aflock-ai/aflock/issues/16)):
 
-1. **Signature Verification** — Check cryptographic signatures
-2. **Identity Verification** — Agent matches policy constraints
-3. **Materials Binding** — Merkle tree and git hash verification
-4. **Constraint Evaluation** — Rego policies against all attestations
-5. **AI Evaluation** — Qualitative assessments
-6. **Sublayout Recursion** — Verify sub-agent attestations
+1. **Signature Verification** — Check cryptographic signatures (**implemented**)
+2. **Identity Verification** — Agent matches policy constraints (*WIP*)
+3. **Materials Binding** — Merkle tree and git hash verification (*WIP*)
+4. **Constraint Evaluation** — Rego policies against all attestations (*WIP*)
+5. **AI Evaluation** — Qualitative assessments (*WIP*)
+6. **Sublayout Recursion** — Verify sub-agent attestations (*WIP*)
 
 Exit code `0` means the session was compliant. Non-zero means violations were found.
 

@@ -615,12 +615,15 @@ func findModelAndSessionFromWorkingDir(workDir string) (model, sessionID, sessio
 
 	indexData, err := os.ReadFile(indexPath) //nolint:gosec // G304: reading session index file
 	if err != nil {
-		return "", "", "", err
+		// Fallback: scan .jsonl files directly when sessions-index.json is missing
+		fmt.Fprintf(os.Stderr, "[aflock] No sessions-index.json, falling back to most recent .jsonl in: %s\n", projectDir)
+		return findModelAndSessionFromDir(projectDir)
 	}
 
 	var index SessionIndex
 	if err := json.Unmarshal(indexData, &index); err != nil {
-		return "", "", "", err
+		fmt.Fprintf(os.Stderr, "[aflock] Invalid sessions-index.json, falling back to most recent .jsonl\n")
+		return findModelAndSessionFromDir(projectDir)
 	}
 
 	// Find matching sessions
@@ -646,7 +649,9 @@ func findModelAndSessionFromWorkingDir(workDir string) (model, sessionID, sessio
 	}
 
 	if mostRecentPath == "" {
-		return "", "", "", fmt.Errorf("no matching session found")
+		// No matching sessions in index — fall back to scanning directory
+		fmt.Fprintf(os.Stderr, "[aflock] No matching sessions in index, falling back to most recent .jsonl\n")
+		return findModelAndSessionFromDir(projectDir)
 	}
 
 	model, err = extractModelFromSession(mostRecentPath)
@@ -655,6 +660,49 @@ func findModelAndSessionFromWorkingDir(workDir string) (model, sessionID, sessio
 	}
 
 	return model, mostRecentID, mostRecentPath, nil
+}
+
+// findModelAndSessionFromDir scans a project directory for the most recent .jsonl session file.
+// This is a fallback when sessions-index.json is missing or doesn't have matching entries.
+func findModelAndSessionFromDir(projectDir string) (model, sessionID, sessionPath string, err error) {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("read project dir: %w", err)
+	}
+
+	var mostRecentPath string
+	var mostRecentTime int64
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().UnixNano() > mostRecentTime {
+			mostRecentTime = info.ModTime().UnixNano()
+			mostRecentPath = filepath.Join(projectDir, entry.Name())
+		}
+	}
+
+	if mostRecentPath == "" {
+		return "", "", "", fmt.Errorf("no session files found in %s", projectDir)
+	}
+
+	fmt.Fprintf(os.Stderr, "[aflock] Most recent session file: %s\n", mostRecentPath)
+
+	model, err = extractModelFromSession(mostRecentPath)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// Extract session ID from filename (UUID.jsonl)
+	base := filepath.Base(mostRecentPath)
+	sessionID = strings.TrimSuffix(base, ".jsonl")
+
+	return model, sessionID, mostRecentPath, nil
 }
 
 // getProcessCommand gets the command line for a process.

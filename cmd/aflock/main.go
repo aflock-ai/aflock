@@ -19,8 +19,10 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/hooks"
 	"github.com/aflock-ai/aflock/internal/mcp"
+	"github.com/aflock-ai/aflock/internal/plan"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/verify"
+	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
 var (
@@ -360,6 +362,146 @@ func parseECDSAPrivateKey(data []byte) (*ecdsa.PrivateKey, error) {
 	return ecKey, nil
 }
 
+// plan-to-policy command flags
+var (
+	planPath       string
+	planOutput     string
+	planMerge      bool
+	planInferFiles bool
+	planLimits     bool
+	planModel      string
+	planList       bool
+)
+
+var planToPolicyCmd = &cobra.Command{
+	Use:   "plan-to-policy",
+	Short: "Convert a Claude plan into an .aflock policy",
+	Long: `Convert a Claude plan markdown file into an .aflock policy with steps and AI evaluators.
+
+This implements spec-driven development: define acceptance criteria BEFORE implementation,
+then verify the AI agent's work against those criteria using attestations.
+
+The plan file is parsed for:
+  - Deterministic steps (lint, test, build) with commands
+  - UAT steps with AI evaluator prompts (PASS/FAIL criteria)
+  - File paths (used to infer files.allow rules)
+  - Acceptance criteria (auto-converted to UAT steps if no explicit UAT steps found)
+
+Examples:
+  # List available plans
+  aflock plan-to-policy --list
+
+  # Convert a plan to policy
+  aflock plan-to-policy --plan ~/.claude/plans/my-plan.md
+
+  # Output to specific file with limits
+  aflock plan-to-policy --plan plan.md -o policies/feature.aflock --limits
+
+  # Merge into existing policy
+  aflock plan-to-policy --plan plan.md --merge
+
+  # Infer file rules from plan
+  aflock plan-to-policy --plan plan.md --infer-files`,
+	Run: func(cmd *cobra.Command, args []string) {
+		if planList {
+			sources, err := plan.ListPlans()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to list plans: %v\n", err)
+				os.Exit(1)
+			}
+			if len(sources) == 0 {
+				fmt.Println("No plans found.")
+				fmt.Println("  Checked: .claude/plans/ (project) and ~/.claude/plans/ (global)")
+				return
+			}
+			total := 0
+			for _, s := range sources {
+				total += len(s.Plans)
+			}
+			fmt.Printf("Available plans (%d):\n", total)
+			for _, s := range sources {
+				fmt.Printf("\n  [%s] %s\n", s.Label, s.Dir)
+				for _, p := range s.Plans {
+					fmt.Printf("    %s\n", filepath.Base(p))
+				}
+			}
+			return
+		}
+
+		if planPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: --plan is required (path to Claude plan markdown file)")
+			fmt.Fprintln(os.Stderr, "Use --list to see available plans")
+			os.Exit(1)
+		}
+
+		// Parse the plan
+		parsed, err := plan.ParseFile(planPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse plan: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Fprintf(os.Stderr, "Parsed plan: %s\n", parsed.Name)
+		fmt.Fprintf(os.Stderr, "  Deterministic steps: %d\n", len(parsed.DeterministicSteps))
+		fmt.Fprintf(os.Stderr, "  UAT steps:           %d\n", len(parsed.UATSteps))
+		fmt.Fprintf(os.Stderr, "  Files referenced:    %d\n", len(parsed.FilesModified))
+
+		// Build options
+		opts := plan.GenerateOptions{
+			OutputPath:     planOutput,
+			DefaultModel:   planModel,
+			InferFileRules: planInferFiles,
+			DefaultLimits:  planLimits,
+		}
+
+		// Merge with existing policy if requested
+		if planMerge {
+			// Try loading from the output path first, then fall back to CWD
+			var mergePolicy *aflock.Policy
+			if _, err := os.Stat(planOutput); err == nil {
+				data, err := os.ReadFile(planOutput)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: --merge: could not read %s: %v\n", planOutput, err)
+				} else {
+					var pol aflock.Policy
+					if err := json.Unmarshal(data, &pol); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: --merge: could not parse %s: %v\n", planOutput, err)
+					} else {
+						mergePolicy = &pol
+					}
+				}
+			}
+			if mergePolicy == nil {
+				cwd, _ := os.Getwd()
+				p, _, err := policy.Load(cwd)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: --merge specified but no existing policy found: %v\n", err)
+				} else {
+					mergePolicy = p
+				}
+			}
+			if mergePolicy != nil {
+				opts.MergeWith = mergePolicy
+				fmt.Fprintln(os.Stderr, "  Merging with existing policy")
+			}
+		}
+
+		// Generate and write
+		outputPath, err := plan.WritePolicy(parsed, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate policy: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nPolicy written to: %s\n", outputPath)
+		fmt.Fprintln(os.Stderr, "\nNext steps:")
+		fmt.Fprintf(os.Stderr, "  1. Review the policy:  cat %s\n", outputPath)
+		fmt.Fprintf(os.Stderr, "  2. Sign the policy:    aflock sign %s\n", outputPath)
+		fmt.Fprintln(os.Stderr, "  3. Implement the feature with Claude")
+		fmt.Fprintf(os.Stderr, "  4. Verify attestations: aflock verify --policy %s\n", outputPath)
+	},
+}
+
 var servePolicyPath string
 var serveHTTPPort int
 
@@ -414,6 +556,7 @@ func init() {
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(signCmd)
 	rootCmd.AddCommand(serveCmd)
+	rootCmd.AddCommand(planToPolicyCmd)
 
 	// Add --hook flag as alternative to hook subcommand for backwards compatibility
 	rootCmd.Flags().StringVar(&hookFlag, "hook", "", "Hook event to handle (alternative to 'hook' subcommand)")
@@ -426,6 +569,15 @@ func init() {
 	// Sign command flags
 	signCmd.Flags().StringVarP(&signKeyPath, "key", "k", "", "Path to ECDSA private key PEM file (or set AFLOCK_SIGNING_KEY)")
 	signCmd.Flags().StringVarP(&signOutputPath, "output", "o", "", "Output path for signed envelope (default: <input>.signed, use - for stdout)")
+
+	// Plan-to-policy command flags
+	planToPolicyCmd.Flags().StringVar(&planPath, "plan", "", "Path to Claude plan markdown file (required)")
+	planToPolicyCmd.Flags().StringVarP(&planOutput, "output", "o", ".aflock", "Output path for generated policy")
+	planToPolicyCmd.Flags().BoolVar(&planMerge, "merge", false, "Merge steps into existing .aflock policy")
+	planToPolicyCmd.Flags().BoolVar(&planInferFiles, "infer-files", false, "Infer files.allow rules from plan")
+	planToPolicyCmd.Flags().BoolVar(&planLimits, "limits", false, "Add default spend/turn limits")
+	planToPolicyCmd.Flags().StringVar(&planModel, "model", "", "AI evaluator model (default: claude-opus-4-5-20251101)")
+	planToPolicyCmd.Flags().BoolVar(&planList, "list", false, "List available plans from .claude/plans/ (project) and ~/.claude/plans/ (global)")
 
 	// Serve command flags
 	serveCmd.Flags().StringVarP(&servePolicyPath, "policy", "p", "", "Path to .aflock policy file")

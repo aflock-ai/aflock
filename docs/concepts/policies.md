@@ -4,6 +4,10 @@ sidebar_position: 0
 
 # Policies
 
+:::info What's Working
+Policy loading, signing (`aflock sign`), tool allowlists, file access rules, domain controls, and resource limit enforcement (spend, tokens, turns, time) are all fully implemented. Features marked below as WIP have types/schemas defined but the runtime enforcement code is not yet complete.
+:::
+
 An `.aflock` file is a **cryptographically signed policy** that constrains AI agent behavior. Like `package-lock.json` locks dependencies, `.aflock` locks what an agent can do.
 
 ## Why Policies?
@@ -122,6 +126,8 @@ Follow the principle of least privilege — all access denied unless explicitly 
 
 ## Grants
 
+> **Status: Schema defined, runtime enforcement not yet implemented** — The `grants` policy is parsed but never evaluated at runtime. See [#22](https://github.com/aflock-ai/aflock/issues/22). **We're looking for contributors.**
+
 Explicit authorization for resource access:
 
 ```json
@@ -173,3 +179,5 @@ Define who can sign the policy:
 ```
 
 Supported types: `publickey`, `keyless` (Sigstore/OIDC), `x509`, `spiffe`.
+
+> **Note:** `publickey` and `x509` functionaries are implemented. `keyless` (Sigstore) signing is not yet implemented ([#20](https://github.com/aflock-ai/aflock/issues/20)). `spiffe` functionaries work for X509-SVIDs; JWT-SVID support is not yet available.
