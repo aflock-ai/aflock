@@ -25,8 +25,8 @@ const FeatureList = [
     title: 'Verify',
     description: (
       <>
-        Verify constraint compliance after the fact with a 6-phase verification algorithm.
-        Cross-step Rego evaluation, merkle tree ordering proofs, and sublayout recursion.
+        Verify constraint compliance with a 6-phase verification algorithm.
+        Signature verification is implemented; identity, Rego, AI evaluation, and sublayout recursion are <a href="https://github.com/aflock-ai/aflock/issues/16">in active development</a>.
       </>
     ),
   },

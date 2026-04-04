@@ -2,7 +2,6 @@
 package attestation
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -20,7 +19,6 @@ import (
 
 	"github.com/aflock-ai/rookery/attestation"
 	"github.com/aflock-ai/rookery/attestation/cryptoutil"
-	"github.com/aflock-ai/rookery/attestation/dsse"
 
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -149,8 +147,9 @@ type Envelope struct {
 
 // Signature is a DSSE signature.
 type Signature struct {
-	KeyID string `json:"keyid"`
-	Sig   string `json:"sig"`
+	KeyID       string `json:"keyid"`
+	Sig         string `json:"sig"`
+	Certificate string `json:"certificate,omitempty"` // PEM-encoded signing certificate
 }
 
 // CreateActionAttestation creates an attestation for an action.
@@ -254,13 +253,23 @@ func (s *Signer) Sign(ctx context.Context, statement Statement) (*Envelope, erro
 		return nil, fmt.Errorf("sign: %w", err)
 	}
 
+	// Encode the signing certificate as PEM for inclusion in the envelope
+	var certPEM string
+	if signingIdentity.Certificate != nil {
+		certPEM = string(pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: signingIdentity.Certificate.Raw,
+		}))
+	}
+
 	envelope := &Envelope{
 		PayloadType: PayloadType,
 		Payload:     payloadB64,
 		Signatures: []Signature{
 			{
-				KeyID: signingIdentity.SPIFFEID.String(),
-				Sig:   base64.StdEncoding.EncodeToString(sig),
+				KeyID:       signingIdentity.SPIFFEID.String(),
+				Sig:         base64.StdEncoding.EncodeToString(sig),
+				Certificate: certPEM,
 			},
 		},
 	}
@@ -425,32 +434,34 @@ func (s *spireSigner) Verifier() (cryptoutil.Verifier, error) {
 	return cryptoutil.NewVerifier(s.identity.Certificate.PublicKey)
 }
 
-// SignCollection signs an attestation Collection and returns a DSSE envelope.
-func (s *Signer) SignCollection(ctx context.Context, collection attestation.Collection) (*dsse.Envelope, error) {
-	// Get the signing identity
-	signingIdentity, _ := s.GetSigningIdentity()
-	if signingIdentity == nil {
-		return nil, fmt.Errorf("no signing identity available")
-	}
-
-	// Serialize collection to JSON
+// SignCollection signs an attestation Collection and returns an Envelope.
+// The collection is wrapped in an in-toto Statement v1 before signing, so that
+// the verifier can parse it as: Statement → predicate → Collection.
+func (s *Signer) SignCollection(ctx context.Context, collection attestation.Collection) (*Envelope, error) {
+	// Compute a digest of the collection for the subject
 	collectionJSON, err := json.Marshal(collection)
 	if err != nil {
 		return nil, fmt.Errorf("marshal collection: %w", err)
 	}
+	digest := sha256.Sum256(collectionJSON)
 
-	// Create signer wrapper with the signing identity
-	signer := &spireSigner{identity: signingIdentity}
-
-	// Sign with DSSE
-	envelope, err := dsse.Sign(attestation.CollectionType, bytes.NewReader(collectionJSON),
-		dsse.SignWithSigners(signer),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("sign collection: %w", err)
+	// Wrap collection in an in-toto Statement
+	statement := Statement{
+		Type: StatementType,
+		Subject: []Subject{
+			{
+				Name: fmt.Sprintf("step:%s", collection.Name),
+				Digest: map[string]string{
+					"sha256": fmt.Sprintf("%x", digest),
+				},
+			},
+		},
+		PredicateType: attestation.CollectionType,
+		Predicate:     collection,
 	}
 
-	return &envelope, nil
+	// Sign using the standard Sign() path (PAE + in-toto envelope)
+	return s.Sign(ctx, statement)
 }
 
 // GetSigner returns a cryptoutil.Signer using the SPIRE identity.

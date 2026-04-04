@@ -4,6 +4,10 @@ sidebar_position: 1
 
 # Example: Compliance Evaluation
 
+:::info Implementation Status
+This example demonstrates the target policy format. **What works now:** tool allowlists, file access rules, resource limits, and identity constraints (model matching). **Not yet implemented:** `grants` enforcement ([#22](https://github.com/aflock-ai/aflock/issues/22)), Rego/AI evaluator execution ([#16](https://github.com/aflock-ai/aflock/issues/16)), and sublayout recursive verification ([#26](https://github.com/aflock-ai/aflock/issues/26)). Sublayout limit attenuation and accumulation work.
+:::
+
 A policy for automated OSCAL control assessment with sub-agent delegation.
 
 ## Policy

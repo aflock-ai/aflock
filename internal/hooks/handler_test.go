@@ -1972,3 +1972,155 @@ func TestIntegration_PreAndPostToolUse(t *testing.T) {
 		t.Errorf("expected 1 file read from post-tool, got %d", len(ss.Metrics.FilesRead))
 	}
 }
+
+// ----- Policy expiration enforcement -----
+
+func TestHandlePreToolUse_ExpiredPolicy_Ephemeral_Denies(t *testing.T) {
+	h := newTestHandler(t)
+
+	// Create a temp dir with an expired policy file
+	policyDir := t.TempDir()
+	expired := time.Now().Add(-1 * time.Hour)
+	polJSON := []byte(`{
+		"name": "expired-test",
+		"expires": "` + expired.Format(time.RFC3339) + `",
+		"tools": {"allow": ["Read"]}
+	}`)
+	if err := os.WriteFile(filepath.Join(policyDir, ".aflock"), polJSON, 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	input := &aflock.HookInput{
+		SessionID: "session-expired-ephemeral",
+		Cwd:       policyDir,
+		ToolName:  "Read",
+		ToolInput: json.RawMessage(`{"file_path": "main.go"}`),
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(input); err != nil {
+			t.Fatalf("handlePreToolUse error: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse output: %v (raw: %s)", err, got)
+	}
+	if out.HookSpecificOutput == nil {
+		t.Fatal("expected hookSpecificOutput")
+	}
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Errorf("expected deny for expired policy, got %v", out.HookSpecificOutput.PermissionDecision)
+	}
+	if out.HookSpecificOutput.PermissionDecisionReason == "" || !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "expired") {
+		t.Errorf("expected reason to mention 'expired', got: %s", out.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_ExpiredPolicy_SessionState_Denies(t *testing.T) {
+	h := newTestHandler(t)
+	expired := time.Now().Add(-1 * time.Hour)
+	pol := &aflock.Policy{
+		Name:    "expired-session",
+		Expires: &expired,
+		Tools: &aflock.ToolsPolicy{
+			Allow: []string{"Read"},
+		},
+	}
+	seedSession(t, h, "session-expired-state", pol)
+
+	input := &aflock.HookInput{
+		SessionID: "session-expired-state",
+		ToolName:  "Read",
+		ToolInput: json.RawMessage(`{"file_path": "main.go"}`),
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(input); err != nil {
+			t.Fatalf("handlePreToolUse error: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse output: %v (raw: %s)", err, got)
+	}
+	if out.HookSpecificOutput == nil {
+		t.Fatal("expected hookSpecificOutput")
+	}
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Errorf("expected deny for expired policy, got %v", out.HookSpecificOutput.PermissionDecision)
+	}
+	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "expired") {
+		t.Errorf("expected reason to mention 'expired', got: %s", out.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_FutureExpiry_Allows(t *testing.T) {
+	h := newTestHandler(t)
+	future := time.Now().Add(24 * time.Hour)
+	pol := &aflock.Policy{
+		Name:    "future-expiry",
+		Expires: &future,
+		Tools: &aflock.ToolsPolicy{
+			Allow: []string{"Read"},
+		},
+	}
+	seedSession(t, h, "session-future-expiry", pol)
+
+	input := &aflock.HookInput{
+		SessionID: "session-future-expiry",
+		ToolName:  "Read",
+		ToolInput: json.RawMessage(`{"file_path": "main.go"}`),
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(input); err != nil {
+			t.Fatalf("handlePreToolUse error: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse output: %v (raw: %s)", err, got)
+	}
+	if out.HookSpecificOutput == nil {
+		t.Fatal("expected hookSpecificOutput")
+	}
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionAllow {
+		t.Errorf("expected allow for non-expired policy, got %v", out.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestHandleSessionStart_ExpiredPolicy_IsChecked(t *testing.T) {
+	// handleSessionStart calls ExitWithError (os.Exit(2)) for expired policies,
+	// so we can't test it directly. Instead, verify that Policy.IsExpired()
+	// returns true for an expired policy, confirming the check will trigger.
+	expired := time.Now().Add(-1 * time.Hour)
+	pol := &aflock.Policy{
+		Name:    "expired-session-start",
+		Expires: &expired,
+	}
+	if !pol.IsExpired() {
+		t.Error("expected IsExpired() to return true for past expiration")
+	}
+
+	// Verify a future expiry does not trigger
+	future := time.Now().Add(24 * time.Hour)
+	polFuture := &aflock.Policy{
+		Name:    "future-session-start",
+		Expires: &future,
+	}
+	if polFuture.IsExpired() {
+		t.Error("expected IsExpired() to return false for future expiration")
+	}
+
+	// Verify nil expiry does not trigger
+	polNoExpiry := &aflock.Policy{
+		Name: "no-expiry",
+	}
+	if polNoExpiry.IsExpired() {
+		t.Error("expected IsExpired() to return false for nil expiration")
+	}
+}

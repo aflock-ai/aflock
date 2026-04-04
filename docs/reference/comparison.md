@@ -52,3 +52,7 @@ aflock is unique in combining:
 5. **Cross-step Rego**: Cumulative constraint checking
 6. **Sublayouts**: Hierarchical sub-agent delegation
 7. **Merkle proofs**: Session ordering and completeness
+
+:::caution
+Some features in the comparison table above reflect the target design. In the current alpha, Rego evaluators, Merkle proofs, full sublayout recursion, and identity verification are not yet implemented at runtime. See the [implementation status](https://github.com/aflock-ai/aflock/issues) for details.
+:::

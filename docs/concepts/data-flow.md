@@ -4,6 +4,10 @@ sidebar_position: 5
 
 # Data Flow Tracking
 
+:::info Implementation Status
+Data flow classification and flow rule enforcement are implemented in the hooks handler for direct file reads/writes. Note that Bash command analysis currently has a limited set of recognized file-reading commands — some commands (e.g., `grep`, `sed`, `awk`) may not trigger data flow checks. See [#25](https://github.com/aflock-ai/aflock/issues/25).
+:::
+
 aflock can classify data by sensitivity level and enforce rules preventing data from flowing between classifications.
 
 ## Why Data Flow Tracking?

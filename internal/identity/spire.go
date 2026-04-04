@@ -42,6 +42,10 @@ var TrustedModels = map[string]TrustedModel{
 		SPIFFEID: "spiffe://aflock.ai/agent/claude-haiku-3-5",
 		Selector: "aflock:model:claude-3-5-haiku-20241022",
 	},
+	"claude-opus-4-6": {
+		SPIFFEID: "spiffe://aflock.ai/agent/claude-opus-4-6",
+		Selector: "aflock:model:claude-opus-4-6",
+	},
 }
 
 // SpireClient connects to a SPIRE agent for workload identity.

@@ -2,6 +2,7 @@ package test
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/gobwas/glob"
@@ -40,7 +41,7 @@ func TestGlobMatching(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	// Just run the tests to see output
+	// Debug output for glob pattern behavior
 	patterns := []string{"**/*.go", "*.go", "**/*"}
 	values := []string{"main.go", "internal/policy/evaluator.go", "evaluator.go"}
 
@@ -56,4 +57,7 @@ func TestMain(m *testing.M) {
 		}
 		fmt.Println()
 	}
+
+	// Run all tests — without this call, no Test* functions execute.
+	os.Exit(m.Run())
 }

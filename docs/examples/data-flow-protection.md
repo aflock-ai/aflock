@@ -4,6 +4,10 @@ sidebar_position: 2
 
 # Example: Data Flow Protection
 
+:::info Implementation Status
+This example demonstrates the target policy format. **What works now:** data flow classification and flow rules for direct file operations, tool allowlists, file access rules, resource limits. **Known limitation:** Bash file-reading commands beyond the built-in set (cat, head, tail, etc.) are not analyzed for data flow — commands like `grep`, `sed`, `awk`, `cp` can bypass flow rules ([#25](https://github.com/aflock-ai/aflock/issues/25)). **SPIFFE functionaries** work for X509-SVIDs but the SPIFFE ID format in the implementation differs from the documented format.
+:::
+
 A policy preventing data exfiltration with sensitivity classification.
 
 ## Policy

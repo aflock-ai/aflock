@@ -4,6 +4,10 @@ sidebar_position: 0
 
 # Example: Feature Development
 
+:::info Implementation Status
+This example demonstrates the target policy format. **What works now:** tool allowlists, file access rules, resource limits (spend, tokens, turns, time), and `requireApproval` patterns. **Not yet implemented:** `requiredAttestations` enforcement, Rego evaluator execution, and AI evaluator execution. These are tracked in [#16](https://github.com/aflock-ai/aflock/issues/16) and [#17](https://github.com/aflock-ai/aflock/issues/17).
+:::
+
 A policy for constraining an AI agent implementing features in a todo app.
 
 ## Policy

@@ -10,5 +10,11 @@
   "repository": "https://github.com/aflock-ai/aflock",
   "license": "Apache-2.0",
   "keywords": ["security", "policy", "attestation", "spiffe", "spire"],
-  "hooks": "./hooks/hooks.json"
+  "hooks": "./hooks/hooks.json",
+  "skills": [
+    {
+      "name": "plan-to-policy",
+      "path": "../skills/plan-to-policy.md"
+    }
+  ]
 }

@@ -2231,8 +2231,9 @@ func TestVerifyDSSESignatures_ValidSig_NoFunctionaries(t *testing.T) {
 	}
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "test-key", Sig: base64.StdEncoding.EncodeToString(sig)},
 	}
@@ -2261,8 +2262,9 @@ func TestVerifyDSSESignatures_InvalidSig(t *testing.T) {
 	sig, _ := ecdsa.SignASN1(rand.Reader, wrongKey, hash[:])
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "wrong-key", Sig: base64.StdEncoding.EncodeToString(sig)},
 	}
@@ -2291,8 +2293,9 @@ func TestVerifyDSSESignatures_FunctionaryKeyID_Match(t *testing.T) {
 	sig, _ := ecdsa.SignASN1(rand.Reader, caKey, hash[:])
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "spiffe://aflock.ai/agent/test", Sig: base64.StdEncoding.EncodeToString(sig)},
 	}
@@ -2323,8 +2326,9 @@ func TestVerifyDSSESignatures_FunctionaryKeyID_Mismatch(t *testing.T) {
 	sig, _ := ecdsa.SignASN1(rand.Reader, caKey, hash[:])
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "spiffe://aflock.ai/agent/actual", Sig: base64.StdEncoding.EncodeToString(sig)},
 	}
@@ -2349,8 +2353,9 @@ func TestVerifyDSSESignatures_BadBase64Sig(t *testing.T) {
 	payloadType := "test/type"
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "k", Sig: "!!!not-base64!!!"},
 	}
@@ -2367,8 +2372,9 @@ func TestVerifyDSSESignatures_EmptySigs(t *testing.T) {
 	caCert, _ := generateTestCA(t)
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{}
 
 	step := &aflock.Step{Name: "test"}
@@ -2872,5 +2878,196 @@ func TestCheckResult_Struct(t *testing.T) {
 	}
 	if cr.Message != "exceeded" {
 		t.Errorf("Message = %q", cr.Message)
+	}
+}
+
+// ---- Embedded certificate verification tests ----
+
+// TestVerifyDSSESignatures_EmbeddedCert_ValidChain verifies that a signature
+// with an embedded leaf cert that chains to a trusted root passes verification.
+func TestVerifyDSSESignatures_EmbeddedCert_ValidChain(t *testing.T) {
+	// Create a trusted CA and a leaf cert signed by that CA.
+	caCert, caKey := generateTestCA(t)
+
+	// Generate a leaf cert with ExtKeyUsageAny so that x509.Verify (which
+	// defaults to checking for ExtKeyUsageServerAuth) accepts it.
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(10),
+		Subject: pkix.Name{
+			CommonName:   "leaf-signer",
+			Organization: []string{"Aflock Test"},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		BasicConstraintsValid: true,
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create leaf cert: %v", err)
+	}
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatalf("parse leaf cert: %v", err)
+	}
+
+	payload := []byte(`{"test":"embedded-cert-valid"}`)
+	payloadType := "application/vnd.in-toto+json"
+
+	// Build PAE and sign with the leaf key.
+	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
+	paeBytes := append([]byte(pae), payload...)
+	hash := sha256.Sum256(paeBytes)
+
+	sig, err := ecdsa.SignASN1(rand.Reader, leafKey, hash[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	// Embed the leaf cert PEM in the signature's Certificate field.
+	sigs := []struct {
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
+	}{
+		{
+			KeyID:       "leaf-key",
+			Sig:         base64.StdEncoding.EncodeToString(sig),
+			Certificate: certToPEM(leafCert),
+		},
+	}
+
+	// The trusted pool contains only the CA. The leaf is embedded in the signature.
+	step := &aflock.Step{Name: "test"}
+	err = verifyDSSESignatures(payloadType, payload, sigs, []*x509.Certificate{caCert}, step)
+	if err != nil {
+		t.Fatalf("expected valid embedded cert chain to pass, got: %v", err)
+	}
+}
+
+// TestVerifyDSSESignatures_EmbeddedCert_SelfSignedCA_Rejected verifies that an
+// attacker who crafts a self-signed CA cert (IsCA=true), embeds it in the
+// signature's Certificate field, and signs with their own key is REJECTED
+// because the cert does not chain to any trusted root in the pool.
+func TestVerifyDSSESignatures_EmbeddedCert_SelfSignedCA_Rejected(t *testing.T) {
+	// Create the legitimate trusted CA (this is the only root in the pool).
+	trustedCACert, _ := generateTestCA(t)
+
+	// Create an attacker-controlled self-signed CA cert.
+	attackerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate attacker key: %v", err)
+	}
+
+	attackerTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(99),
+		Subject: pkix.Name{
+			CommonName:   "Attacker CA",
+			Organization: []string{"Evil Corp"},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	attackerCertDER, err := x509.CreateCertificate(rand.Reader, attackerTemplate, attackerTemplate, &attackerKey.PublicKey, attackerKey)
+	if err != nil {
+		t.Fatalf("create attacker CA cert: %v", err)
+	}
+	attackerCert, err := x509.ParseCertificate(attackerCertDER)
+	if err != nil {
+		t.Fatalf("parse attacker CA cert: %v", err)
+	}
+
+	payload := []byte(`{"test":"self-signed-ca-attack"}`)
+	payloadType := "application/vnd.in-toto+json"
+
+	// Sign with the attacker's key.
+	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
+	paeBytes := append([]byte(pae), payload...)
+	hash := sha256.Sum256(paeBytes)
+
+	sig, err := ecdsa.SignASN1(rand.Reader, attackerKey, hash[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	// Embed the attacker's self-signed CA cert in the signature.
+	sigs := []struct {
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
+	}{
+		{
+			KeyID:       "attacker-key",
+			Sig:         base64.StdEncoding.EncodeToString(sig),
+			Certificate: certToPEM(attackerCert),
+		},
+	}
+
+	// Trusted pool only contains the legitimate CA, NOT the attacker's cert.
+	step := &aflock.Step{Name: "test"}
+	err = verifyDSSESignatures(payloadType, payload, sigs, []*x509.Certificate{trustedCACert}, step)
+	if err == nil {
+		t.Fatal("SECURITY: self-signed CA cert embedded in signature was accepted; it MUST be rejected")
+	}
+	if !strings.Contains(err.Error(), "no valid signature") {
+		t.Errorf("Error = %q, expected to contain 'no valid signature'", err.Error())
+	}
+}
+
+// TestVerifyDSSESignatures_EmbeddedCert_UntrustedLeaf_Rejected verifies that a
+// signature with an embedded leaf cert that does NOT chain to the trusted root
+// pool is rejected.
+func TestVerifyDSSESignatures_EmbeddedCert_UntrustedLeaf_Rejected(t *testing.T) {
+	// Create the legitimate trusted CA.
+	trustedCACert, _ := generateTestCA(t)
+
+	// Create a separate, untrusted CA and issue a leaf from it.
+	untrustedCACert, untrustedCAKey := generateTestCA(t)
+	_ = untrustedCACert // not added to the trusted pool
+	leafCert, leafKey := generateTestLeafCert(t, untrustedCACert, untrustedCAKey, "untrusted-leaf")
+
+	payload := []byte(`{"test":"untrusted-leaf"}`)
+	payloadType := "application/vnd.in-toto+json"
+
+	// Sign with the leaf key from the untrusted CA.
+	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
+	paeBytes := append([]byte(pae), payload...)
+	hash := sha256.Sum256(paeBytes)
+
+	sig, err := ecdsa.SignASN1(rand.Reader, leafKey, hash[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	// Embed the leaf cert in the signature.
+	sigs := []struct {
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
+	}{
+		{
+			KeyID:       "untrusted-leaf-key",
+			Sig:         base64.StdEncoding.EncodeToString(sig),
+			Certificate: certToPEM(leafCert),
+		},
+	}
+
+	// Trusted pool contains only the legitimate CA, not the one that issued this leaf.
+	step := &aflock.Step{Name: "test"}
+	err = verifyDSSESignatures(payloadType, payload, sigs, []*x509.Certificate{trustedCACert}, step)
+	if err == nil {
+		t.Fatal("Expected embedded leaf cert from untrusted CA to be rejected")
+	}
+	if !strings.Contains(err.Error(), "no valid signature") {
+		t.Errorf("Error = %q, expected to contain 'no valid signature'", err.Error())
 	}
 }
