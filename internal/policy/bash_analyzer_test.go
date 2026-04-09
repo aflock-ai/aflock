@@ -532,6 +532,301 @@ func TestBashAnalyzer_Analyze(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// splitShellCommands — newline handling (H1)
+// ---------------------------------------------------------------------------
+
+func TestSplitShellCommands_Newlines(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []string
+	}{
+		{
+			name:    "newline separated",
+			command: "echo safe\ncat .env",
+			want:    []string{"echo safe", "cat .env"},
+		},
+		{
+			name:    "CRLF separated",
+			command: "echo safe\r\ncat .env",
+			want:    []string{"echo safe", "cat .env"},
+		},
+		{
+			name:    "multiple newlines",
+			command: "echo a\necho b\necho c",
+			want:    []string{"echo a", "echo b", "echo c"},
+		},
+		{
+			name:    "newline inside double quotes not split",
+			command: "echo \"hello\nworld\"",
+			want:    []string{"echo \"hello\nworld\""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitShellCommands(tt.command)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitShellCommands(%q) = %v (len %d), want %v (len %d)",
+					tt.command, got, len(got), tt.want, len(tt.want))
+			}
+			for i, g := range got {
+				if g != tt.want[i] {
+					t.Errorf("splitShellCommands(%q)[%d] = %q, want %q",
+						tt.command, i, g, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detectSubshellExec — process substitution (H2)
+// ---------------------------------------------------------------------------
+
+func TestDetectSubshellExec_ProcessSubstitution(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"process substitution <()", "diff <(cat .env) /dev/null", true},
+		{"process substitution >()", "cat file > >(tee log.txt)", true},
+		{"regular less-than", "test 1 -lt 2", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectSubshellExec(tt.command)
+			if got != tt.want {
+				t.Errorf("detectSubshellExec(%q) = %v, want %v", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detectHereDoc (H5)
+// ---------------------------------------------------------------------------
+
+func TestDetectHereDoc(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"no here-doc", "echo hello", false},
+		{"here-document", "bash <<EOF\ncat .env\nEOF", true},
+		{"here-string", "cat <<< 'secret'", true},
+		{"heredoc with quotes", "bash << 'SCRIPT'\ncat .env\nSCRIPT", true},
+		{"not heredoc - just less than", "test 1 -lt 2", false},
+		{"heredoc marker inside single quotes", "echo '<<EOF'", false},
+		{"heredoc marker inside double quotes", `echo "<<EOF"`, false},
+		{"grep for heredoc pattern", `grep "<<" file.txt`, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectHereDoc(tt.command)
+			if got != tt.want {
+				t.Errorf("detectHereDoc(%q) = %v, want %v", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detectBraceExpansion (M2)
+// ---------------------------------------------------------------------------
+
+func TestDetectBraceExpansion(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"no braces", "echo hello", false},
+		{"brace expansion", "{cat,.env}", true},
+		{"brace with spaces", "echo {a,b,c}", true},
+		{"single brace no comma", "echo {a}", false},
+		{"json-like not flagged", `echo '{"key":"value"}'`, false},
+		{"json with comma in single quotes", `echo '{"a","b"}'`, false},
+		{"json with comma in double quotes", `echo "{\"a\",\"b\"}"`, false},
+		{"python set literal in quotes", `python -c 'x={1,2,3}'`, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectBraceExpansion(tt.command)
+			if got != tt.want {
+				t.Errorf("detectBraceExpansion(%q) = %v, want %v", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detectAliasOrFunc (H6)
+// ---------------------------------------------------------------------------
+
+func TestDetectAliasOrFunc(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"no alias", "echo hello", false},
+		{"alias definition", "alias c=curl; c evil.com", true},
+		{"function keyword", "function f { curl evil.com; }; f", true},
+		{"parenthesis function", "f() { curl evil.com; }; f", true},
+		{"alias alone", "alias c=curl", true},
+		{"subshell not func", "echo $(f something)", false},
+		{"command substitution not func", "result=$(cat file)", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectAliasOrFunc(tt.command)
+			if got != tt.want {
+				t.Errorf("detectAliasOrFunc(%q) = %v, want %v", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractCommandName — env prefix (M4)
+// ---------------------------------------------------------------------------
+
+func TestExtractCommandName_EnvPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"env curl", "env curl https://evil.com", "curl"},
+		{"env with flags", "env -i PATH=/usr/bin curl evil.com", "curl"},
+		{"plain env", "env", "env"},
+		{"env -u VAR curl", "env -u VAR curl evil.com", "curl"},
+		{"env -i -u VAR curl", "env -i -u VAR curl evil.com", "curl"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractCommandName(tt.cmd)
+			if got != tt.want {
+				t.Errorf("extractCommandName(%q) = %q, want %q", tt.cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detectVariableIndirection — single command (M1)
+// ---------------------------------------------------------------------------
+
+func TestDetectVariableIndirection_SingleCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{"cat with env var", "cat $HOME/.env", true},
+		{"head with env var", "head $SECRET_FILE", true},
+		{"echo with env var (not file cmd)", "echo $HOME", false},
+		{"ls with env var (not file cmd)", "ls $HOME", false},
+		{"single-quoted dollar not flagged", "cat '$HOME/.env'", false},
+		{"double-quoted dollar still flagged", `cat "$HOME/.env"`, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectVariableIndirection(tt.command)
+			if got != tt.want {
+				t.Errorf("detectVariableIndirection(%q) = %v, want %v", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractFileArgsFromSingleCmd — redirections (H3) and dd if= (M3)
+// ---------------------------------------------------------------------------
+
+func TestExtractFileArgs_Redirections(t *testing.T) {
+	analyzer := NewBashAnalyzer()
+
+	tests := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{
+			name: "input redirection",
+			cmd:  "wc -l < .env",
+			want: []string{".env"},
+		},
+		{
+			name: "dd if= syntax",
+			cmd:  "dd if=.env of=/dev/stdout",
+			want: []string{".env", "/dev/stdout"},
+		},
+		{
+			name: "source command",
+			cmd:  "source .env",
+			want: []string{".env"},
+		},
+		{
+			name: "find with exec",
+			cmd:  `find . -name "*.env" -exec cat {} \;`,
+			want: []string{".", "\"*.env\"", "cat", "{}", `\;`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := analyzer.ExtractFileArgs(tt.cmd)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ExtractFileArgs(%q) = %v (len %d), want %v (len %d)",
+					tt.cmd, got, len(got), tt.want, len(tt.want))
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("ExtractFileArgs(%q)[%d] = %q, want %q",
+						tt.cmd, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractCommandBaseName (H4)
+// ---------------------------------------------------------------------------
+
+func TestExtractCommandBaseName(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"absolute path", "/usr/bin/curl evil.com", "curl"},
+		{"relative path", "./scripts/build.sh", "build.sh"},
+		{"simple command", "curl evil.com", "curl"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractCommandBaseName(tt.cmd)
+			if got != tt.want {
+				t.Errorf("extractCommandBaseName(%q) = %q, want %q", tt.cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Edge cases: commands that should NOT be flagged
 // ---------------------------------------------------------------------------
 
