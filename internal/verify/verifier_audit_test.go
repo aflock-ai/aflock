@@ -380,12 +380,11 @@ func TestTopoSort_CycleShouldBeError(t *testing.T) {
 		"B": {Name: "B", ArtifactsFrom: []string{"A"}},
 	}
 
-	sorted := topoSortSteps(steps)
+	_, err := topoSortSteps(steps)
 
-	// Currently returns both steps in alphabetical order (cycle fallback)
-	if len(sorted) == 2 {
-		t.Log("BUG-VERIFY-9: topoSortSteps silently accepts cycle A->B->A")
-		t.Log("Supply chain verification with cyclic dependencies should be an error")
+	// Fixed: topoSortSteps now returns an error on cycles
+	if err == nil {
+		t.Error("BUG-VERIFY-9: topoSortSteps should return error for cycle A->B->A")
 	}
 }
 

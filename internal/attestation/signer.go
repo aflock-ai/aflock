@@ -340,13 +340,27 @@ func createPAE(payloadType string, payload []byte) []byte {
 }
 
 // signWithPrivateKey signs data using the provided private key.
+// Ed25519 signs the raw message (not a hash), while ECDSA/RSA sign a SHA-256 digest.
 func signWithPrivateKey(privateKey interface{}, data []byte) ([]byte, error) {
-	hash := sha256.Sum256(data)
-
 	switch key := privateKey.(type) {
+	case ed25519.PrivateKey:
+		// Ed25519 is a full-message signature scheme — sign raw data, not a hash.
+		// The verifier calls ed25519.Verify(key, rawPAE, sig), so the signer must
+		// use ed25519.Sign(key, rawPAE) to produce compatible signatures.
+		return ed25519.Sign(key, data), nil
 	case *ecdsa.PrivateKey:
+		hash := sha256.Sum256(data)
 		return ecdsa.SignASN1(rand.Reader, key, hash[:])
+	case *rsa.PrivateKey:
+		hash := sha256.Sum256(data)
+		return rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
 	case crypto.Signer:
+		// For other crypto.Signer implementations (e.g., KMS-backed keys),
+		// check if the underlying key is Ed25519 to avoid pre-hashing.
+		if _, ok := key.Public().(ed25519.PublicKey); ok {
+			return key.Sign(rand.Reader, data, crypto.Hash(0))
+		}
+		hash := sha256.Sum256(data)
 		return key.Sign(rand.Reader, hash[:], crypto.SHA256)
 	default:
 		return nil, fmt.Errorf("unsupported key type: %T", privateKey)
