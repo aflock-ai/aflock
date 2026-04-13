@@ -122,9 +122,15 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return nil
 	}
 
-	// Discover agent identity
+	// Discover agent identity. If the policy has identity constraints
+	// (AllowedModels), a discovery failure must block the session — otherwise
+	// the constraint is silently bypassed (issue #60 / H7).
 	agentIdentity, err := identity.DiscoverAgentIdentity()
 	if err != nil {
+		if pol != nil && pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
+			output.ExitWithError(fmt.Sprintf("[aflock] Identity discovery failed and policy requires allowedModels: %v", err))
+			return nil
+		}
 		output.ExitWithWarning(fmt.Sprintf("Failed to discover agent identity: %v", err))
 		return nil
 	}

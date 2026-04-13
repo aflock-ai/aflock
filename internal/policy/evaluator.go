@@ -354,11 +354,12 @@ func (e *Evaluator) extractInputForMatching(toolName string, toolInput json.RawM
 			return input.Pattern
 		}
 	case toolGrep:
+		// Deny rules target what's being searched for (the pattern), not where.
+		// File-level restrictions are handled separately by file deny rules.
+		// Returning Path here caused Grep:password to match against /src/file.go
+		// instead of the search term "password" (issue #60 / I5).
 		var input aflock.GrepToolInput
 		if err := json.Unmarshal(toolInput, &input); err == nil {
-			if input.Path != "" {
-				return input.Path
-			}
 			return input.Pattern
 		}
 	case toolNotebookEdit:
@@ -1010,8 +1011,8 @@ func (e *Evaluator) CheckLimits(metrics *aflock.SessionMetrics, enforcementMode 
 		if limit.Enforcement != enforcementMode {
 			return false, "", ""
 		}
-		if current > limit.Value {
-			return true, name, fmt.Sprintf("%s exceeded: %.2f > %.2f", name, current, limit.Value)
+		if current >= limit.Value {
+			return true, name, fmt.Sprintf("%s exceeded: %.2f >= %.2f", name, current, limit.Value)
 		}
 		return false, "", ""
 	}

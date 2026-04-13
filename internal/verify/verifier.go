@@ -76,10 +76,22 @@ func NewVerifier() *Verifier {
 	}
 }
 
+// maxSublayoutDepth is the maximum recursion depth for sublayout verification.
+// Prevents stack overflow from cyclic or deeply nested sublayout chains (issue #60 / I4).
+const maxSublayoutDepth = 10
+
 // VerifySession verifies a session's attestations against its policy.
 //
 //nolint:gocognit,gocyclo,funlen // session verification requires many validation steps
 func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
+	return v.verifySessionWithDepth(sessionID, 0)
+}
+
+func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result, error) {
+	if depth > maxSublayoutDepth {
+		return nil, fmt.Errorf("sublayout recursion depth exceeded (%d > %d)", depth, maxSublayoutDepth)
+	}
+
 	result := &Result{
 		SessionID:  sessionID,
 		VerifiedAt: time.Now(),
@@ -334,7 +346,7 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 
 	// Check 5: Sublayout recursion (Phase 6)
 	if len(sessionState.Policy.Sublayouts) > 0 && len(sessionState.ChildSessionIDs) > 0 {
-		sublayoutErrors := v.verifySublayouts(sessionState)
+		sublayoutErrors := v.verifySublayouts(sessionState, depth)
 		if len(sublayoutErrors) > 0 {
 			result.Success = false
 			for _, msg := range sublayoutErrors {
@@ -1493,7 +1505,7 @@ func topoSortSteps(steps map[string]aflock.Step) ([]string, error) {
 //  4. Accumulates child spend toward parent metrics
 //
 //nolint:gocognit // sublayout verification requires many checks
-func (v *Verifier) verifySublayouts(parentState *aflock.SessionState) []string {
+func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int) []string {
 	if len(parentState.Policy.Sublayouts) == 0 {
 		return nil
 	}
@@ -1525,7 +1537,7 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState) []string {
 			childFound = true
 
 			// 3. Recursively verify the child session
-			childResult, err := v.VerifySession(childID)
+			childResult, err := v.verifySessionWithDepth(childID, depth+1)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("sublayout %q: verify child %s: %v", sub.Name, childID, err))
 				continue
