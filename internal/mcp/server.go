@@ -197,27 +197,8 @@ func (s *Server) Serve(policyPath string) error {
 		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
 	}
 
-	// Initialize attestation signer with SPIRE
-	s.signer = attestation.NewSigner("") // Uses default SPIRE socket
-	ctx := context.Background()
-	if err := s.signer.Initialize(ctx); err != nil { //nolint:nestif
-		fmt.Fprintf(os.Stderr, "[aflock] Warning: SPIRE not available, attestation signing disabled: %v\n", err)
-		s.signingEnabled = false
-	} else {
-		s.signingEnabled = true
-		fmt.Fprintf(os.Stderr, "[aflock] SPIRE attestation signing enabled\n")
-
-		// Try to get delegated identity for the AI agent
-		// Model name comes from PID-based discovery (via agentIdentity)
-		if s.agentIdentity != nil && s.agentIdentity.Model != "" && s.agentIdentity.Model != "unknown" {
-			if err := s.signer.SetModel(ctx, s.agentIdentity.Model); err != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: %v\n", err)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: No model discovered from PID trace - attestation signing disabled\n")
-			s.signingEnabled = false
-		}
-	}
+	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
+	s.initSigning()
 
 	// Initialize JWT authorization
 	if err := s.initAuth(); err != nil {
@@ -271,6 +252,9 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		}
 	}
 
+	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
+	s.initSigning()
+
 	// Initialize JWT authorization
 	if err := s.initAuth(); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
@@ -311,6 +295,52 @@ func (s *Server) computePolicyDigest() string {
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+// initSigning initializes attestation signing with a 3-tier fallback chain
+// matching the hooks mode behavior (handler.go:547-562):
+//
+//  1. SPIRE — delegated identity from a SPIRE agent (strongest, infrastructure-backed)
+//  2. Fulcio — keyless signing via OIDC tokens (CI/CD environments)
+//  3. Ephemeral — fresh ECDSA P-256 key (always available, weakest)
+//
+// The model=unknown check that previously disabled signing is removed —
+// an unknown model is recorded in the attestation predicate without
+// preventing signing (issue #55).
+func (s *Server) initSigning() {
+	s.signer = attestation.NewSigner("")
+	ctx := context.Background()
+
+	identityHash := ""
+	if s.agentIdentity != nil {
+		identityHash = s.agentIdentity.IdentityHash
+	}
+
+	if err := s.signer.Initialize(ctx); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: SPIRE\n")
+		if s.agentIdentity != nil && s.agentIdentity.Model != "" && s.agentIdentity.Model != "unknown" {
+			if setErr := s.signer.SetModel(ctx, s.agentIdentity.Model); setErr != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: %v\n", setErr)
+			}
+		}
+		return
+	}
+
+	if err := s.signer.InitializeFulcio(ctx); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: Fulcio (keyless)\n")
+		return
+	}
+
+	if err := s.signer.InitializeEphemeral(identityHash); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: ephemeral key\n")
+		return
+	}
+
+	s.signingEnabled = false
+	fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)\n")
 }
 
 // initAuth initializes the JWT token issuer. If SPIRE is available and provides
@@ -411,7 +441,7 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 // signAndStoreAttestation creates a signed attestation for an action and stores it to disk.
 func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.ActionRecord) error {
 	if !s.signingEnabled {
-		return nil // Signing not available, skip silently
+		return fmt.Errorf("attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)")
 	}
 
 	// Get session metrics
@@ -1028,7 +1058,7 @@ func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallTool
 	}
 
 	if !s.signingEnabled {
-		return mcp.NewToolResultError("Attestation signing not available (SPIRE not connected)"), nil
+		return mcp.NewToolResultError("Attestation signing not available (SPIRE, Fulcio, and ephemeral key all failed during initialization)"), nil
 	}
 
 	predicateType := request.GetString("predicate_type", "")
