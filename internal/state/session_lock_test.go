@@ -3,6 +3,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -177,7 +178,7 @@ func TestSave_AtomicRename(t *testing.T) {
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".tmp" || len(e.Name()) > 0 && e.Name()[0] == '.' {
 			// Allow dotfiles like .state.lock; only fail on leftover tmp.
-			if filepath.HasPrefix(e.Name(), ".state.json.tmp") {
+			if strings.HasPrefix(e.Name(), ".state.json.tmp") {
 				t.Errorf("leftover temp file: %s", e.Name())
 			}
 		}
