@@ -85,6 +85,15 @@ func (h *Handler) Handle(hookName string) error {
 
 // handleSessionStart initializes session state and loads policy.
 func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", lockErr))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Try to load policy from cwd or env
 	var pol *aflock.Policy
 	var policyPath string
@@ -266,6 +275,18 @@ func (h *Handler) buildPolicyContext(pol *aflock.Policy, agentIdentity *identity
 
 // handlePreToolUse evaluates policy before tool execution.
 func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
+	// Hold an exclusive file lock across the entire load-modify-save cycle so
+	// that concurrent hook invocations for the same session cannot lose
+	// writes via a TOCTOU race (issue #58 / H9).
+	if input.SessionID != "" {
+		unlock, err := h.stateManager.LockSession(input.SessionID)
+		if err != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", err))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Load session state. If session ID is empty or invalid, treat as no
 	// session state and fall through to ephemeral policy loading below.
 	var sessionState *aflock.SessionState
@@ -278,8 +299,17 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// If the on-disk session state file exists but its Policy is nil (corruption
+	// or tampering), fail closed rather than silently falling through to the
+	// ephemeral policy loader — which would otherwise allow-all whenever no
+	// .aflock file is discoverable from cwd (issue #58 / M13).
+	if sessionState != nil && sessionState.Policy == nil {
+		return output.Write(output.PreToolUseDeny(
+			"[aflock] BLOCKED: session state is present but policy is missing (possible corruption); refusing to fall through to ephemeral policy"))
+	}
+
 	// If no session state, try to load policy directly (for when SessionStart wasn't run)
-	if sessionState == nil || sessionState.Policy == nil {
+	if sessionState == nil {
 		var pol *aflock.Policy
 		var policyPath string
 		var loadErr error
@@ -397,6 +427,15 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 
 // handlePostToolUse records tool execution and updates metrics.
 func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", lockErr))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Load session state. Skip loading if no session ID (ephemeral session).
 	var sessionState *aflock.SessionState
 	if input.SessionID != "" {
@@ -598,6 +637,12 @@ func (h *Handler) handlePermissionRequest(input *aflock.HookInput) error {
 
 // handleUserPromptSubmit validates prompt against policy.
 func (h *Handler) handleUserPromptSubmit(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr == nil {
+			defer unlock()
+		}
+	}
 	// Load session state
 	sessionState, err := h.stateManager.Load(input.SessionID)
 	if err != nil {
@@ -665,13 +710,29 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 	if input.SessionID == "" {
 		return output.Write(output.StopAllow())
 	}
+	// Lock the child session for its lifetime in this handler.
+	childUnlock, lockErr := h.stateManager.LockSession(input.SessionID)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock child session: %v\n", lockErr)
+	} else {
+		defer childUnlock()
+	}
 	childState, err := h.stateManager.Load(input.SessionID)
 	if err != nil || childState == nil {
 		return output.Write(output.StopAllow())
 	}
 
-	// If child has a parent, merge results back
+	// If child has a parent, merge results back. Lock the parent separately —
+	// child and parent IDs differ so no deadlock, and the parent lock protects
+	// any concurrent writer in the parent process.
 	if childState.ParentSessionID != "" {
+		parentUnlock, parentLockErr := h.stateManager.LockSession(childState.ParentSessionID)
+		if parentLockErr != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock parent session %s: %v\n",
+				childState.ParentSessionID, parentLockErr)
+		} else {
+			defer parentUnlock()
+		}
 		parentState, loadErr := h.stateManager.Load(childState.ParentSessionID)
 		if loadErr != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to load parent session %s: %v\n",
@@ -699,6 +760,12 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 
 // handleSessionEnd finalizes attestations and runs verification.
 func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr == nil {
+			defer unlock()
+		}
+	}
 	sessionState, err := h.stateManager.Load(input.SessionID)
 	if err != nil {
 		return output.WriteEmpty()

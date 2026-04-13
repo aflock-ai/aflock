@@ -1102,14 +1102,24 @@ func computePredicateDigest(predicate interface{}) string {
 }
 
 // recordAction records an action in the session state.
-// Must hold sessionMu or be called from a context where session state
-// is not concurrently accessed.
+//
+// Acquires both the in-process sessionMu (serializing concurrent MCP request
+// handlers in this process) and an exclusive file lock via LockSession
+// (serializing against other aflock processes — e.g. concurrent hook
+// invocations sharing the same state directory). This closes the TOCTOU race
+// on the state file described in issue #58 / M6.
 func (s *Server) recordAction(toolName, decision, reason string) {
 	if s.policy == nil {
 		return
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	unlock, err := s.stateManager.LockSession(s.sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock session state: %v\n", err)
+		return
+	}
+	defer unlock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState == nil {
 		return
@@ -1125,14 +1135,21 @@ func (s *Server) recordAction(toolName, decision, reason string) {
 }
 
 // trackFile tracks a file access in the session state.
-// Must hold sessionMu or be called from a context where session state
-// is not concurrently accessed.
+//
+// Acquires both the in-process sessionMu and an exclusive cross-process file
+// lock, mirroring recordAction. See issue #58 / M6.
 func (s *Server) trackFile(toolName, filePath string) {
 	if s.policy == nil {
 		return
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	unlock, err := s.stateManager.LockSession(s.sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock session state: %v\n", err)
+		return
+	}
+	defer unlock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState == nil {
 		return

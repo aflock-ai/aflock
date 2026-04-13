@@ -1688,9 +1688,13 @@ func TestHandlePreToolUse_WildcardAllow(t *testing.T) {
 	}
 }
 
-// ----- PreToolUse: nil policy in session -> allow -----
-
-func TestHandlePreToolUse_NilPolicyInSession_FallsThrough(t *testing.T) {
+// ----- PreToolUse: nil policy in existing session state -> fail closed -----
+//
+// Regression for issue #58 / M13. A session state file exists on disk but its
+// Policy field is nil (corruption or tampering). The handler must fail closed
+// rather than fall through to the ephemeral policy loader — which would
+// otherwise allow-all whenever no .aflock file is discoverable from cwd.
+func TestHandlePreToolUse_NilPolicyInSession_FailsClosed(t *testing.T) {
 	h := newTestHandler(t)
 	// Create a session but with nil policy, and cwd has no policy
 	ss := h.stateManager.Initialize("session-nil-pol", nil, "")
@@ -1713,8 +1717,9 @@ func TestHandlePreToolUse_NilPolicyInSession_FallsThrough(t *testing.T) {
 	if err := json.Unmarshal([]byte(got), &out); err != nil {
 		t.Fatalf("unmarshal output: %v", err)
 	}
-	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionAllow {
-		t.Errorf("expected allow when no policy found, got %v", out.HookSpecificOutput.PermissionDecision)
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Errorf("expected deny (fail-closed) when session state has nil policy, got %v",
+			out.HookSpecificOutput.PermissionDecision)
 	}
 }
 
