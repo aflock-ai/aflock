@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -76,9 +77,16 @@ func (s *Signer) InitializeEphemeral(agentIdentityHash string) error {
 		return fmt.Errorf("generate ephemeral key: %w", err)
 	}
 
-	// Create a self-signed certificate for the ephemeral key
+	// Create a self-signed certificate for the ephemeral key.
+	// Use a random 128-bit serial to avoid collisions and meet RFC 5280 §4.1.2.2
+	// which recommends serials contain at least 20 bits of entropy.
+	serialMax := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialMax)
+	if err != nil {
+		return fmt.Errorf("generate certificate serial: %w", err)
+	}
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serial,
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -125,8 +133,19 @@ func (s *Signer) GetSigningIdentity() (*identity.Identity, string) {
 	return s.identity, ""
 }
 
-// Close releases resources.
+// Close releases resources and securely wipes ephemeral key material from
+// memory. The wipe is best-effort — the Go runtime may have copied the key
+// bytes during GC or stack growth — but it eliminates the most common heap
+// dump / core dump exposure window (issue #57 / L1).
 func (s *Signer) Close() error {
+	if s.identity != nil && s.identity.PrivateKey != nil {
+		if key, ok := s.identity.PrivateKey.(ed25519.PrivateKey); ok {
+			for i := range key {
+				key[i] = 0
+			}
+		}
+		s.identity.PrivateKey = nil
+	}
 	if s.spireClient != nil {
 		return s.spireClient.Close()
 	}
@@ -326,10 +345,27 @@ func (s *Signer) Sign(ctx context.Context, statement Statement) (*Envelope, erro
 	return envelope, nil
 }
 
-// createPAE creates Pre-Authentication Encoding for DSSE.
-// Uses byte slice concatenation instead of fmt.Sprintf to avoid
-// corrupting non-UTF-8 payload bytes via string() conversion.
+// createPAE creates Pre-Authentication Encoding per the DSSE v1 spec.
+// Format: "DSSEv1" || LE64(len(payloadType)) || payloadType || LE64(len(payload)) || payload
+// where LE64 is a 64-bit unsigned little-endian integer (8 bytes).
+// This matches the canonical encoding produced by go-securesystemslib and is
+// required for interoperability with standard DSSE verification tooling.
 func createPAE(payloadType string, payload []byte) []byte {
+	typeBytes := []byte(payloadType)
+	buf := make([]byte, 0, 6+8+len(typeBytes)+8+len(payload))
+	buf = append(buf, "DSSEv1"...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(typeBytes)))
+	buf = append(buf, typeBytes...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(payload)))
+	buf = append(buf, payload...)
+	return buf
+}
+
+// createPAELegacy reproduces the previous (non-spec-compliant) PAE encoding
+// that used ASCII decimal lengths with space separators. Verification code
+// falls back to this format so that attestations signed before the H10 fix
+// continue to verify.
+func createPAELegacy(payloadType string, payload []byte) []byte {
 	prefix := fmt.Sprintf("DSSEv1 %d %s %d ",
 		len(payloadType), payloadType,
 		len(payload))
@@ -414,9 +450,13 @@ func VerifyEnvelope(envelope *Envelope, trustedCerts []*x509.Certificate) error 
 		return fmt.Errorf("decode payload: %w", err)
 	}
 
-	// Create PAE
+	// Create PAE (spec-compliant binary LE64 encoding).
 	pae := createPAE(envelope.PayloadType, payload)
 	hash := sha256.Sum256(pae)
+	// Legacy PAE for backward compatibility with attestations signed before
+	// the H10 fix. Only computed lazily if the spec-compliant PAE fails.
+	var paeLegacy []byte
+	var hashLegacy [32]byte
 
 	// Verify each signature
 	for _, sig := range envelope.Signatures {
@@ -425,7 +465,9 @@ func VerifyEnvelope(envelope *Envelope, trustedCerts []*x509.Certificate) error 
 			return fmt.Errorf("decode signature: %w", err)
 		}
 
-		// Find matching certificate — supports ECDSA, RSA, and Ed25519
+		// Find matching certificate — supports ECDSA, RSA, and Ed25519.
+		// RSA is pinned to PKCS1v15 (matching what the signer produces) to
+		// prevent padding-confusion attacks (issue #57 / L3).
 		verified := false
 		for _, cert := range trustedCerts {
 			switch key := cert.PublicKey.(type) {
@@ -436,11 +478,31 @@ func VerifyEnvelope(envelope *Envelope, trustedCerts []*x509.Certificate) error 
 			case *rsa.PublicKey:
 				if rsa.VerifyPKCS1v15(key, crypto.SHA256, hash[:], sigBytes) == nil {
 					verified = true
-				} else if rsa.VerifyPSS(key, crypto.SHA256, hash[:], sigBytes, nil) == nil {
-					verified = true
 				}
 			case ed25519.PublicKey:
 				if ed25519.Verify(key, pae, sigBytes) {
+					verified = true
+				}
+			}
+			if verified {
+				break
+			}
+			// Try legacy PAE format if spec-compliant didn't match.
+			if paeLegacy == nil {
+				paeLegacy = createPAELegacy(envelope.PayloadType, payload)
+				hashLegacy = sha256.Sum256(paeLegacy)
+			}
+			switch key := cert.PublicKey.(type) {
+			case *ecdsa.PublicKey:
+				if ecdsa.VerifyASN1(key, hashLegacy[:], sigBytes) {
+					verified = true
+				}
+			case *rsa.PublicKey:
+				if rsa.VerifyPKCS1v15(key, crypto.SHA256, hashLegacy[:], sigBytes) == nil {
+					verified = true
+				}
+			case ed25519.PublicKey:
+				if ed25519.Verify(key, paeLegacy, sigBytes) {
 					verified = true
 				}
 			}

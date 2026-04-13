@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -716,9 +717,11 @@ func verifyDSSESignaturesNoFunctionary(payloadType string, payload []byte, signa
 	Sig         string `json:"sig"`
 	Certificate string `json:"certificate,omitempty"`
 }, trustedCerts []*x509.Certificate) error {
-	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
-	paeBytes := append([]byte(pae), payload...)
+	paeBytes := createDSSEPAE(payloadType, payload)
 	hash := sha256.Sum256(paeBytes)
+	// Legacy PAE for backward compatibility with pre-H10-fix attestations.
+	paeBytesLegacy := createDSSEPAELegacy(payloadType, payload)
+	hashLegacy := sha256.Sum256(paeBytesLegacy)
 
 	rootPool := x509.NewCertPool()
 	for _, cert := range trustedCerts {
@@ -744,7 +747,8 @@ func verifyDSSESignaturesNoFunctionary(payloadType string, payload []byte, signa
 		}
 
 		for _, cert := range candidates {
-			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) {
+			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) &&
+				!verifySignatureWithCert(cert, paeBytesLegacy, hashLegacy[:], sigBytes) {
 				continue
 			}
 
@@ -1227,10 +1231,11 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 	Sig         string `json:"sig"`
 	Certificate string `json:"certificate,omitempty"`
 }, trustedCerts []*x509.Certificate, step *aflock.Step) error {
-	// Create PAE (Pre-Authentication Encoding)
-	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
-	paeBytes := append([]byte(pae), payload...)
+	// Create PAE (Pre-Authentication Encoding) — both spec-compliant and legacy.
+	paeBytes := createDSSEPAE(payloadType, payload)
 	hash := sha256.Sum256(paeBytes)
+	paeBytesLegacy := createDSSEPAELegacy(payloadType, payload)
+	hashLegacy := sha256.Sum256(paeBytesLegacy)
 
 	// Build a cert pool from trusted roots for chain validation
 	rootPool := x509.NewCertPool()
@@ -1259,9 +1264,10 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 			}
 		}
 
-		// Verify the signature against each candidate cert
+		// Verify the signature against each candidate cert (try both PAE formats)
 		for _, cert := range candidates {
-			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) {
+			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) &&
+				!verifySignatureWithCert(cert, paeBytesLegacy, hashLegacy[:], sigBytes) {
 				continue
 			}
 
@@ -1295,11 +1301,9 @@ func verifySignatureWithCert(cert *x509.Certificate, paeBytes, hash, sig []byte)
 	case *ecdsa.PublicKey:
 		return ecdsa.VerifyASN1(key, hash, sig)
 	case *rsa.PublicKey:
-		// Try PKCS1v15 first (more common), fall back to PSS
-		if rsa.VerifyPKCS1v15(key, crypto.SHA256, hash, sig) == nil {
-			return true
-		}
-		return rsa.VerifyPSS(key, crypto.SHA256, hash, sig, nil) == nil
+		// Pinned to PKCS1v15 to match what the signer produces and prevent
+		// padding-confusion attacks (issue #57 / L3).
+		return rsa.VerifyPKCS1v15(key, crypto.SHA256, hash, sig) == nil
 	case ed25519PublicKey:
 		// Ed25519 signs the raw message, not a hash. The rookery DSSE signer
 		// calls ed25519.Sign(key, PAE) directly (unlike ECDSA/RSA which hash first),
@@ -1308,6 +1312,30 @@ func verifySignatureWithCert(cert *x509.Certificate, paeBytes, hash, sig []byte)
 	default:
 		return false
 	}
+}
+
+// createDSSEPAE creates Pre-Authentication Encoding per the DSSE v1 spec.
+// Format: "DSSEv1" || LE64(len(payloadType)) || payloadType || LE64(len(payload)) || payload
+func createDSSEPAE(payloadType string, payload []byte) []byte {
+	typeBytes := []byte(payloadType)
+	buf := make([]byte, 0, 6+8+len(typeBytes)+8+len(payload))
+	buf = append(buf, "DSSEv1"...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(typeBytes)))
+	buf = append(buf, typeBytes...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(payload)))
+	buf = append(buf, payload...)
+	return buf
+}
+
+// createDSSEPAELegacy reproduces the previous (non-spec-compliant) PAE encoding
+// with ASCII decimal lengths for backward-compatible verification.
+func createDSSEPAELegacy(payloadType string, payload []byte) []byte {
+	prefix := fmt.Sprintf("DSSEv1 %d %s %d ",
+		len(payloadType), payloadType, len(payload))
+	result := make([]byte, 0, len(prefix)+len(payload))
+	result = append(result, []byte(prefix)...)
+	result = append(result, payload...)
+	return result
 }
 
 // matchesFunctionary checks whether a signing certificate and key ID satisfy
