@@ -111,6 +111,10 @@ func TestGetModelForBackend(t *testing.T) {
 
 func mockAnthropicServer(t *testing.T, status, reason string) *httptest.Server {
 	t.Helper()
+	// httptest binds to 127.0.0.1; the SSRF guard added in issue #61 / M9
+	// blocks loopback at dial time. Opt in for tests, the same escape hatch
+	// users set when running a self-hosted Anthropic-compatible proxy.
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") == "" {
 			http.Error(w, "missing api key", http.StatusUnauthorized)

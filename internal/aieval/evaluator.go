@@ -174,7 +174,7 @@ func evaluateAnthropic(ctx context.Context, pol Policy, materialsJSON []byte, ap
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", anthropicAPIVersion)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := safeHTTPClient(evalTimeout).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic API request failed: %w", err)
 	}
@@ -271,7 +271,7 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := safeHTTPClient(evalTimeout).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ollama API request failed: %w", err)
 	}
@@ -415,6 +415,70 @@ func validateURL(rawURL string) error {
 		}
 	}
 	return nil
+}
+
+// safeHTTPClient returns an *http.Client whose transport refuses connections
+// to any address that fails blockedIPReason at dial time, and whose redirect
+// handler re-runs validateURL on every hop.
+//
+// This closes two SSRF gaps that pure URL-string validation cannot:
+//
+//  1. DNS rebinding TOCTOU — the dial-time IP check happens after DNS
+//     resolution by Go's resolver but before the TCP connect, so an
+//     attacker who flips DNS between LookupIP() and Dial cannot reach an
+//     internal address.
+//  2. HTTP redirect bypass — a 302 from a permitted public host to an
+//     internal URL would otherwise sail through; CheckRedirect rejects it.
+//
+// The opt-in env var AFLOCK_AIEVAL_ALLOW_INTERNAL=1 still applies (cloud
+// metadata IPs are always rejected).
+func safeHTTPClient(timeout time.Duration) *http.Client {
+	allowInternal := os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve %s: %w", host, err)
+			}
+			for _, ip := range ips {
+				reason := blockedIPReason(ip)
+				if reason == "" {
+					continue
+				}
+				if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+					return nil, fmt.Errorf("dial %s: blocked cloud metadata IP %s", addr, ip)
+				}
+				if !allowInternal {
+					return nil, fmt.Errorf("dial %s: blocked address %s (%s)", addr, ip, reason)
+				}
+			}
+			// Dial the first acceptable IP directly — re-resolving in
+			// dialer.DialContext would reintroduce the rebinding window.
+			for _, ip := range ips {
+				if reason := blockedIPReason(ip); reason != "" && !allowInternal {
+					continue
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			}
+			return nil, fmt.Errorf("dial %s: no acceptable IP", addr)
+		},
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return validateURL(req.URL.String())
+		},
+	}
 }
 
 // blockedIPReason returns a non-empty reason string when ip falls into a
