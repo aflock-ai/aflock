@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,6 +47,19 @@ type Server struct {
 
 	// JWT authorization
 	tokenIssuer *auth.TokenIssuer
+
+	// authActive is set to true the moment any goroutine starts processing
+	// a get_token request, so concurrent tool-call goroutines can no longer
+	// observe a stale "no token issued" state from disk. Closes the TOCTOU
+	// race in issue #59 / H11. atomic.Bool gives us a lock-free fast path
+	// for every validateJWT call.
+	authActive atomic.Bool
+
+	// requireToken, when true, denies any tool call that arrives without a
+	// valid JWT — even before the first get_token call. Toggled via the
+	// AFLOCK_REQUIRE_TOKEN=1 env var. Closes the unauthenticated bootstrap
+	// window (issue #59 / M10). Default false for backward compatibility.
+	requireToken bool
 }
 
 // NewServer creates a new aflock MCP server.
@@ -58,6 +72,7 @@ func NewServer() *Server {
 		stateManager: state.NewManager(""),
 		sessionID:    fmt.Sprintf("mcp-%s", uuid.New().String()),
 		attestDir:    attestDir,
+		requireToken: os.Getenv("AFLOCK_REQUIRE_TOKEN") == "1",
 	}
 
 	// Create the MCP server
@@ -370,6 +385,13 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError("Token issuer not initialized"), nil
 	}
 
+	// Flip auth-active synchronously, BEFORE any IO. From this instant on,
+	// concurrent validateJWT goroutines will see auth as active and require
+	// a token — closing the TOCTOU window where a tool call could observe
+	// stale "no token issued" state from disk between get_token's load and
+	// save (issue #59 / H11).
+	s.authActive.Store(true)
+
 	ttl := 1 * time.Hour
 	if s.policy != nil && s.policy.Limits != nil && s.policy.Limits.MaxWallTimeSeconds != nil {
 		ttl = time.Duration(s.policy.Limits.MaxWallTimeSeconds.Value) * time.Second
@@ -414,10 +436,19 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 }
 
 // validateJWT validates a JWT token from a tool call request.
+//
 // Returns the claims if valid, nil if auth is not active, or an error if the
-// token is present but invalid. Auth is only enforced when a token has been
-// issued for the session (graceful adoption — existing clients without tokens
-// continue to work until they call get_token).
+// token is present but invalid.
+//
+// Enforcement model:
+//   - If s.requireToken is true, every call must carry a valid token from the
+//     start. Closes the unauthenticated bootstrap window (issue #59 / M10).
+//   - Otherwise, "graceful adoption" applies: tool calls without a token are
+//     permitted UNTIL the first get_token completes, after which all calls
+//     must carry a token. The trigger for "after" is the in-process atomic
+//     flag s.authActive, which is set synchronously at the top of
+//     handleGetToken — eliminating the TOCTOU race where a stale disk read
+//     could miss a freshly issued token (issue #59 / H11).
 func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, error) {
 	if s.tokenIssuer == nil {
 		return nil, nil // Auth not initialized, skip validation
@@ -425,20 +456,19 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 
 	tokenStr, _ := request.GetArguments()["_token"].(string)
 	if tokenStr == "" {
-		// Check if a token has been issued for this session.
-		// If no token was issued yet, allow unauthenticated access (graceful adoption).
-		s.sessionMu.Lock()
-		sessionState, _ := s.stateManager.Load(s.sessionID)
-		hasToken := sessionState != nil && sessionState.AuthToken != ""
-		s.sessionMu.Unlock()
-
-		if hasToken {
+		if s.requireToken {
+			return nil, fmt.Errorf("missing auth token (_token parameter); server is in require-token mode")
+		}
+		if s.authActive.Load() {
 			return nil, fmt.Errorf("missing auth token (_token parameter)")
 		}
-		return nil, nil // No token issued yet, skip enforcement
+		return nil, nil // graceful adoption: no token issued yet
 	}
 
-	claims, err := s.tokenIssuer.ValidateTokenForSession(tokenStr, s.sessionID)
+	// Bind validation to the current policy digest so a token issued under a
+	// permissive policy does not survive a policy tightening (issue #59 / M11).
+	claims, err := s.tokenIssuer.ValidateTokenForSessionAndPolicy(
+		tokenStr, s.sessionID, s.computePolicyDigest())
 	if err != nil {
 		return nil, fmt.Errorf("auth failed: %w", err)
 	}

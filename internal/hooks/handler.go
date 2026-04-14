@@ -668,6 +668,38 @@ func (h *Handler) handleUserPromptSubmit(input *aflock.HookInput) error {
 	return output.WriteEmpty()
 }
 
+// missingRequiredAttestations returns the list of tools that the policy
+// requires attestations for AND that the session actually used (decision=allow)
+// AND for which no attestation file exists on disk. An empty slice means the
+// stop check should pass.
+//
+// Extracted from handleStop so handleSubagentStop can apply the same check —
+// previously SubagentStop skipped attestation enforcement entirely, allowing
+// a child agent to use Bash without producing the required Bash attestation
+// (issue #59 / M12).
+func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *aflock.SessionState) []string {
+	if sessionState == nil || sessionState.Policy == nil ||
+		len(sessionState.Policy.RequiredAttestations) == 0 {
+		return nil
+	}
+
+	usedTools := make(map[string]bool)
+	for _, action := range sessionState.Actions {
+		if action.Decision == "allow" {
+			usedTools[action.ToolName] = true
+		}
+	}
+
+	attestDir := h.stateManager.AttestationsDir(sessionID)
+	var missing []string
+	for _, required := range sessionState.Policy.RequiredAttestations {
+		if usedTools[required] && !findAttestation(attestDir, required) {
+			missing = append(missing, required)
+		}
+	}
+	return missing
+}
+
 // handleStop checks if required attestations are complete.
 func (h *Handler) handleStop(input *aflock.HookInput) error {
 	sessionState, err := h.stateManager.Load(input.SessionID)
@@ -681,29 +713,9 @@ func (h *Handler) handleStop(input *aflock.HookInput) error {
 		return output.Write(output.StopAllow())
 	}
 
-	// Check required attestations — only for tools that were actually used.
-	// Policy constrains what must be attested, it doesn't instruct the agent
-	// to use tools it wasn't asked to use. If the user never used Bash,
-	// don't block Stop for a missing Bash attestation.
-	if len(sessionState.Policy.RequiredAttestations) > 0 {
-		usedTools := make(map[string]bool)
-		for _, action := range sessionState.Actions {
-			if action.Decision == "allow" {
-				usedTools[action.ToolName] = true
-			}
-		}
-
-		attestDir := h.stateManager.AttestationsDir(input.SessionID)
-		var missing []string
-		for _, required := range sessionState.Policy.RequiredAttestations {
-			if usedTools[required] && !findAttestation(attestDir, required) {
-				missing = append(missing, required)
-			}
-		}
-		if len(missing) > 0 {
-			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Cannot stop: missing attestations for used tools: %v", missing)))
-		}
+	if missing := h.missingRequiredAttestations(input.SessionID, sessionState); len(missing) > 0 {
+		return output.Write(output.StopBlock(
+			fmt.Sprintf("[aflock] Cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
 	return output.Write(output.StopAllow())
@@ -749,6 +761,15 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save parent session: %v\n", saveErr)
 			}
 		}
+	}
+
+	// Enforce required attestations on the child session — same check that
+	// handleStop performs on the top-level session. Without this, a subagent
+	// could use a tool listed in requiredAttestations without producing the
+	// matching attestation file (issue #59 / M12).
+	if missing := h.missingRequiredAttestations(input.SessionID, childState); len(missing) > 0 {
+		return output.Write(output.StopBlock(
+			fmt.Sprintf("[aflock] Subagent cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
 	// Check post-hoc limits on the child session
