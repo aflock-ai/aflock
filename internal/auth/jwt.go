@@ -189,11 +189,22 @@ func IsToolAllowed(toolName string, allowedTools, deniedTools []string) bool {
 	return true
 }
 
-// ComputePolicyDigest computes a SHA-256 digest of a policy for binding tokens
-// to a specific policy version.
+// ComputePolicyDigest returns a SHA-256 digest of the policy for binding
+// tokens to a specific policy version.
+//
+// Prefers pol.RawDigest, which is the SHA-256 of the on-disk policy bytes
+// captured by policy.Load. Re-marshaling the parsed struct would normalize
+// formatting (key order, whitespace, number representation) and produce a
+// different digest for byte-identical input — see issue #61 / L5.
+//
+// Falls back to marshaling for policies constructed in-memory (e.g., tests)
+// that have no associated file.
 func ComputePolicyDigest(pol *aflock.Policy) string {
 	if pol == nil {
 		return ""
+	}
+	if pol.RawDigest != "" {
+		return pol.RawDigest
 	}
 	data, err := json.Marshal(pol)
 	if err != nil {

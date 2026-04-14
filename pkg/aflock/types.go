@@ -159,6 +159,13 @@ type Policy struct {
 	MaterialsFrom        *MaterialsPolicy  `json:"materialsFrom,omitempty"`
 	Evaluators           *EvaluatorsPolicy `json:"evaluators,omitempty"`
 	Functionaries        []Functionary     `json:"functionaries,omitempty"` // Legacy, use Steps.Functionaries instead
+
+	// RawDigest is the SHA-256 hex digest of the raw policy file bytes captured
+	// at load time. Stored here (json:"-") so callers can bind tokens and
+	// attestations to the exact file the user reviewed/signed, rather than
+	// re-marshaling the parsed struct (which can normalize formatting and
+	// produce a different digest for byte-identical input — issue #61 / L5).
+	RawDigest string `json:"-"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.

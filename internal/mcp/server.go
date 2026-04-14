@@ -284,10 +284,18 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
 }
 
-// computePolicyDigest computes the SHA256 digest of the loaded policy.
+// computePolicyDigest returns the SHA-256 digest of the loaded policy.
+//
+// Prefers s.policy.RawDigest (set by policy.Load from the on-disk bytes) so
+// the digest binds to the exact file the user signed/reviewed rather than a
+// re-marshaled copy of the parsed struct (issue #61 / L5). Falls back to
+// marshaling for in-memory policies used in tests.
 func (s *Server) computePolicyDigest() string {
 	if s.policy == nil {
 		return ""
+	}
+	if s.policy.RawDigest != "" {
+		return s.policy.RawDigest
 	}
 	data, err := json.Marshal(s.policy)
 	if err != nil {
@@ -664,15 +672,10 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 			fmt.Fprintf(os.Stderr, "[aflock] BLOCKED data exfiltration: %s\n", flowReason)
 			return mcp.NewToolResultError(fmt.Sprintf("DataFlow policy denied: %s", flowReason)), nil
 		}
-
-		// Evaluate data flow — Bash is a write operation, check flow rules
-		s.mu.Lock()
-		flowDecision, flowReason, _ := evaluator.EvaluateDataFlow("Bash", inputJSON, s.materials)
-		s.mu.Unlock()
-		if flowDecision == aflock.DecisionDeny {
-			s.recordAction("Bash", "deny", flowReason)
-			return mcp.NewToolResultError(fmt.Sprintf("Data flow violation: %s", flowReason)), nil
-		}
+		// (Removed the duplicate evaluator.EvaluateDataFlow against s.materials.
+		// Persisted sessionState.Materials is the single source of truth — issue
+		// #61 / M7. The in-memory s.materials slice could drift out of sync with
+		// disk between concurrent MCP requests, producing inconsistent decisions.)
 	}
 
 	// If attest=true, use attestors for full attestation

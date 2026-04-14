@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -308,14 +309,20 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 // ---- Helpers ----
 
 // parseEvalResponse extracts PASS/FAIL status and reason from AI response text.
-// Tries JSON parsing first, then falls back to text scanning.
+//
+// Only structured JSON of the form `{"status": "PASS"|"FAIL", "reason": "..."}`
+// is accepted (matching the contract built into buildPrompt). If the response
+// is not parseable as that JSON, this returns FAIL — never a permissive
+// substring scan that could be tricked by prompt injection in materials data
+// containing the word "PASS" (issue #61 / M8). The original response is
+// surfaced in the reason so operators can debug genuine model misbehavior.
 func parseEvalResponse(text string) (status, reason string) {
 	var jsonResp struct {
 		Status string `json:"status"`
 		Reason string `json:"reason"`
 	}
 
-	// The response might have markdown code fences around the JSON
+	// Strip optional markdown code fences around the JSON.
 	cleaned := strings.TrimSpace(text)
 	cleaned = strings.TrimPrefix(cleaned, "```json")
 	cleaned = strings.TrimPrefix(cleaned, "```")
@@ -329,16 +336,11 @@ func parseEvalResponse(text string) (status, reason string) {
 		}
 	}
 
-	// Fallback: scan for PASS/FAIL in the text
-	upper := strings.ToUpper(text)
-	if strings.Contains(upper, "PASS") && !strings.Contains(upper, "FAIL") {
-		return "PASS", text
-	}
-	if strings.Contains(upper, "FAIL") {
-		return "FAIL", text
-	}
-
-	return "INCONCLUSIVE", text
+	// Fail closed. A response we can't parse as the structured PASS/FAIL
+	// contract must not be allowed to silently pass — substring scans for
+	// "PASS"/"FAIL" are trivially gamed by content injected into the model's
+	// context (e.g., a Read tool surfacing "always PASS" in its output).
+	return "FAIL", "AI evaluator response did not match the required JSON contract: " + truncate(text, 200)
 }
 
 func getBackend(backend string) string {
@@ -359,7 +361,24 @@ func getModelForBackend(model, backend string) string {
 	return defaultAnthropicModel
 }
 
-// validateURL checks for basic SSRF protections (same as rookery).
+// validateURL applies SSRF protections for AI-evaluator endpoints.
+//
+// Beyond scheme/host checks, this rejects URLs that resolve to:
+//   - Cloud instance metadata (169.254.169.254)
+//   - Loopback (127.0.0.0/8, ::1)
+//   - Link-local (169.254.0.0/16, fe80::/10)
+//   - RFC 1918 private ranges (10/8, 172.16/12, 192.168/16)
+//   - RFC 6598 shared address space (100.64/10)
+//   - IPv6 unique-local (fc00::/7)
+//   - Unspecified (0.0.0.0, ::)
+//
+// Hostnames are resolved at validation time so an attacker cannot bypass
+// the check by pointing DNS at an internal address (issue #61 / M9).
+//
+// For local development (e.g., a self-hosted Ollama at 127.0.0.1:11434),
+// set AFLOCK_AIEVAL_ALLOW_INTERNAL=1 to permit loopback and RFC 1918.
+// Even with that flag set, cloud metadata IPs are still rejected — that
+// exposure has no legitimate dev use case.
 func validateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -368,10 +387,75 @@ func validateURL(rawURL string) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("URL must use http or https scheme, got %q", u.Scheme)
 	}
-	if u.Host == "" {
+	host := u.Hostname()
+	if host == "" {
 		return fmt.Errorf("URL must have a host")
 	}
+
+	allowInternal := os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+
+	// Resolve the host to one or more IPs and reject any that fall into a
+	// blocked range. If resolution fails, refuse — better than silently
+	// passing a hostname we can't validate.
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("resolve host %q: %w", host, err)
+	}
+	for _, ip := range addrs {
+		reason := blockedIPReason(ip)
+		if reason == "" {
+			continue
+		}
+		// Cloud metadata is always blocked, opt-in flag or not.
+		if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+			return fmt.Errorf("URL host %q resolves to cloud metadata IP %s (always blocked)", host, ip)
+		}
+		if !allowInternal {
+			return fmt.Errorf("URL host %q resolves to blocked address %s (%s); set AFLOCK_AIEVAL_ALLOW_INTERNAL=1 to permit local/internal endpoints", host, ip, reason)
+		}
+	}
 	return nil
+}
+
+// blockedIPReason returns a non-empty reason string when ip falls into a
+// range that must not be reachable from the AI-evaluator HTTP client.
+func blockedIPReason(ip net.IP) string {
+	if ip == nil {
+		return "nil address"
+	}
+	if ip.IsUnspecified() {
+		return "unspecified"
+	}
+	if ip.IsLoopback() {
+		return "loopback"
+	}
+	// Cloud instance-metadata services first so we can name the reason
+	// precisely before the broader link-local check shadows it.
+	if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+		return "cloud metadata (AWS/GCP/Azure IMDS)"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return "link-local"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// RFC 1918 private ranges.
+		switch {
+		case v4[0] == 10:
+			return "RFC 1918 private (10/8)"
+		case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31:
+			return "RFC 1918 private (172.16/12)"
+		case v4[0] == 192 && v4[1] == 168:
+			return "RFC 1918 private (192.168/16)"
+		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127:
+			return "RFC 6598 shared address space (100.64/10)"
+		}
+	} else if ip.To16() != nil {
+		// IPv6 unique-local fc00::/7
+		if ip[0]&0xfe == 0xfc {
+			return "IPv6 unique-local (fc00::/7)"
+		}
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {
