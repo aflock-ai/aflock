@@ -342,11 +342,10 @@ func (s *Server) initSigning() {
 	if err := s.signer.Initialize(ctx); err == nil {
 		s.signingEnabled = true
 		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: SPIRE\n")
-		if s.agentIdentity != nil && s.agentIdentity.Model != "" && s.agentIdentity.Model != "unknown" {
-			if setErr := s.signer.SetModel(ctx, s.agentIdentity.Model); setErr != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: %v\n", setErr)
-			}
-		}
+		// Note: trusted-model enforcement happens in the policy evaluator via
+		// identity.allowedModels at SessionStart (issue #67 review). We no
+		// longer call a signer-side SetModel that returned an error but did
+		// not actually gate signing — that was dead misleading code.
 		return
 	}
 

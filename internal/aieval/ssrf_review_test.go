@@ -37,3 +37,21 @@ func TestValidateURL_MetadataAlwaysBlocked(t *testing.T) {
 		t.Error("metadata IP must remain blocked even with ALLOW_INTERNAL=1")
 	}
 }
+
+// Issue #67 review: the Ollama default URL (http://localhost:11434) must
+// validate successfully without the user setting AFLOCK_AIEVAL_ALLOW_INTERNAL.
+// Regression guard for the UX bug introduced in #61.
+func TestValidateURLWithContext_OllamaLocalhostDefault(t *testing.T) {
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "")
+	if err := validateURLWithContext("http://localhost:11434", true); err != nil {
+		t.Errorf("ollama localhost default should validate with localBackend=true, got: %v", err)
+	}
+}
+
+// But IMDS must STILL be blocked for local backends — no escape hatch there.
+func TestValidateURLWithContext_LocalBackendStillBlocksMetadata(t *testing.T) {
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "")
+	if err := validateURLWithContext("http://169.254.169.254/", true); err == nil {
+		t.Error("localBackend=true must still block cloud metadata IP")
+	}
+}

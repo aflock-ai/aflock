@@ -122,7 +122,7 @@ func TestSafeHTTPClient_RejectsRedirectToInternal(t *testing.T) {
 
 	// Re-enable for the *initial* request so the dial of redirector succeeds.
 	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
-	resp, err := safeHTTPClient(2 * time.Second).Do(req)
+	resp, err := safeHTTPClient(2*time.Second, false).Do(req)
 	if err == nil {
 		resp.Body.Close()
 		t.Fatal("safeHTTPClient followed redirect to internal address; redirect re-validation is broken")
@@ -147,7 +147,7 @@ func TestSafeHTTPClient_RejectsDialToInternal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
-	resp, err := safeHTTPClient(2 * time.Second).Do(req)
+	resp, err := safeHTTPClient(2*time.Second, false).Do(req)
 	if err == nil {
 		resp.Body.Close()
 		t.Fatal("safeHTTPClient connected to loopback without ALLOW_INTERNAL=1")

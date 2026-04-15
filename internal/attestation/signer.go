@@ -41,7 +41,6 @@ const (
 type Signer struct {
 	spireClient      *identity.SpireClient
 	identity         *identity.Identity
-	modelName        string
 	fulcioX509Signer *cryptoutil.X509Signer // Non-nil when using Fulcio keyless signing
 }
 
@@ -112,19 +111,6 @@ func (s *Signer) InitializeEphemeral(agentIdentityHash string) error {
 		PrivateKey:  key,
 		ExpiresAt:   template.NotAfter,
 	}
-	return nil
-}
-
-// SetModel sets the AI model name and validates it against the trusted models list.
-// This should be called after Initialize when the model is known.
-func (s *Signer) SetModel(ctx context.Context, modelName string) error {
-	s.modelName = modelName
-
-	// Check if this is a trusted model
-	if !identity.IsTrustedModel(modelName) {
-		return fmt.Errorf("model %s is not trusted - attestations will not be signed", modelName)
-	}
-
 	return nil
 }
 

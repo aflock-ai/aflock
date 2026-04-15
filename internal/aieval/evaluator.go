@@ -174,7 +174,8 @@ func evaluateAnthropic(ctx context.Context, pol Policy, materialsJSON []byte, ap
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", anthropicAPIVersion)
 
-	resp, err := safeHTTPClient(evalTimeout).Do(req)
+	// Anthropic API is a public cloud endpoint — no local backend exception.
+	resp, err := safeHTTPClient(evalTimeout, false).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic API request failed: %w", err)
 	}
@@ -235,8 +236,11 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 		endpoint = defaultOllamaURL
 	}
 
-	// Validate URL (SSRF protection, same as rookery)
-	if err := validateURL(endpoint); err != nil {
+	// SSRF protection. Ollama is a local backend by design, so permit
+	// loopback/RFC 1918 without requiring AFLOCK_AIEVAL_ALLOW_INTERNAL=1
+	// (closes the default-URL regression from issue #61 / M9 — see issue
+	// #67 review). Cloud metadata IPs remain blocked regardless.
+	if err := validateURLWithContext(endpoint, true); err != nil {
 		return nil, fmt.Errorf("invalid Ollama endpoint: %w", err)
 	}
 
@@ -271,7 +275,7 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := safeHTTPClient(evalTimeout).Do(req)
+	resp, err := safeHTTPClient(evalTimeout, true).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ollama API request failed: %w", err)
 	}
@@ -375,11 +379,20 @@ func getModelForBackend(model, backend string) string {
 // Hostnames are resolved at validation time so an attacker cannot bypass
 // the check by pointing DNS at an internal address (issue #61 / M9).
 //
-// For local development (e.g., a self-hosted Ollama at 127.0.0.1:11434),
-// set AFLOCK_AIEVAL_ALLOW_INTERNAL=1 to permit loopback and RFC 1918.
-// Even with that flag set, cloud metadata IPs are still rejected — that
-// exposure has no legitimate dev use case.
+// Opt-ins for permitting internal addresses:
+//   - AFLOCK_AIEVAL_ALLOW_INTERNAL=1: operator-level, applies to any backend
+//   - localBackend=true: caller-level, for backends that are expected to be
+//     local (e.g., self-hosted Ollama). This closes the UX regression where
+//     the default Ollama URL (http://localhost:11434) was blocked out of
+//     the box (issue #67 review).
+//
+// Even with either opt-in, cloud metadata IPs are ALWAYS rejected — there
+// is no legitimate reason for an AI-eval endpoint to resolve to IMDS.
 func validateURL(rawURL string) error {
+	return validateURLWithContext(rawURL, false)
+}
+
+func validateURLWithContext(rawURL string, localBackend bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -392,7 +405,7 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("URL must have a host")
 	}
 
-	allowInternal := os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+	allowInternal := localBackend || os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
 
 	// Resolve the host to one or more IPs and reject any that fall into a
 	// blocked range. If resolution fails, refuse — better than silently
@@ -431,9 +444,11 @@ func validateURL(rawURL string) error {
 //     internal URL would otherwise sail through; CheckRedirect rejects it.
 //
 // The opt-in env var AFLOCK_AIEVAL_ALLOW_INTERNAL=1 still applies (cloud
-// metadata IPs are always rejected).
-func safeHTTPClient(timeout time.Duration) *http.Client {
-	allowInternal := os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+// metadata IPs are always rejected). For backends that are expected to run
+// locally by construction (e.g., self-hosted Ollama), pass localBackend=true
+// to permit loopback/private addresses without requiring the env var.
+func safeHTTPClient(timeout time.Duration, localBackend bool) *http.Client {
+	allowInternal := localBackend || os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
 
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	transport := &http.Transport{
@@ -476,7 +491,7 @@ func safeHTTPClient(timeout time.Duration) *http.Client {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
 			}
-			return validateURL(req.URL.String())
+			return validateURLWithContext(req.URL.String(), localBackend)
 		},
 	}
 }
