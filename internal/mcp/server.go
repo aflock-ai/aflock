@@ -198,19 +198,8 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
-	// Discover agent identity
-	agentID, err := identity.DiscoverAgentIdentity()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
-	} else {
-		s.agentIdentity = agentID
-	}
-
-	// Compute policy digest and add to agent identity
-	if s.policy != nil && s.agentIdentity != nil {
-		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
-		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
-	}
+	// Identity discovery + policy-digest binding per paper §3.1.
+	s.initAgentIdentity()
 
 	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
 	s.initSigning()
@@ -267,6 +256,12 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		}
 	}
 
+	// Identity discovery + policy-digest binding per paper §3.1. Mirrors
+	// Serve() — previously missing on the HTTP transport, which caused JWTs
+	// issued via SSE to have empty identity_hash and attestations to miss
+	// the agent-identity predicate. Caught in PR #67 review.
+	s.initAgentIdentity()
+
 	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
 	s.initSigning()
 
@@ -318,6 +313,33 @@ func (s *Server) computePolicyDigest() string {
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+// initAgentIdentity discovers the connecting process's identity, binds it to
+// the current policy's digest, and derives the paper §3.1 identity hash
+//
+//	SHA256(model ‖ env ‖ tools ‖ policyDigest ‖ parent).
+//
+// Called from both Serve() (stdio) and ServeHTTP() (SSE) so both transports
+// produce identically identity-bound JWTs and attestations. Before this was
+// extracted, ServeHTTP silently skipped the block, which meant HTTP sessions
+// had empty identity_hash in their JWTs and missing agentIdentity in
+// attestation predicates (caught in PR #67 review).
+//
+// A discovery failure is a warning, not a fatal — the process may not be
+// under a Claude Code tree yet. Caller is responsible for deciding whether
+// to fail closed via policy.identity.allowedModels.
+func (s *Server) initAgentIdentity() {
+	agentID, err := identity.DiscoverAgentIdentity()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
+		return
+	}
+	s.agentIdentity = agentID
+	if s.policy != nil {
+		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
+		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
+	}
 }
 
 // initSigning initializes attestation signing with a 3-tier fallback chain
@@ -384,13 +406,6 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError("Token issuer not initialized"), nil
 	}
 
-	// Flip auth-active synchronously, BEFORE any IO. From this instant on,
-	// concurrent validateJWT goroutines will see auth as active and require
-	// a token — closing the TOCTOU window where a tool call could observe
-	// stale "no token issued" state from disk between get_token's load and
-	// save (issue #59 / H11).
-	s.authActive.Store(true)
-
 	ttl := 1 * time.Hour
 	if s.policy != nil && s.policy.Limits != nil && s.policy.Limits.MaxWallTimeSeconds != nil {
 		ttl = time.Duration(s.policy.Limits.MaxWallTimeSeconds.Value) * time.Second
@@ -405,6 +420,10 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		identityHash = s.agentIdentity.IdentityHash
 	}
 
+	// Issue the token BEFORE flipping authActive. If this returns an error,
+	// we must leave authActive=false so clients can retry get_token without
+	// being locked into require-token mode by a prior failure (PR #67 review
+	// finding — originally introduced by the H11 fix in #59).
 	tokenStr, err := s.tokenIssuer.IssueToken(
 		s.sessionID,
 		agentID,
@@ -416,13 +435,20 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to issue token: %v", err)), nil
 	}
 
-	// Also store in session state
+	// Persist the token AND flip authActive under sessionMu so concurrent
+	// validateJWT observers see a consistent pair:
+	//   - before: authActive=false AND no AuthToken on disk (pass, graceful)
+	//   - after:  authActive=true  AND AuthToken on disk (require token)
+	// There is no intermediate state a racing caller can exploit. This keeps
+	// the H11 TOCTOU guarantee intact while fixing the DoS lockout when
+	// IssueToken returns an error.
 	s.sessionMu.Lock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState != nil {
 		sessionState.AuthToken = tokenStr
 		_ = s.stateManager.Save(sessionState)
 	}
+	s.authActive.Store(true)
 	s.sessionMu.Unlock()
 
 	result := map[string]any{
