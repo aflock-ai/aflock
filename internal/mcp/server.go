@@ -37,9 +37,9 @@ type Server struct {
 	agentIdentity *identity.AgentIdentity
 	sessionID     string
 
-	// In-memory data flow tracking (thread-safe for concurrent MCP requests)
-	mu             sync.Mutex
-	materials      []aflock.MaterialClassification
+	// (`mu` + `materials` were dead code after issue #61 / M7 removed the
+	// duplicate in-memory data-flow evaluation in handleBash. Removed
+	// entirely to satisfy golangci-lint's unused check.)
 	signer         *attestation.Signer
 	signingEnabled bool
 	attestDir      string     // Directory for storing step attestations by git tree hash

@@ -97,7 +97,7 @@ func TestValidateURL_AcceptsPublic(t *testing.T) {
 // the redirect to the test server (bound to 127.0.0.1) must be rejected.
 func TestSafeHTTPClient_RejectsRedirectToInternal(t *testing.T) {
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("should-never-reach-here"))
+		_, _ = w.Write([]byte("should-never-reach-here"))
 	}))
 	defer internal.Close()
 
@@ -138,7 +138,7 @@ func TestSafeHTTPClient_RejectsRedirectToInternal(t *testing.T) {
 // that pure URL-string validation cannot.
 func TestSafeHTTPClient_RejectsDialToInternal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	}))
 	defer server.Close()
 

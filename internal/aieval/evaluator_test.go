@@ -370,13 +370,13 @@ func TestValidateURL_StrictByDefault(t *testing.T) {
 		url     string
 		wantErr bool
 	}{
-		{"http://localhost:11434", true},        // blocked: loopback
-		{"http://127.0.0.1:11434", true},        // blocked: loopback
-		{"http://192.168.1.100:11434", true},    // blocked: RFC 1918
-		{"http://169.254.169.254/", true},       // blocked: cloud metadata
+		{"http://localhost:11434", true},         // blocked: loopback
+		{"http://127.0.0.1:11434", true},         // blocked: loopback
+		{"http://192.168.1.100:11434", true},     // blocked: RFC 1918
+		{"http://169.254.169.254/", true},        // blocked: cloud metadata
 		{"https://api.anthropic.com/v1/", false}, // public API allowed
-		{"ftp://evil.com", true},                // wrong scheme
-		{"not-a-url", true},                     // unparseable
+		{"ftp://evil.com", true},                 // wrong scheme
+		{"not-a-url", true},                      // unparseable
 	}
 	for _, tt := range tests {
 		err := validateURL(tt.url)
