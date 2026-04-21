@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -85,7 +86,13 @@ func (m *Manager) Load(sessionID string) (*aflock.SessionState, error) {
 	return &state, nil
 }
 
-// Save persists the session state.
+// Save persists the session state atomically.
+//
+// The write is performed to a temporary file in the same directory and then
+// renamed over the destination so that concurrent Load calls never observe a
+// partially written state.json. Callers that perform a load-modify-save cycle
+// should additionally hold an exclusive lock via LockSession to prevent lost
+// updates from racing hook/MCP processes.
 func (m *Manager) Save(state *aflock.SessionState) error {
 	if err := validateSessionID(state.SessionID); err != nil {
 		return err
@@ -101,11 +108,72 @@ func (m *Manager) Save(state *aflock.SessionState) error {
 	}
 
 	path := filepath.Join(dir, "state.json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("write state: %w", err)
+	tmp, err := os.CreateTemp(dir, ".state.json.tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp state: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod temp state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("sync temp state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp state: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename state: %w", err)
 	}
 
 	return nil
+}
+
+// LockSession acquires an exclusive advisory file lock for the given session.
+// It blocks until the lock is available and returns an unlock function that
+// the caller MUST invoke (typically via defer) to release the lock.
+//
+// This is intended to wrap a full load-modify-save cycle so that concurrent
+// hook or MCP processes cannot both load a stale state, both modify it, and
+// both save (losing the first writer's changes). The lock is a separate file
+// (state.lock) within the session directory so it does not interfere with the
+// atomic rename performed by Save.
+func (m *Manager) LockSession(sessionID string) (func(), error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, err
+	}
+	dir := m.SessionDir(sessionID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
+	}
+	lockPath := filepath.Join(dir, "state.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600) //nolint:gosec // G304: path is derived from validated session ID within stateDir
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("acquire flock: %w", err)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+		})
+	}, nil
 }
 
 // Initialize creates a new session state.

@@ -192,7 +192,9 @@ func TestDeriveIdentity_SetsIdentityHash(t *testing.T) {
 }
 
 func TestDeriveIdentity_CanonicalRepresentation(t *testing.T) {
-	// Verify the canonical string matches expected format
+	// Verify the canonical string matches the paper's 5-component formula
+	// (issue #61 / M16): SHA256(model ‖ env ‖ tools ‖ policyDigest ‖ parent).
+	// Binary fields nest inside `env` per paper §3.1.
 	a := &AgentIdentity{
 		Model:        "test-model",
 		ModelVersion: "1.0.0",
@@ -209,13 +211,47 @@ func TestDeriveIdentity_CanonicalRepresentation(t *testing.T) {
 
 	a.DeriveIdentity()
 
-	// Reconstruct what canonical should look like
-	expected := "model:test-model@1.0.0|binary:claude-code@2.0.0|env:local|tools:bash,write|policy:policydigest123"
+	expected := "model:test-model@1.0.0|env:local;binary=claude-code@2.0.0|tools:bash,write|policy:policydigest123|parent:"
 	hash := sha256.Sum256([]byte(expected))
 	expectedHash := hex.EncodeToString(hash[:])
 
 	if a.IdentityHash != expectedHash {
 		t.Fatalf("Identity hash mismatch.\nExpected canonical: %s\nExpected hash: %s\nGot hash: %s", expected, expectedHash, a.IdentityHash)
+	}
+}
+
+// TestDeriveIdentity_PaperFormula_FiveComponents verifies that the canonical
+// string has exactly 5 top-level "|"-separated components matching the paper
+// equation in §3.1 (issue #61 / M16).
+func TestDeriveIdentity_PaperFormula_FiveComponents(t *testing.T) {
+	a := &AgentIdentity{
+		Model:        "claude-opus-4-6",
+		ModelVersion: "20251101",
+		Binary: &BinaryIdentity{
+			Name: "claude-code", Version: "2.1.76", Path: "/usr/local/bin/claude", Digest: "sha256:abc",
+		},
+		Environment: &EnvironmentIdentity{
+			Type: "container", UserID: 501, Hostname: "host", ContainerID: "c1", ImageDigest: "sha256:img",
+		},
+		Tools:          []string{"Bash", "Read"},
+		PolicyDigest:   "sha256:pol",
+		ParentIdentity: "parenthash",
+	}
+	a.DeriveIdentity()
+
+	// Recompute canonical and assert structure.
+	canonical := "model:claude-opus-4-6@20251101" +
+		"|env:container;binary=claude-code@2.1.76;binary_path=/usr/local/bin/claude;binary_digest=sha256:abc;user=501;hostname=host;container=c1;image=sha256:img" +
+		"|tools:Bash,Read" +
+		"|policy:sha256:pol" +
+		"|parent:parenthash"
+	parts := strings.Split(canonical, "|")
+	if len(parts) != 5 {
+		t.Fatalf("paper formula must have 5 top-level components, got %d in %q", len(parts), canonical)
+	}
+	want := sha256.Sum256([]byte(canonical))
+	if a.IdentityHash != hex.EncodeToString(want[:]) {
+		t.Fatalf("hash mismatch — canonical layout drifted from paper formula\n  canonical: %s", canonical)
 	}
 }
 

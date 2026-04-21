@@ -27,20 +27,12 @@ import (
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
-// BUG-VERIFY-1: Ed25519 signing vs verification mismatch.
-// The signer (signer.go:signWithPrivateKey) hashes the data with SHA256 before signing
-// for ALL key types including Ed25519. But Ed25519 is a full-message signature scheme -
-// it internally hashes the message. The verifier (verifier.go:verifySignatureWithCert)
-// correctly passes paeBytes (raw message) to ed25519.Verify. This means:
-//   - Signer: ed25519.Sign(key, SHA256(PAE))  (via crypto.Signer interface or ecdsa path)
-//   - Verifier: ed25519.Verify(key, PAE, sig)  (raw PAE, not hash)
-//
-// These will NEVER match because the signer signs SHA256(PAE) but verifier checks PAE.
-//
-// The signer code dispatches Ed25519 keys through crypto.Signer which calls
-// key.Sign(rand, hash[:], crypto.SHA256) - this is WRONG for Ed25519.
-// Ed25519 Sign with opts=crypto.SHA256 would treat hash[:] as the pre-hashed message
-// and use Ed25519ph, but the verifier uses plain Ed25519 (not Ed25519ph).
+// BUG-VERIFY-1 (FIXED in issue #57 / C2): Ed25519 signing vs verification mismatch.
+// PREVIOUSLY: signWithPrivateKey hashed with SHA256 for ALL key types including Ed25519,
+// producing Ed25519ph signatures. The verifier expected pure Ed25519 (raw PAE). These
+// were cryptographically incompatible — Ed25519 attestations would NEVER verify.
+// NOW: signWithPrivateKey has an explicit ed25519.PrivateKey branch that signs raw data.
+// This test remains as a REGRESSION test demonstrating the mismatch pattern that was fixed.
 func TestEd25519_SignVerify_Mismatch(t *testing.T) {
 	// Generate Ed25519 key pair
 	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
@@ -90,10 +82,10 @@ func TestEd25519_SignVerify_Mismatch(t *testing.T) {
 	t.Log("BUG-VERIFY-1 confirmed: Ed25519 sign/verify mismatch. Signer signs SHA256(PAE), verifier checks PAE.")
 }
 
-// BUG-VERIFY-2: RSA signature verification tries PKCS1v15 then PSS,
-// but this means a signature created with PSS padding could be verified
-// by a cert that only allows PKCS1v15, and vice versa. This is a
-// signature algorithm confusion attack vector.
+// BUG-VERIFY-2 (FIXED in issue #57 / L3): RSA verification tried PKCS1v15 then PSS,
+// allowing a PSS-signed attestation to verify against a cert expecting PKCS1v15 and
+// vice versa (padding confusion). Now pinned to PKCS1v15 only, matching the signer.
+// This test remains as a REGRESSION test confirming PSS is rejected.
 func TestRSA_PaddingConfusion(t *testing.T) {
 	// Generate RSA key
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -380,12 +372,11 @@ func TestTopoSort_CycleShouldBeError(t *testing.T) {
 		"B": {Name: "B", ArtifactsFrom: []string{"A"}},
 	}
 
-	sorted := topoSortSteps(steps)
+	_, err := topoSortSteps(steps)
 
-	// Currently returns both steps in alphabetical order (cycle fallback)
-	if len(sorted) == 2 {
-		t.Log("BUG-VERIFY-9: topoSortSteps silently accepts cycle A->B->A")
-		t.Log("Supply chain verification with cyclic dependencies should be an error")
+	// Fixed: topoSortSteps now returns an error on cycles
+	if err == nil {
+		t.Error("BUG-VERIFY-9: topoSortSteps should return error for cycle A->B->A")
 	}
 }
 
@@ -439,8 +430,9 @@ func TestVerifyDSSESignatures_OneOfMany(t *testing.T) {
 	}
 
 	sigs := []struct {
-		KeyID string `json:"keyid"`
-		Sig   string `json:"sig"`
+		KeyID       string `json:"keyid"`
+		Sig         string `json:"sig"`
+		Certificate string `json:"certificate,omitempty"`
 	}{
 		{KeyID: "bogus-key", Sig: base64.StdEncoding.EncodeToString(bogusSig)},
 		{KeyID: "valid-key", Sig: base64.StdEncoding.EncodeToString(validSig)},
@@ -496,8 +488,8 @@ func generateEd25519CA(t *testing.T) (*x509.Certificate, ed25519.PrivateKey) {
 	return cert, privKey
 }
 
-// BUG-VERIFY-13: Ed25519 verification in verifySignatureWithCert uses raw PAE.
-// But the signer hashes first. Test the actual verify path with an Ed25519 cert.
+// BUG-VERIFY-13 (FIXED in issue #57 / C2): Ed25519 verification path regression test.
+// Verifier uses raw PAE; signer now also signs raw PAE (fixed from SHA256-prehash).
 func TestVerifySignatureWithCert_Ed25519(t *testing.T) {
 	cert, privKey := generateEd25519CA(t)
 

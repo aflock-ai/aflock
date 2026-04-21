@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -75,10 +76,22 @@ func NewVerifier() *Verifier {
 	}
 }
 
+// maxSublayoutDepth is the maximum recursion depth for sublayout verification.
+// Prevents stack overflow from cyclic or deeply nested sublayout chains (issue #60 / I4).
+const maxSublayoutDepth = 10
+
 // VerifySession verifies a session's attestations against its policy.
 //
 //nolint:gocognit,gocyclo,funlen // session verification requires many validation steps
 func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
+	return v.verifySessionWithDepth(sessionID, 0)
+}
+
+func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result, error) {
+	if depth > maxSublayoutDepth {
+		return nil, fmt.Errorf("sublayout recursion depth exceeded (%d > %d)", depth, maxSublayoutDepth)
+	}
+
 	result := &Result{
 		SessionID:  sessionID,
 		VerifiedAt: time.Now(),
@@ -106,6 +119,45 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 			TotalCostUSD:   sessionState.Metrics.CostUSD,
 			Duration:       time.Since(sessionState.StartedAt).Round(time.Second).String(),
 		}
+	}
+
+	// Phase 1: Attestation signature verification
+	// Verify DSSE signatures on all attestation files in the session's attestation directory.
+	// This prevents accepting forged or tampered attestation data.
+	attestDir := v.stateManager.AttestationsDir(sessionID)
+	if sigErrors := v.verifySessionAttestationSignatures(attestDir, sessionState); len(sigErrors) > 0 {
+		result.Success = false
+		for _, msg := range sigErrors {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:    "signatures",
+				Passed:  false,
+				Message: msg,
+			})
+			result.Errors = append(result.Errors, msg)
+		}
+	} else {
+		result.Checks = append(result.Checks, CheckResult{
+			Name:   "signatures",
+			Passed: true,
+		})
+	}
+
+	// Phase 1b: Session binding and timestamp freshness (anti-replay)
+	if bindErrors := v.verifySessionBinding(attestDir, sessionID, sessionState.StartedAt); len(bindErrors) > 0 {
+		result.Success = false
+		for _, msg := range bindErrors {
+			result.Checks = append(result.Checks, CheckResult{
+				Name:    "session-binding",
+				Passed:  false,
+				Message: msg,
+			})
+			result.Errors = append(result.Errors, msg)
+		}
+	} else {
+		result.Checks = append(result.Checks, CheckResult{
+			Name:   "session-binding",
+			Passed: true,
+		})
 	}
 
 	// Check 0: Identity verification (Phase 2)
@@ -235,7 +287,6 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 
 	// Check 2: Required attestations
 	if len(sessionState.Policy.RequiredAttestations) > 0 {
-		attestDir := v.stateManager.AttestationsDir(sessionID)
 		for _, required := range sessionState.Policy.RequiredAttestations {
 			found := v.findAttestation(attestDir, required)
 			if !found {
@@ -295,7 +346,7 @@ func (v *Verifier) VerifySession(sessionID string) (*Result, error) {
 
 	// Check 5: Sublayout recursion (Phase 6)
 	if len(sessionState.Policy.Sublayouts) > 0 && len(sessionState.ChildSessionIDs) > 0 {
-		sublayoutErrors := v.verifySublayouts(sessionState)
+		sublayoutErrors := v.verifySublayouts(sessionState, depth)
 		if len(sublayoutErrors) > 0 {
 			result.Success = false
 			for _, msg := range sublayoutErrors {
@@ -485,19 +536,338 @@ type SessionInfo struct {
 	ToolCalls  int       `json:"toolCalls"`
 }
 
+// findAttestation checks if an attestation for the given name exists in the directory.
+// It first tries exact filename matches, then scans all .intoto.json files and checks
+// the predicate's toolName/action field (content-based lookup). This handles
+// timestamp-prefixed filenames like 20260210-143022-ab3def12.intoto.json.
 func (v *Verifier) findAttestation(dir, name string) bool {
-	patterns := []string{
+	// First try exact filename match
+	exactPaths := []string{
 		filepath.Join(dir, name+".json"),
 		filepath.Join(dir, name+".intoto.json"),
 	}
-	for _, p := range patterns {
+	for _, p := range exactPaths {
 		if _, err := os.Stat(p); err == nil {
+			if validateAttestationStructure(p) {
+				return true
+			}
+		}
+	}
+
+	// Scan attestation files and check their content for matching tool names.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fname := entry.Name()
+		if !strings.HasSuffix(fname, ".intoto.json") && !strings.HasSuffix(fname, ".json") {
+			continue
+		}
+		p := filepath.Join(dir, fname)
+		if attestationContentMatchesName(p, name) && validateAttestationStructure(p) {
 			return true
 		}
 	}
-	// Also check glob
-	matches, _ := filepath.Glob(filepath.Join(dir, name+"*"))
-	return len(matches) > 0
+
+	return false
+}
+
+// validateAttestationStructure performs structural validation on an attestation file.
+// It checks that the file is a valid DSSE envelope with non-empty payload, payloadType,
+// and signatures. This does NOT perform cryptographic verification.
+func validateAttestationStructure(path string) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation file path from state directory
+	if err != nil {
+		return false
+	}
+
+	var envelope struct {
+		Payload     string `json:"payload"`
+		PayloadType string `json:"payloadType"`
+		Signatures  []struct {
+			KeyID string `json:"keyid"`
+			Sig   string `json:"sig"`
+		} `json:"signatures"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	return envelope.Payload != "" && envelope.PayloadType != "" && len(envelope.Signatures) > 0
+}
+
+// attestationContentMatchesName checks if an attestation file's predicate toolName or
+// action field matches the required name (case-insensitive).
+func attestationContentMatchesName(path, name string) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation file path from state directory
+	if err != nil {
+		return false
+	}
+
+	var envelope struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return false
+	}
+
+	var statement struct {
+		Predicate json.RawMessage `json:"predicate"`
+	}
+	if err := json.Unmarshal(payload, &statement); err != nil {
+		return false
+	}
+
+	var predicate struct {
+		ToolName string `json:"toolName"`
+		Action   string `json:"action"`
+	}
+	if err := json.Unmarshal(statement.Predicate, &predicate); err != nil {
+		return false
+	}
+
+	return strings.EqualFold(predicate.ToolName, name) || strings.EqualFold(predicate.Action, name)
+}
+
+// DefaultTimestampFreshness is the default maximum age for attestation timestamps.
+const DefaultTimestampFreshness = 24 * time.Hour
+
+// verifySessionAttestationSignatures verifies DSSE signatures on all attestation files
+// in the session's attestation directory. This is Phase 1 of the verification pipeline.
+func (v *Verifier) verifySessionAttestationSignatures(attestDir string, ss *aflock.SessionState) []string {
+	var errors []string
+
+	// If no roots configured in policy, skip signature verification with a warning
+	if ss.Policy == nil || len(ss.Policy.Roots) == 0 {
+		return nil
+	}
+
+	entries, err := os.ReadDir(attestDir)
+	if err != nil {
+		// No attestation directory is not an error — some sessions may not have attestations
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return []string{fmt.Sprintf("read attestation directory: %v", err)}
+	}
+
+	trustedCerts, err := loadRootCertificates(ss.Policy.Roots)
+	if err != nil {
+		return []string{fmt.Sprintf("load root certificates: %v", err)}
+	}
+	if len(trustedCerts) == 0 {
+		return []string{"no valid certificates loaded from policy roots"}
+	}
+
+	attestationCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fname := entry.Name()
+		if !strings.HasSuffix(fname, ".intoto.json") && !strings.HasSuffix(fname, ".json") {
+			continue
+		}
+		attestationCount++
+
+		p := filepath.Join(attestDir, fname)
+		data, err := os.ReadFile(p) //nolint:gosec // G304: attestation path from state directory
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("read attestation %s: %v", fname, err))
+			continue
+		}
+
+		var envelope struct {
+			PayloadType string `json:"payloadType"`
+			Payload     string `json:"payload"`
+			Signatures  []struct {
+				KeyID       string `json:"keyid"`
+				Sig         string `json:"sig"`
+				Certificate string `json:"certificate,omitempty"`
+			} `json:"signatures"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			errors = append(errors, fmt.Sprintf("parse envelope %s: %v", fname, err))
+			continue
+		}
+
+		if len(envelope.Signatures) == 0 {
+			errors = append(errors, fmt.Sprintf("attestation %s has no signatures", fname))
+			continue
+		}
+
+		payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("decode payload %s: %v", fname, err))
+			continue
+		}
+
+		// Verify at least one signature is valid against trusted roots
+		if err := verifyDSSESignaturesNoFunctionary(envelope.PayloadType, payload, envelope.Signatures, trustedCerts); err != nil {
+			errors = append(errors, fmt.Sprintf("signature verification failed for %s: %v", fname, err))
+		}
+	}
+
+	return errors
+}
+
+// verifyDSSESignaturesNoFunctionary verifies DSSE envelope signatures against trusted certificates
+// without checking functionary constraints. Used for session-level verification where
+// we just need to confirm signatures are authentic.
+func verifyDSSESignaturesNoFunctionary(payloadType string, payload []byte, signatures []struct {
+	KeyID       string `json:"keyid"`
+	Sig         string `json:"sig"`
+	Certificate string `json:"certificate,omitempty"`
+}, trustedCerts []*x509.Certificate) error {
+	paeBytes := createDSSEPAE(payloadType, payload)
+	hash := sha256.Sum256(paeBytes)
+	// Legacy PAE for backward compatibility with pre-H10-fix attestations.
+	paeBytesLegacy := createDSSEPAELegacy(payloadType, payload)
+	hashLegacy := sha256.Sum256(paeBytesLegacy)
+
+	rootPool := x509.NewCertPool()
+	for _, cert := range trustedCerts {
+		rootPool.AddCert(cert)
+	}
+
+	for _, sig := range signatures {
+		sigBytes, err := base64.StdEncoding.DecodeString(sig.Sig)
+		if err != nil {
+			continue
+		}
+
+		candidates := make([]*x509.Certificate, len(trustedCerts))
+		copy(candidates, trustedCerts)
+
+		if sig.Certificate != "" {
+			block, _ := pem.Decode([]byte(sig.Certificate))
+			if block != nil {
+				if leafCert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					candidates = append(candidates, leafCert)
+				}
+			}
+		}
+
+		for _, cert := range candidates {
+			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) &&
+				!verifySignatureWithCert(cert, paeBytesLegacy, hashLegacy[:], sigBytes) {
+				continue
+			}
+
+			_, chainErr := cert.Verify(x509.VerifyOptions{
+				Roots:     rootPool,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+			})
+			if chainErr != nil {
+				continue
+			}
+
+			return nil // Valid signature from trusted cert
+		}
+	}
+
+	return fmt.Errorf("no valid signature from a trusted certificate")
+}
+
+// verifySessionBinding verifies that attestation predicates are bound to the correct session
+// and that timestamps are within the freshness window. This prevents attestation replay attacks.
+func (v *Verifier) verifySessionBinding(attestDir, sessionID string, sessionStartedAt time.Time) []string {
+	var errors []string
+
+	entries, err := os.ReadDir(attestDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return []string{fmt.Sprintf("read attestation directory: %v", err)}
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fname := entry.Name()
+		if !strings.HasSuffix(fname, ".intoto.json") && !strings.HasSuffix(fname, ".json") {
+			continue
+		}
+
+		p := filepath.Join(attestDir, fname)
+		sessionErr, timestampErr := verifyAttestationBinding(p, sessionID, sessionStartedAt)
+		if sessionErr != "" {
+			errors = append(errors, fmt.Sprintf("%s: %s", fname, sessionErr))
+		}
+		if timestampErr != "" {
+			errors = append(errors, fmt.Sprintf("%s: %s", fname, timestampErr))
+		}
+	}
+
+	return errors
+}
+
+// verifyAttestationBinding checks a single attestation's session binding and timestamp freshness.
+// Returns separate error messages for session mismatch and timestamp staleness.
+func verifyAttestationBinding(path, expectedSessionID string, sessionStartedAt time.Time) (sessionErr, timestampErr string) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation path from state directory
+	if err != nil {
+		return fmt.Sprintf("read file: %v", err), ""
+	}
+
+	var envelope struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return fmt.Sprintf("parse envelope: %v", err), ""
+	}
+
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return fmt.Sprintf("decode payload: %v", err), ""
+	}
+
+	var statement struct {
+		Predicate json.RawMessage `json:"predicate"`
+	}
+	if err := json.Unmarshal(payload, &statement); err != nil {
+		return fmt.Sprintf("parse statement: %v", err), ""
+	}
+
+	var predicate struct {
+		SessionID string    `json:"sessionId"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+	if err := json.Unmarshal(statement.Predicate, &predicate); err != nil {
+		// Predicate may not have these fields (e.g., collection predicates)
+		return "", ""
+	}
+
+	// Check session binding
+	if predicate.SessionID != "" && predicate.SessionID != expectedSessionID {
+		sessionErr = fmt.Sprintf("session ID mismatch: attestation bound to %q, expected %q", predicate.SessionID, expectedSessionID)
+	}
+
+	// Check timestamp freshness
+	if !predicate.Timestamp.IsZero() {
+		age := time.Since(predicate.Timestamp)
+		if age > DefaultTimestampFreshness {
+			timestampErr = fmt.Sprintf("attestation timestamp too old: %s (max %s)", age.Round(time.Second), DefaultTimestampFreshness)
+		}
+		// Also check that attestation wasn't created before the session started (pre-dated)
+		if predicate.Timestamp.Before(sessionStartedAt.Add(-1 * time.Minute)) {
+			timestampErr = fmt.Sprintf("attestation timestamp %s is before session start %s", predicate.Timestamp.Format(time.RFC3339), sessionStartedAt.Format(time.RFC3339))
+		}
+	}
+
+	return sessionErr, timestampErr
 }
 
 func containsCheckPrefix(checks []CheckResult, prefix string) bool {
@@ -557,7 +927,12 @@ func (v *Verifier) VerifySteps(pol *aflock.Policy, attestDir, treeHash string) (
 
 	// Topologically sort steps so dependencies (ArtifactsFrom) are processed first.
 	// This ensures that when step B depends on step A's products, A is already verified.
-	sortedSteps := topoSortSteps(pol.Steps)
+	sortedSteps, err := topoSortSteps(pol.Steps)
+	if err != nil {
+		result.Success = false
+		result.Errors = append(result.Errors, err.Error())
+		return result, nil
+	}
 
 	// Verify each step has an attestation
 	for _, stepName := range sortedSteps {
@@ -868,10 +1243,11 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 	Sig         string `json:"sig"`
 	Certificate string `json:"certificate,omitempty"`
 }, trustedCerts []*x509.Certificate, step *aflock.Step) error {
-	// Create PAE (Pre-Authentication Encoding)
-	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
-	paeBytes := append([]byte(pae), payload...)
+	// Create PAE (Pre-Authentication Encoding) — both spec-compliant and legacy.
+	paeBytes := createDSSEPAE(payloadType, payload)
 	hash := sha256.Sum256(paeBytes)
+	paeBytesLegacy := createDSSEPAELegacy(payloadType, payload)
+	hashLegacy := sha256.Sum256(paeBytesLegacy)
 
 	// Build a cert pool from trusted roots for chain validation
 	rootPool := x509.NewCertPool()
@@ -900,9 +1276,10 @@ func verifyDSSESignatures(payloadType string, payload []byte, signatures []struc
 			}
 		}
 
-		// Verify the signature against each candidate cert
+		// Verify the signature against each candidate cert (try both PAE formats)
 		for _, cert := range candidates {
-			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) {
+			if !verifySignatureWithCert(cert, paeBytes, hash[:], sigBytes) &&
+				!verifySignatureWithCert(cert, paeBytesLegacy, hashLegacy[:], sigBytes) {
 				continue
 			}
 
@@ -936,11 +1313,9 @@ func verifySignatureWithCert(cert *x509.Certificate, paeBytes, hash, sig []byte)
 	case *ecdsa.PublicKey:
 		return ecdsa.VerifyASN1(key, hash, sig)
 	case *rsa.PublicKey:
-		// Try PKCS1v15 first (more common), fall back to PSS
-		if rsa.VerifyPKCS1v15(key, crypto.SHA256, hash, sig) == nil {
-			return true
-		}
-		return rsa.VerifyPSS(key, crypto.SHA256, hash, sig, nil) == nil
+		// Pinned to PKCS1v15 to match what the signer produces and prevent
+		// padding-confusion attacks (issue #57 / L3).
+		return rsa.VerifyPKCS1v15(key, crypto.SHA256, hash, sig) == nil
 	case ed25519PublicKey:
 		// Ed25519 signs the raw message, not a hash. The rookery DSSE signer
 		// calls ed25519.Sign(key, PAE) directly (unlike ECDSA/RSA which hash first),
@@ -949,6 +1324,30 @@ func verifySignatureWithCert(cert *x509.Certificate, paeBytes, hash, sig []byte)
 	default:
 		return false
 	}
+}
+
+// createDSSEPAE creates Pre-Authentication Encoding per the DSSE v1 spec.
+// Format: "DSSEv1" || LE64(len(payloadType)) || payloadType || LE64(len(payload)) || payload
+func createDSSEPAE(payloadType string, payload []byte) []byte {
+	typeBytes := []byte(payloadType)
+	buf := make([]byte, 0, 6+8+len(typeBytes)+8+len(payload))
+	buf = append(buf, "DSSEv1"...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(typeBytes)))
+	buf = append(buf, typeBytes...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(len(payload)))
+	buf = append(buf, payload...)
+	return buf
+}
+
+// createDSSEPAELegacy reproduces the previous (non-spec-compliant) PAE encoding
+// with ASCII decimal lengths for backward-compatible verification.
+func createDSSEPAELegacy(payloadType string, payload []byte) []byte {
+	prefix := fmt.Sprintf("DSSEv1 %d %s %d ",
+		len(payloadType), payloadType, len(payload))
+	result := make([]byte, 0, len(prefix)+len(payload))
+	result = append(result, []byte(prefix)...)
+	result = append(result, payload...)
+	return result
 }
 
 // matchesFunctionary checks whether a signing certificate and key ID satisfy
@@ -984,7 +1383,13 @@ func matchesFunctionary(cert *x509.Certificate, keyID string, step *aflock.Step)
 
 // certMatchesConstraint checks whether a certificate satisfies the given constraint.
 // All non-empty constraint fields must match (AND logic).
+// An empty constraint (no CommonName, no URIs) never matches — at least one field must be set.
 func certMatchesConstraint(cert *x509.Certificate, constraint *aflock.CertConstraint) bool {
+	// Reject empty constraints — they would match any certificate
+	if constraint.CommonName == "" && len(constraint.URIs) == 0 {
+		return false
+	}
+
 	// Check CommonName if specified
 	if constraint.CommonName != "" {
 		if cert.Subject.CommonName != constraint.CommonName {
@@ -1027,11 +1432,8 @@ func matchSPIFFEPattern(pattern, spiffeID string) bool {
 }
 
 // topoSortSteps returns step names in topological order based on ArtifactsFrom dependencies.
-// Steps with no dependencies come first. If there are cycles, the remaining steps are
-// appended in sorted order (alphabetical) to ensure deterministic output.
-//
-//nolint:gocognit // topological sort is inherently complex
-func topoSortSteps(steps map[string]aflock.Step) []string {
+// Steps with no dependencies come first. Returns an error if cycles are detected.
+func topoSortSteps(steps map[string]aflock.Step) ([]string, error) {
 	// Build in-degree map and adjacency list
 	inDegree := make(map[string]int)
 	dependents := make(map[string][]string) // from -> list of steps that depend on it
@@ -1073,9 +1475,9 @@ func topoSortSteps(steps map[string]aflock.Step) []string {
 		}
 	}
 
-	// If there are cycles, append remaining steps in sorted order
+	// If there are cycles, return an error listing the cyclic steps
 	if len(sorted) < len(steps) {
-		var remaining []string
+		var cyclic []string
 		for name := range steps {
 			found := false
 			for _, s := range sorted {
@@ -1085,14 +1487,14 @@ func topoSortSteps(steps map[string]aflock.Step) []string {
 				}
 			}
 			if !found {
-				remaining = append(remaining, name)
+				cyclic = append(cyclic, name)
 			}
 		}
-		sort.Strings(remaining)
-		sorted = append(sorted, remaining...)
+		sort.Strings(cyclic)
+		return nil, fmt.Errorf("dependency cycle detected among steps: %s", strings.Join(cyclic, ", "))
 	}
 
-	return sorted
+	return sorted, nil
 }
 
 // verifySublayouts checks child sessions against sublayout policies (Phase 6).
@@ -1103,7 +1505,7 @@ func topoSortSteps(steps map[string]aflock.Step) []string {
 //  4. Accumulates child spend toward parent metrics
 //
 //nolint:gocognit // sublayout verification requires many checks
-func (v *Verifier) verifySublayouts(parentState *aflock.SessionState) []string {
+func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int) []string {
 	if len(parentState.Policy.Sublayouts) == 0 {
 		return nil
 	}
@@ -1135,7 +1537,7 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState) []string {
 			childFound = true
 
 			// 3. Recursively verify the child session
-			childResult, err := v.VerifySession(childID)
+			childResult, err := v.verifySessionWithDepth(childID, depth+1)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("sublayout %q: verify child %s: %v", sub.Name, childID, err))
 				continue

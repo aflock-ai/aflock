@@ -106,10 +106,17 @@ type EnvironmentIdentity struct {
 	PodName string `json:"podName,omitempty"`
 }
 
-// DeriveIdentity computes the transitive identity hash from all components.
-// The identity is computed as:
+// DeriveIdentity computes the transitive identity hash per the aflock paper
+// (Section 3.1, Equation 1):
 //
-//	SHA256(model || binary || environment || sorted(tools) || policyDigest || parentIdentity)
+//	AgentIdentity = SHA256(model ‖ env ‖ tools ‖ policyDigest ‖ parent)
+//
+// The five top-level components are joined with "|" in fixed order. The "env"
+// component bundles all PID-introspected properties the paper attributes to
+// it: binary path/name/version/digest, OS user/group, hostname, container ID,
+// container image digest, and Kubernetes namespace/pod. Bundling preserves
+// the security guarantees of binding the hash to binary and runtime
+// properties while matching the paper's 5-component formula (issue #61 / M16).
 func (a *AgentIdentity) DeriveIdentity() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -117,45 +124,60 @@ func (a *AgentIdentity) DeriveIdentity() string {
 	return a.deriveIdentityLocked()
 }
 
-// deriveIdentityLocked computes the identity hash. Caller must hold a.mu.
-func (a *AgentIdentity) deriveIdentityLocked() string {
-	// Build canonical representation
-	components := []string{
-		fmt.Sprintf("model:%s@%s", a.Model, a.ModelVersion),
+// canonicalEnv serializes the env component as
+//
+//	env:<type>;<k1>=<v1>;<k2>=<v2>;...
+//
+// Sub-fields are emitted in a fixed order and only when non-empty so the
+// canonical string is deterministic and minimally surprising. Binary fields
+// nest here per the paper (binary path is one of the PID-introspected env
+// properties listed in §3.1).
+func (a *AgentIdentity) canonicalEnv() string {
+	parts := []string{"env:"}
+	if a.Environment != nil {
+		parts[0] = "env:" + a.Environment.Type
+	}
+
+	add := func(key, value string) {
+		if value != "" {
+			parts = append(parts, fmt.Sprintf("%s=%s", key, value))
+		}
 	}
 
 	if a.Binary != nil {
-		components = append(components, fmt.Sprintf("binary:%s@%s", a.Binary.Name, a.Binary.Version))
-		if a.Binary.Digest != "" {
-			components = append(components, fmt.Sprintf("binary-digest:%s", a.Binary.Digest))
-		}
+		add("binary", a.Binary.Name+"@"+a.Binary.Version)
+		add("binary_path", a.Binary.Path)
+		add("binary_digest", a.Binary.Digest)
 	}
-
 	if a.Environment != nil {
-		components = append(components, fmt.Sprintf("env:%s", a.Environment.Type))
-		if a.Environment.ContainerID != "" {
-			components = append(components, fmt.Sprintf("container:%s", a.Environment.ContainerID))
+		if a.Environment.UserID != 0 {
+			add("user", fmt.Sprintf("%d", a.Environment.UserID))
 		}
-		if a.Environment.ImageDigest != "" {
-			components = append(components, fmt.Sprintf("image:%s", a.Environment.ImageDigest))
-		}
+		add("hostname", a.Environment.Hostname)
+		add("container", a.Environment.ContainerID)
+		add("image", a.Environment.ImageDigest)
+		add("namespace", a.Environment.Namespace)
+		add("pod", a.Environment.PodName)
 	}
+	return strings.Join(parts, ";")
+}
 
-	// Sort tools for deterministic hashing
+// deriveIdentityLocked computes the identity hash. Caller must hold a.mu.
+func (a *AgentIdentity) deriveIdentityLocked() string {
+	// Build canonical representation per paper §3.1:
+	// SHA256(model ‖ env ‖ tools ‖ policyDigest ‖ parent)
 	sortedTools := make([]string, len(a.Tools))
 	copy(sortedTools, a.Tools)
 	sort.Strings(sortedTools)
-	components = append(components, fmt.Sprintf("tools:%s", strings.Join(sortedTools, ",")))
 
-	if a.PolicyDigest != "" {
-		components = append(components, fmt.Sprintf("policy:%s", a.PolicyDigest))
+	components := []string{
+		fmt.Sprintf("model:%s@%s", a.Model, a.ModelVersion),
+		a.canonicalEnv(),
+		fmt.Sprintf("tools:%s", strings.Join(sortedTools, ",")),
+		fmt.Sprintf("policy:%s", a.PolicyDigest),
+		fmt.Sprintf("parent:%s", a.ParentIdentity),
 	}
 
-	if a.ParentIdentity != "" {
-		components = append(components, fmt.Sprintf("parent:%s", a.ParentIdentity))
-	}
-
-	// Compute hash
 	canonical := strings.Join(components, "|")
 	hash := sha256.Sum256([]byte(canonical))
 	a.IdentityHash = hex.EncodeToString(hash[:])
