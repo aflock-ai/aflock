@@ -3,6 +3,7 @@ package policy
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -44,9 +45,17 @@ func (m *Matcher) MatchGlob(pattern, value string) bool {
 		var err error
 		g, err = glob.Compile(pattern)
 		if err != nil {
+			// Cache nil so we don't retry on every call, and log the error.
+			// A malformed deny pattern must not silently disappear — that turns
+			// a security rule into a no-op (issue #60 / L8).
+			m.globs[pattern] = nil
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: invalid glob deny pattern %q (compile error: %v) — rule will be skipped\n", pattern, err)
 			return false
 		}
 		m.globs[pattern] = g
+	}
+	if g == nil {
+		return false
 	}
 	if matched, matchErr := safeGlobMatch(g, value); matchErr != nil {
 		// Glob panicked during match — treat as non-match

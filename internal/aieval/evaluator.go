@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -173,7 +174,8 @@ func evaluateAnthropic(ctx context.Context, pol Policy, materialsJSON []byte, ap
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", anthropicAPIVersion)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Anthropic API is a public cloud endpoint — no local backend exception.
+	resp, err := safeHTTPClient(evalTimeout, false).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic API request failed: %w", err)
 	}
@@ -234,8 +236,11 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 		endpoint = defaultOllamaURL
 	}
 
-	// Validate URL (SSRF protection, same as rookery)
-	if err := validateURL(endpoint); err != nil {
+	// SSRF protection. Ollama is a local backend by design, so permit
+	// loopback/RFC 1918 without requiring AFLOCK_AIEVAL_ALLOW_INTERNAL=1
+	// (closes the default-URL regression from issue #61 / M9 — see issue
+	// #67 review). Cloud metadata IPs remain blocked regardless.
+	if err := validateURLWithContext(endpoint, true); err != nil {
 		return nil, fmt.Errorf("invalid Ollama endpoint: %w", err)
 	}
 
@@ -270,7 +275,7 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := safeHTTPClient(evalTimeout, true).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ollama API request failed: %w", err)
 	}
@@ -308,14 +313,20 @@ func evaluateOllama(ctx context.Context, pol Policy, materialsJSON []byte) (*Eva
 // ---- Helpers ----
 
 // parseEvalResponse extracts PASS/FAIL status and reason from AI response text.
-// Tries JSON parsing first, then falls back to text scanning.
+//
+// Only structured JSON of the form `{"status": "PASS"|"FAIL", "reason": "..."}`
+// is accepted (matching the contract built into buildPrompt). If the response
+// is not parseable as that JSON, this returns FAIL — never a permissive
+// substring scan that could be tricked by prompt injection in materials data
+// containing the word "PASS" (issue #61 / M8). The original response is
+// surfaced in the reason so operators can debug genuine model misbehavior.
 func parseEvalResponse(text string) (status, reason string) {
 	var jsonResp struct {
 		Status string `json:"status"`
 		Reason string `json:"reason"`
 	}
 
-	// The response might have markdown code fences around the JSON
+	// Strip optional markdown code fences around the JSON.
 	cleaned := strings.TrimSpace(text)
 	cleaned = strings.TrimPrefix(cleaned, "```json")
 	cleaned = strings.TrimPrefix(cleaned, "```")
@@ -329,16 +340,11 @@ func parseEvalResponse(text string) (status, reason string) {
 		}
 	}
 
-	// Fallback: scan for PASS/FAIL in the text
-	upper := strings.ToUpper(text)
-	if strings.Contains(upper, "PASS") && !strings.Contains(upper, "FAIL") {
-		return "PASS", text
-	}
-	if strings.Contains(upper, "FAIL") {
-		return "FAIL", text
-	}
-
-	return "INCONCLUSIVE", text
+	// Fail closed. A response we can't parse as the structured PASS/FAIL
+	// contract must not be allowed to silently pass — substring scans for
+	// "PASS"/"FAIL" are trivially gamed by content injected into the model's
+	// context (e.g., a Read tool surfacing "always PASS" in its output).
+	return "FAIL", "AI evaluator response did not match the required JSON contract: " + truncate(text, 200)
 }
 
 func getBackend(backend string) string {
@@ -359,8 +365,34 @@ func getModelForBackend(model, backend string) string {
 	return defaultAnthropicModel
 }
 
-// validateURL checks for basic SSRF protections (same as rookery).
+// validateURL applies SSRF protections for AI-evaluator endpoints.
+//
+// Beyond scheme/host checks, this rejects URLs that resolve to:
+//   - Cloud instance metadata (169.254.169.254)
+//   - Loopback (127.0.0.0/8, ::1)
+//   - Link-local (169.254.0.0/16, fe80::/10)
+//   - RFC 1918 private ranges (10/8, 172.16/12, 192.168/16)
+//   - RFC 6598 shared address space (100.64/10)
+//   - IPv6 unique-local (fc00::/7)
+//   - Unspecified (0.0.0.0, ::)
+//
+// Hostnames are resolved at validation time so an attacker cannot bypass
+// the check by pointing DNS at an internal address (issue #61 / M9).
+//
+// Opt-ins for permitting internal addresses:
+//   - AFLOCK_AIEVAL_ALLOW_INTERNAL=1: operator-level, applies to any backend
+//   - localBackend=true: caller-level, for backends that are expected to be
+//     local (e.g., self-hosted Ollama). This closes the UX regression where
+//     the default Ollama URL (http://localhost:11434) was blocked out of
+//     the box (issue #67 review).
+//
+// Even with either opt-in, cloud metadata IPs are ALWAYS rejected — there
+// is no legitimate reason for an AI-eval endpoint to resolve to IMDS.
 func validateURL(rawURL string) error {
+	return validateURLWithContext(rawURL, false)
+}
+
+func validateURLWithContext(rawURL string, localBackend bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -368,10 +400,141 @@ func validateURL(rawURL string) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("URL must use http or https scheme, got %q", u.Scheme)
 	}
-	if u.Host == "" {
+	host := u.Hostname()
+	if host == "" {
 		return fmt.Errorf("URL must have a host")
 	}
+
+	allowInternal := localBackend || os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+
+	// Resolve the host to one or more IPs and reject any that fall into a
+	// blocked range. If resolution fails, refuse — better than silently
+	// passing a hostname we can't validate.
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("resolve host %q: %w", host, err)
+	}
+	for _, ip := range addrs {
+		reason := blockedIPReason(ip)
+		if reason == "" {
+			continue
+		}
+		// Cloud metadata is always blocked, opt-in flag or not.
+		if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+			return fmt.Errorf("URL host %q resolves to cloud metadata IP %s (always blocked)", host, ip)
+		}
+		if !allowInternal {
+			return fmt.Errorf("URL host %q resolves to blocked address %s (%s); set AFLOCK_AIEVAL_ALLOW_INTERNAL=1 to permit local/internal endpoints", host, ip, reason)
+		}
+	}
 	return nil
+}
+
+// safeHTTPClient returns an *http.Client whose transport refuses connections
+// to any address that fails blockedIPReason at dial time, and whose redirect
+// handler re-runs validateURL on every hop.
+//
+// This closes two SSRF gaps that pure URL-string validation cannot:
+//
+//  1. DNS rebinding TOCTOU — the dial-time IP check happens after DNS
+//     resolution by Go's resolver but before the TCP connect, so an
+//     attacker who flips DNS between LookupIP() and Dial cannot reach an
+//     internal address.
+//  2. HTTP redirect bypass — a 302 from a permitted public host to an
+//     internal URL would otherwise sail through; CheckRedirect rejects it.
+//
+// The opt-in env var AFLOCK_AIEVAL_ALLOW_INTERNAL=1 still applies (cloud
+// metadata IPs are always rejected). For backends that are expected to run
+// locally by construction (e.g., self-hosted Ollama), pass localBackend=true
+// to permit loopback/private addresses without requiring the env var.
+func safeHTTPClient(timeout time.Duration, localBackend bool) *http.Client {
+	allowInternal := localBackend || os.Getenv("AFLOCK_AIEVAL_ALLOW_INTERNAL") == "1"
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve %s: %w", host, err)
+			}
+			for _, ip := range ips {
+				reason := blockedIPReason(ip)
+				if reason == "" {
+					continue
+				}
+				if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+					return nil, fmt.Errorf("dial %s: blocked cloud metadata IP %s", addr, ip)
+				}
+				if !allowInternal {
+					return nil, fmt.Errorf("dial %s: blocked address %s (%s)", addr, ip, reason)
+				}
+			}
+			// Dial the first acceptable IP directly — re-resolving in
+			// dialer.DialContext would reintroduce the rebinding window.
+			for _, ip := range ips {
+				if reason := blockedIPReason(ip); reason != "" && !allowInternal {
+					continue
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			}
+			return nil, fmt.Errorf("dial %s: no acceptable IP", addr)
+		},
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return validateURLWithContext(req.URL.String(), localBackend)
+		},
+	}
+}
+
+// blockedIPReason returns a non-empty reason string when ip falls into a
+// range that must not be reachable from the AI-evaluator HTTP client.
+func blockedIPReason(ip net.IP) string {
+	if ip == nil {
+		return "nil address"
+	}
+	if ip.IsUnspecified() {
+		return "unspecified"
+	}
+	if ip.IsLoopback() {
+		return "loopback"
+	}
+	// Cloud instance-metadata services first so we can name the reason
+	// precisely before the broader link-local check shadows it.
+	if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+		return "cloud metadata (AWS/GCP/Azure IMDS)"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return "link-local"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// RFC 1918 private ranges.
+		switch {
+		case v4[0] == 10:
+			return "RFC 1918 private (10/8)"
+		case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31:
+			return "RFC 1918 private (172.16/12)"
+		case v4[0] == 192 && v4[1] == 168:
+			return "RFC 1918 private (192.168/16)"
+		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127:
+			return "RFC 6598 shared address space (100.64/10)"
+		}
+	} else if ip.To16() != nil {
+		// IPv6 unique-local fc00::/7
+		if ip[0]&0xfe == 0xfc {
+			return "IPv6 unique-local (fc00::/7)"
+		}
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {

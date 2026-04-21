@@ -3,8 +3,10 @@ package hooks
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -85,6 +87,15 @@ func (h *Handler) Handle(hookName string) error {
 
 // handleSessionStart initializes session state and loads policy.
 func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", lockErr))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Try to load policy from cwd or env
 	var pol *aflock.Policy
 	var policyPath string
@@ -113,9 +124,15 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return nil
 	}
 
-	// Discover agent identity
+	// Discover agent identity. If the policy has identity constraints
+	// (AllowedModels), a discovery failure must block the session — otherwise
+	// the constraint is silently bypassed (issue #60 / H7).
 	agentIdentity, err := identity.DiscoverAgentIdentity()
 	if err != nil {
+		if pol != nil && pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
+			output.ExitWithError(fmt.Sprintf("[aflock] Identity discovery failed and policy requires allowedModels: %v", err))
+			return nil
+		}
 		output.ExitWithWarning(fmt.Sprintf("Failed to discover agent identity: %v", err))
 		return nil
 	}
@@ -266,6 +283,18 @@ func (h *Handler) buildPolicyContext(pol *aflock.Policy, agentIdentity *identity
 
 // handlePreToolUse evaluates policy before tool execution.
 func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
+	// Hold an exclusive file lock across the entire load-modify-save cycle so
+	// that concurrent hook invocations for the same session cannot lose
+	// writes via a TOCTOU race (issue #58 / H9).
+	if input.SessionID != "" {
+		unlock, err := h.stateManager.LockSession(input.SessionID)
+		if err != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", err))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Load session state. If session ID is empty or invalid, treat as no
 	// session state and fall through to ephemeral policy loading below.
 	var sessionState *aflock.SessionState
@@ -278,8 +307,17 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// If the on-disk session state file exists but its Policy is nil (corruption
+	// or tampering), fail closed rather than silently falling through to the
+	// ephemeral policy loader — which would otherwise allow-all whenever no
+	// .aflock file is discoverable from cwd (issue #58 / M13).
+	if sessionState != nil && sessionState.Policy == nil {
+		return output.Write(output.PreToolUseDeny(
+			"[aflock] BLOCKED: session state is present but policy is missing (possible corruption); refusing to fall through to ephemeral policy"))
+	}
+
 	// If no session state, try to load policy directly (for when SessionStart wasn't run)
-	if sessionState == nil || sessionState.Policy == nil {
+	if sessionState == nil {
 		var pol *aflock.Policy
 		var policyPath string
 		var loadErr error
@@ -397,6 +435,15 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 
 // handlePostToolUse records tool execution and updates metrics.
 func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr != nil {
+			output.ExitWithWarning(fmt.Sprintf("Failed to lock session state: %v", lockErr))
+			return nil
+		}
+		defer unlock()
+	}
+
 	// Load session state. Skip loading if no session ID (ephemeral session).
 	var sessionState *aflock.SessionState
 	if input.SessionID != "" {
@@ -550,9 +597,12 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		return
 	}
 
-	// Store attestation to disk
+	// Store attestation to disk. Attestations contain tool inputs (file
+	// paths, sometimes contents), agent identity metadata, session metrics,
+	// and signing cert chains — owner-only is the right baseline.
+	// Standardized with internal/mcp/server.go (issue #67 review).
 	attestDir := h.stateManager.AttestationsDir(sessionState.SessionID)
-	if err := os.MkdirAll(attestDir, 0750); err != nil {
+	if err := os.MkdirAll(attestDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: create attestation dir: %v\n", err)
 		return
 	}
@@ -571,7 +621,7 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		return
 	}
 
-	if err := os.WriteFile(path, data, 0640); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: write attestation: %v\n", err)
 		return
 	}
@@ -598,6 +648,12 @@ func (h *Handler) handlePermissionRequest(input *aflock.HookInput) error {
 
 // handleUserPromptSubmit validates prompt against policy.
 func (h *Handler) handleUserPromptSubmit(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr == nil {
+			defer unlock()
+		}
+	}
 	// Load session state
 	sessionState, err := h.stateManager.Load(input.SessionID)
 	if err != nil {
@@ -617,6 +673,59 @@ func (h *Handler) handleUserPromptSubmit(input *aflock.HookInput) error {
 	return output.WriteEmpty()
 }
 
+// missingRequiredAttestations returns the list of tools that the policy
+// requires attestations for AND that the session actually used (decision=allow)
+// AND for which no cryptographically-valid attestation exists on disk.
+//
+// This enforces the paper's "forged evidence" threat (§2.1): a file-drop
+// attacker (e.g., a sandboxed sub-tool with filesystem write but no signing
+// key) cannot satisfy the Stop gate by dropping a structurally-plausible
+// DSSE envelope — the signature must actually verify against the leaf cert
+// and the payload must bind to the expected session/toolName/toolUseID.
+//
+// LIMITATION (issue #62 / paper §2.1 bullet "Forge attestations"): in hooks
+// mode the signing capability lives in the hook process under the same UID
+// as the agent. A malicious agent that can invoke `aflock hook PostToolUse`
+// can still produce a real signed attestation for any tool call it dictates.
+// Closing that requires moving signing into a separate privileged service.
+// This function defends against the narrower (but real) attacker who can
+// write files into the attestations dir but cannot drive the signer.
+//
+// Extracted from handleStop so handleSubagentStop can apply the same check —
+// previously SubagentStop skipped attestation enforcement entirely, allowing
+// a child agent to use Bash without producing the required Bash attestation
+// (issue #59 / M12).
+func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *aflock.SessionState) []string {
+	if sessionState == nil || sessionState.Policy == nil ||
+		len(sessionState.Policy.RequiredAttestations) == 0 {
+		return nil
+	}
+
+	// Map required tool -> list of (allowed) toolUseIDs the agent actually used.
+	// We want at least one cryptographically-valid attestation per required tool,
+	// bound to this session and to a toolUseID that appears in the session log.
+	usedToolUseIDs := make(map[string][]string)
+	for _, action := range sessionState.Actions {
+		if action.Decision != "allow" {
+			continue
+		}
+		usedToolUseIDs[action.ToolName] = append(usedToolUseIDs[action.ToolName], action.ToolUseID)
+	}
+
+	attestDir := h.stateManager.AttestationsDir(sessionID)
+	var missing []string
+	for _, required := range sessionState.Policy.RequiredAttestations {
+		toolUseIDs, used := usedToolUseIDs[required]
+		if !used {
+			continue // tool wasn't used → no attestation needed
+		}
+		if !findVerifiedAttestation(attestDir, sessionID, required, toolUseIDs) {
+			missing = append(missing, required)
+		}
+	}
+	return missing
+}
+
 // handleStop checks if required attestations are complete.
 func (h *Handler) handleStop(input *aflock.HookInput) error {
 	sessionState, err := h.stateManager.Load(input.SessionID)
@@ -630,29 +739,9 @@ func (h *Handler) handleStop(input *aflock.HookInput) error {
 		return output.Write(output.StopAllow())
 	}
 
-	// Check required attestations — only for tools that were actually used.
-	// Policy constrains what must be attested, it doesn't instruct the agent
-	// to use tools it wasn't asked to use. If the user never used Bash,
-	// don't block Stop for a missing Bash attestation.
-	if len(sessionState.Policy.RequiredAttestations) > 0 {
-		usedTools := make(map[string]bool)
-		for _, action := range sessionState.Actions {
-			if action.Decision == "allow" {
-				usedTools[action.ToolName] = true
-			}
-		}
-
-		attestDir := h.stateManager.AttestationsDir(input.SessionID)
-		var missing []string
-		for _, required := range sessionState.Policy.RequiredAttestations {
-			if usedTools[required] && !findAttestation(attestDir, required) {
-				missing = append(missing, required)
-			}
-		}
-		if len(missing) > 0 {
-			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Cannot stop: missing attestations for used tools: %v", missing)))
-		}
+	if missing := h.missingRequiredAttestations(input.SessionID, sessionState); len(missing) > 0 {
+		return output.Write(output.StopBlock(
+			fmt.Sprintf("[aflock] Cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
 	return output.Write(output.StopAllow())
@@ -665,13 +754,29 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 	if input.SessionID == "" {
 		return output.Write(output.StopAllow())
 	}
+	// Lock the child session for its lifetime in this handler.
+	childUnlock, lockErr := h.stateManager.LockSession(input.SessionID)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock child session: %v\n", lockErr)
+	} else {
+		defer childUnlock()
+	}
 	childState, err := h.stateManager.Load(input.SessionID)
 	if err != nil || childState == nil {
 		return output.Write(output.StopAllow())
 	}
 
-	// If child has a parent, merge results back
+	// If child has a parent, merge results back. Lock the parent separately —
+	// child and parent IDs differ so no deadlock, and the parent lock protects
+	// any concurrent writer in the parent process.
 	if childState.ParentSessionID != "" {
+		parentUnlock, parentLockErr := h.stateManager.LockSession(childState.ParentSessionID)
+		if parentLockErr != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock parent session %s: %v\n",
+				childState.ParentSessionID, parentLockErr)
+		} else {
+			defer parentUnlock()
+		}
 		parentState, loadErr := h.stateManager.Load(childState.ParentSessionID)
 		if loadErr != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to load parent session %s: %v\n",
@@ -682,6 +787,15 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save parent session: %v\n", saveErr)
 			}
 		}
+	}
+
+	// Enforce required attestations on the child session — same check that
+	// handleStop performs on the top-level session. Without this, a subagent
+	// could use a tool listed in requiredAttestations without producing the
+	// matching attestation file (issue #59 / M12).
+	if missing := h.missingRequiredAttestations(input.SessionID, childState); len(missing) > 0 {
+		return output.Write(output.StopBlock(
+			fmt.Sprintf("[aflock] Subagent cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
 	// Check post-hoc limits on the child session
@@ -699,6 +813,12 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 
 // handleSessionEnd finalizes attestations and runs verification.
 func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
+	if input.SessionID != "" {
+		unlock, lockErr := h.stateManager.LockSession(input.SessionID)
+		if lockErr == nil {
+			defer unlock()
+		}
+	}
 	sessionState, err := h.stateManager.Load(input.SessionID)
 	if err != nil {
 		return output.WriteEmpty()
@@ -746,11 +866,132 @@ func (h *Handler) handlePreCompact(_ *aflock.HookInput) error {
 	return output.WriteEmpty()
 }
 
+// findVerifiedAttestation returns true iff some attestation file under dir
+// cryptographically verifies AND is bound to (sessionID, toolName, one of
+// allowedToolUseIDs). This is the Stop-gate enforcement path that defends
+// against forged-file attacks (issue #67 review / L2).
+//
+// Each DSSE envelope embeds the signing leaf certificate. We verify:
+//  1. Structural integrity (validateAttestationIntegrity)
+//  2. DSSE signature against the embedded leaf cert's public key
+//  3. Payload binds to THIS session (sessionID) and THIS tool (toolName)
+//  4. Payload's toolUseID appears in the session's recorded "allow" actions
+//
+// The embedded cert is trusted by virtue of "whoever signed this had the
+// private key at the time" — which is exactly what keeps a file-drop
+// attacker without key access from forging evidence. Chain validation to an
+// external root (SPIRE/Fulcio) is a stronger mode reserved for the
+// `aflock verify` command; at runtime we use the lighter self-attested
+// signature check because the signing key that produced these files is the
+// hook process's own key, and we want to reject files NOT signed by it.
+func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs []string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	allowed := make(map[string]bool, len(allowedToolUseIDs))
+	for _, id := range allowedToolUseIDs {
+		allowed[id] = true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isAttestationFile(entry.Name()) {
+			continue
+		}
+		p := filepath.Join(dir, entry.Name())
+		if !validateAttestationIntegrity(p) {
+			continue
+		}
+		if cryptographicallyVerifyAttestation(p, sessionID, toolName, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+// cryptographicallyVerifyAttestation does the heavy lifting for
+// findVerifiedAttestation. Returns true only when the signature verifies and
+// the payload binds to the expected session and tool use.
+func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowedToolUseIDs map[string]bool) bool {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path from AttestationsDir
+	if err != nil {
+		return false
+	}
+	var envelope attestation.Envelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	// Extract each signature's embedded leaf cert and treat them as the
+	// trusted set for this file. VerifyEnvelope handles PAE + Ed25519 /
+	// ECDSA / RSA selection and tries both spec + legacy PAE encodings.
+	var leafCerts []*x509.Certificate
+	for _, sig := range envelope.Signatures {
+		if sig.Certificate == "" {
+			continue
+		}
+		block, _ := pem.Decode([]byte(sig.Certificate))
+		if block == nil {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		leafCerts = append(leafCerts, cert)
+	}
+	if len(leafCerts) == 0 {
+		return false
+	}
+	if err := attestation.VerifyEnvelope(&envelope, leafCerts); err != nil {
+		return false
+	}
+
+	// Signature valid — now bind to session + tool + a recorded toolUseID.
+	payloadBytes, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return false
+	}
+	var stmt struct {
+		Predicate struct {
+			SessionID string `json:"sessionId"`
+			ToolName  string `json:"toolName"`
+			ToolUseID string `json:"toolUseId"`
+			Decision  string `json:"decision"`
+		} `json:"predicate"`
+	}
+	if err := json.Unmarshal(payloadBytes, &stmt); err != nil {
+		return false
+	}
+	if stmt.Predicate.SessionID != sessionID {
+		return false
+	}
+	if stmt.Predicate.ToolName != toolName {
+		return false
+	}
+	// Only "allow" attestations satisfy a required-attestations gate. A deny
+	// attestation is evidence the tool was BLOCKED, not used.
+	if stmt.Predicate.Decision != "" && stmt.Predicate.Decision != "allow" {
+		return false
+	}
+	// If the session recorded specific toolUseIDs for this tool, the
+	// attestation must match one — prevents cross-session replay where an
+	// attacker copies a real attestation from session A into session B's dir.
+	if len(allowedToolUseIDs) > 0 {
+		if !allowedToolUseIDs[stmt.Predicate.ToolUseID] {
+			return false
+		}
+	}
+	return true
+}
+
 // findAttestation checks if a structurally valid attestation file exists for the given name.
 // It first checks for exact filename matches (name.json, name.intoto.json),
 // then scans all .intoto.json files in the directory and checks if any
 // attestation's tool name matches the required name. Files must pass
 // structural validation (valid DSSE envelope with non-empty signatures).
+//
+// Deprecated: prefer findVerifiedAttestation for security-sensitive paths.
+// This function remains for legacy callers that only need a structural check.
 func findAttestation(dir, name string) bool {
 	// First try exact filename match
 	exactPaths := []string{
@@ -790,14 +1031,21 @@ func findAttestation(dir, name string) bool {
 	return false
 }
 
-// validateAttestationIntegrity performs structural validation on an attestation file.
-// It checks that the file is a valid DSSE envelope with:
-//   - A non-empty "payload" field
-//   - A non-empty "payloadType" field
-//   - A non-empty "signatures" array
+// validateAttestationIntegrity performs best-effort structural validation on
+// an attestation file. It is NOT a substitute for cryptographic signature
+// verification (see cryptographicallyVerifyAttestation for that); the Stop
+// gate calls this as a fast pre-filter before the expensive crypto check.
 //
-// This does NOT perform cryptographic signature verification (that requires
-// trusted roots), but prevents accepting fake/empty/malformed attestation files.
+// Rejects files that fail ANY of:
+//   - Parseable as DSSE envelope JSON
+//   - Non-empty "payload" field, base64-decodable, parseable as in-toto Statement
+//   - "payloadType" == "application/vnd.in-toto+json"
+//   - At least one signature with non-empty keyid AND base64-decodable non-empty sig
+//
+// Closes the trivial forgery path (e.g., a single `{"payload":"x",
+// "payloadType":"y","signatures":[{"sig":"z"}]}` file drop) but does not
+// close the "forged signature from an untrusted key" path — that's what
+// cryptographicallyVerifyAttestation is for.
 func validateAttestationIntegrity(path string) bool {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: attestation file path from state directory
 	if err != nil {
@@ -816,17 +1064,51 @@ func validateAttestationIntegrity(path string) bool {
 		return false
 	}
 
-	if envelope.Payload == "" {
-		return false
-	}
-	if envelope.PayloadType == "" {
-		return false
-	}
-	if len(envelope.Signatures) == 0 {
+	// PayloadType must be the in-toto content type.
+	if envelope.PayloadType != "application/vnd.in-toto+json" {
 		return false
 	}
 
-	return true
+	// Payload must be base64-decodable and parse as an in-toto Statement
+	// with a non-empty subject.
+	if envelope.Payload == "" {
+		return false
+	}
+	payloadBytes, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil || len(payloadBytes) == 0 {
+		return false
+	}
+	var stmt struct {
+		Type    string `json:"_type"`
+		Subject []struct {
+			Name string `json:"name"`
+		} `json:"subject"`
+	}
+	if err := json.Unmarshal(payloadBytes, &stmt); err != nil {
+		return false
+	}
+	if stmt.Type == "" || len(stmt.Subject) == 0 {
+		return false
+	}
+
+	// At least one signature with a non-empty, base64-decodable sig and a
+	// non-empty keyid. This rejects the trivial `{"sig":""}` forgery.
+	if len(envelope.Signatures) == 0 {
+		return false
+	}
+	validSig := false
+	for _, sig := range envelope.Signatures {
+		if sig.KeyID == "" || sig.Sig == "" {
+			continue
+		}
+		sigBytes, err := base64.StdEncoding.DecodeString(sig.Sig)
+		if err != nil || len(sigBytes) == 0 {
+			continue
+		}
+		validSig = true
+		break
+	}
+	return validSig
 }
 
 // isAttestationFile checks if a filename looks like an attestation file.

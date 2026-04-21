@@ -2,6 +2,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,6 +65,13 @@ func Load(path string) (*aflock.Policy, string, error) {
 	if err := json.Unmarshal(data, &policy); err != nil {
 		return nil, "", fmt.Errorf("parse policy: %w", err)
 	}
+
+	// Bind the digest to the exact file bytes the user signed/reviewed
+	// (issue #61 / L5). Re-marshaling the parsed struct would normalize
+	// whitespace, key order, and number formatting, producing a digest that
+	// drifts from the on-disk representation.
+	rawHash := sha256.Sum256(data)
+	policy.RawDigest = hex.EncodeToString(rawHash[:])
 
 	return &policy, policyPath, nil
 }

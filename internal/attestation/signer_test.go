@@ -10,8 +10,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -127,57 +127,77 @@ func newSignerWithIdentity(t *testing.T) (*Signer, *identity.Identity, *x509.Cer
 // --- PAE Tests ---
 
 func TestCreatePAE_Correctness(t *testing.T) {
-	// PAE spec: "DSSEv1" + SP + LEN(type) + SP + type + SP + LEN(body) + SP + body
+	// DSSE v1 spec: "DSSEv1" || LE64(len(type)) || type || LE64(len(body)) || body
+	// LE64 is an 8-byte unsigned little-endian integer.
+	le64 := func(n int) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, uint64(n))
+		return b
+	}
+	buildExpected := func(payloadType string, payload []byte) []byte {
+		var buf []byte
+		buf = append(buf, "DSSEv1"...)
+		buf = append(buf, le64(len(payloadType))...)
+		buf = append(buf, payloadType...)
+		buf = append(buf, le64(len(payload))...)
+		buf = append(buf, payload...)
+		return buf
+	}
+
 	tests := []struct {
 		name        string
 		payloadType string
 		payload     []byte
-		expected    string
 	}{
 		{
 			name:        "standard in-toto payload type",
 			payloadType: "application/vnd.in-toto+json",
 			payload:     []byte(`{"hello":"world"}`),
-			expected:    fmt.Sprintf("DSSEv1 %d %s %d %s", len("application/vnd.in-toto+json"), "application/vnd.in-toto+json", len(`{"hello":"world"}`), `{"hello":"world"}`),
 		},
 		{
 			name:        "empty payload",
 			payloadType: "application/vnd.in-toto+json",
 			payload:     []byte{},
-			expected:    fmt.Sprintf("DSSEv1 %d %s 0 ", len("application/vnd.in-toto+json"), "application/vnd.in-toto+json"),
 		},
 		{
 			name:        "empty payload type",
 			payloadType: "",
 			payload:     []byte("data"),
-			expected:    "DSSEv1 0  4 data",
 		},
 		{
 			name:        "binary-ish payload",
 			payloadType: "application/octet-stream",
 			payload:     []byte{0x41, 0x42, 0x43}, // "ABC"
-			expected:    fmt.Sprintf("DSSEv1 %d %s 3 ABC", len("application/octet-stream"), "application/octet-stream"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := createPAE(tt.payloadType, tt.payload)
-			if string(got) != tt.expected {
-				t.Errorf("createPAE(%q, %q):\n  got  = %q\n  want = %q", tt.payloadType, tt.payload, string(got), tt.expected)
+			expected := buildExpected(tt.payloadType, tt.payload)
+			if !bytes.Equal(got, expected) {
+				t.Errorf("createPAE(%q, %q):\n  got  = %x\n  want = %x", tt.payloadType, tt.payload, got, expected)
 			}
 		})
 	}
 }
 
 func TestCreatePAE_LengthPrefix(t *testing.T) {
-	// Verify the length prefix is the byte length, not rune count.
-	// This matters for multi-byte characters.
 	payload := []byte("café") // 5 bytes in UTF-8 (é = 2 bytes)
 	pae := createPAE("test", payload)
-	expected := fmt.Sprintf("DSSEv1 4 test %d %s", len(payload), string(payload))
-	if string(pae) != expected {
-		t.Errorf("PAE length should be byte count, not rune count.\n  got  = %q\n  want = %q", string(pae), expected)
+
+	// The LE64 length prefix for "test" (4 bytes) should be [4,0,0,0,0,0,0,0]
+	// Starting at offset 6 (after "DSSEv1").
+	typeLen := binary.LittleEndian.Uint64(pae[6:14])
+	if typeLen != 4 {
+		t.Errorf("type length = %d, want 4", typeLen)
+	}
+
+	// Payload length should be the byte count (5), not rune count (4).
+	payloadLenOffset := 6 + 8 + 4 // "DSSEv1" + LE64(type len) + "test"
+	payloadLen := binary.LittleEndian.Uint64(pae[payloadLenOffset : payloadLenOffset+8])
+	if payloadLen != uint64(len(payload)) {
+		t.Errorf("payload length = %d, want %d (byte count, not rune count)", payloadLen, len(payload))
 	}
 }
 

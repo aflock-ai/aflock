@@ -39,24 +39,29 @@ func TestParseEvalResponse_JSONWithCodeFence(t *testing.T) {
 	}
 }
 
-func TestParseEvalResponse_FallbackTextPass(t *testing.T) {
+// Issue #61 / M8: parseEvalResponse no longer falls back to substring scanning
+// — anything that isn't strict JSON returns FAIL. The three tests below were
+// originally written for the gameable substring path. They now assert the
+// fail-closed behavior.
+
+func TestParseEvalResponse_PlainTextPassFailsClosed(t *testing.T) {
 	status, _ := parseEvalResponse("The code is production-ready. PASS.")
-	if status != "PASS" {
-		t.Errorf("status = %q, want PASS", status)
+	if status != "FAIL" {
+		t.Errorf("status = %q, want FAIL (substring scan removed in M8)", status)
 	}
 }
 
-func TestParseEvalResponse_FallbackTextFail(t *testing.T) {
+func TestParseEvalResponse_PlainTextFailFailsClosed(t *testing.T) {
 	status, _ := parseEvalResponse("The code has critical bugs. FAIL.")
 	if status != "FAIL" {
-		t.Errorf("status = %q, want FAIL", status)
+		t.Errorf("status = %q, want FAIL (no substring scan)", status)
 	}
 }
 
-func TestParseEvalResponse_Inconclusive(t *testing.T) {
+func TestParseEvalResponse_InconclusiveFailsClosed(t *testing.T) {
 	status, _ := parseEvalResponse("I'm not sure about this code.")
-	if status != "INCONCLUSIVE" {
-		t.Errorf("status = %q, want INCONCLUSIVE", status)
+	if status != "FAIL" {
+		t.Errorf("status = %q, want FAIL (no JSON contract → fail closed)", status)
 	}
 }
 
@@ -106,6 +111,10 @@ func TestGetModelForBackend(t *testing.T) {
 
 func mockAnthropicServer(t *testing.T, status, reason string) *httptest.Server {
 	t.Helper()
+	// httptest binds to 127.0.0.1; the SSRF guard added in issue #61 / M9
+	// blocks loopback at dial time. Opt in for tests, the same escape hatch
+	// users set when running a self-hosted Anthropic-compatible proxy.
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") == "" {
 			http.Error(w, "missing api key", http.StatusUnauthorized)
@@ -193,6 +202,10 @@ func TestEvaluate_Anthropic_Fail(t *testing.T) {
 
 func mockOllamaServer(t *testing.T, status, reason string) *httptest.Server {
 	t.Helper()
+	// httptest binds to 127.0.0.1; the SSRF guard added in issue #61 / M9
+	// blocks loopback by default. Opt in for tests, which is the same escape
+	// hatch documented for local Ollama deployments.
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/generate" {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -286,6 +299,7 @@ func TestEvaluate_Ollama_CustomModel(t *testing.T) {
 }
 
 func TestEvaluate_Ollama_ServerDown(t *testing.T) {
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
 	policies := []Policy{{
 		Name:     "test",
 		Prompt:   "check",
@@ -348,21 +362,41 @@ func TestEvaluate_MixedBackends(t *testing.T) {
 
 // ---- URL validation tests ----
 
-func TestValidateURL(t *testing.T) {
+// TestValidateURL_StrictByDefault checks the post-M9 behavior: localhost,
+// loopback, and RFC 1918 are blocked unless AFLOCK_AIEVAL_ALLOW_INTERNAL=1.
+// Public IPs and bad schemes behave as before.
+func TestValidateURL_StrictByDefault(t *testing.T) {
 	tests := []struct {
 		url     string
 		wantErr bool
 	}{
-		{"http://localhost:11434", false},
-		{"https://ollama.internal:11434", false},
-		{"http://192.168.1.100:11434", false},
-		{"ftp://evil.com", true},
-		{"not-a-url", true},
+		{"http://localhost:11434", true},         // blocked: loopback
+		{"http://127.0.0.1:11434", true},         // blocked: loopback
+		{"http://192.168.1.100:11434", true},     // blocked: RFC 1918
+		{"http://169.254.169.254/", true},        // blocked: cloud metadata
+		{"https://api.anthropic.com/v1/", false}, // public API allowed
+		{"ftp://evil.com", true},                 // wrong scheme
+		{"not-a-url", true},                      // unparseable
 	}
 	for _, tt := range tests {
 		err := validateURL(tt.url)
 		if (err != nil) != tt.wantErr {
 			t.Errorf("validateURL(%q) err=%v, wantErr=%v", tt.url, err, tt.wantErr)
+		}
+	}
+}
+
+// TestValidateURL_AllowInternalOptIn covers the local-development escape
+// hatch added for self-hosted Ollama at 127.0.0.1.
+func TestValidateURL_AllowInternalOptIn(t *testing.T) {
+	t.Setenv("AFLOCK_AIEVAL_ALLOW_INTERNAL", "1")
+	for _, raw := range []string{
+		"http://localhost:11434",
+		"http://127.0.0.1:11434",
+		"http://192.168.1.100:11434",
+	} {
+		if err := validateURL(raw); err != nil {
+			t.Errorf("validateURL(%q) err=%v, want nil with ALLOW_INTERNAL=1", raw, err)
 		}
 	}
 }

@@ -242,6 +242,43 @@ func newTestVerifier(tmpDir string) *Verifier {
 	}
 }
 
+// makeDSSEEnvelope creates a minimal valid DSSE envelope for testing.
+// The payload contains a predicate with the given toolName and sessionID.
+func makeDSSEEnvelope(t *testing.T, toolName, sessionID string) []byte {
+	t.Helper()
+
+	predicate := map[string]interface{}{
+		"toolName":  toolName,
+		"sessionId": sessionID,
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+	stmt := map[string]interface{}{
+		"_type":         "https://in-toto.io/Statement/v1",
+		"predicateType": "https://aflock.ai/attestations/action/v0.1",
+		"predicate":     predicate,
+		"subject":       []map[string]interface{}{},
+	}
+
+	payload, err := json.Marshal(stmt)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	envelope := map[string]interface{}{
+		"payloadType": "application/vnd.in-toto+json",
+		"payload":     base64.StdEncoding.EncodeToString(payload),
+		"signatures": []map[string]string{
+			{"keyid": "test-key", "sig": "dGVzdC1zaWduYXR1cmU="},
+		},
+	}
+
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return data
+}
+
 // ---- Tests ----
 
 func TestNewVerifier(t *testing.T) {
@@ -655,7 +692,7 @@ func TestVerifySession_RequiredAttestationsMissing(t *testing.T) {
 	if err := os.MkdirAll(attestDir, 0755); err != nil {
 		t.Fatalf("mkdir attestations: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(attestDir, "build.json"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(attestDir, "build.json"), makeDSSEEnvelope(t, "build", "sess-attest"), 0644); err != nil {
 		t.Fatalf("write build.json: %v", err)
 	}
 	// "test" attestation is missing
@@ -710,8 +747,8 @@ func TestVerifySession_RequiredAttestationsAllPresent(t *testing.T) {
 
 	attestDir := filepath.Join(tmpDir, "sess-attest-ok", "attestations")
 	os.MkdirAll(attestDir, 0755)
-	os.WriteFile(filepath.Join(attestDir, "build.json"), []byte("{}"), 0644)
-	os.WriteFile(filepath.Join(attestDir, "test.intoto.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(attestDir, "build.json"), makeDSSEEnvelope(t, "build", "sess-attest-ok"), 0644)
+	os.WriteFile(filepath.Join(attestDir, "test.intoto.json"), makeDSSEEnvelope(t, "test", "sess-attest-ok"), 0644)
 
 	v := newTestVerifier(tmpDir)
 	result, err := v.VerifySession("sess-attest-ok")
@@ -728,7 +765,7 @@ func TestVerifySession_RequiredAttestationsAllPresent(t *testing.T) {
 
 func TestFindAttestation_ExactJSON(t *testing.T) {
 	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "build.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "build.json"), makeDSSEEnvelope(t, "build", "s1"), 0644)
 
 	v := NewVerifier()
 	if !v.findAttestation(tmpDir, "build") {
@@ -738,7 +775,7 @@ func TestFindAttestation_ExactJSON(t *testing.T) {
 
 func TestFindAttestation_InTotoJSON(t *testing.T) {
 	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "build.intoto.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "build.intoto.json"), makeDSSEEnvelope(t, "build", "s1"), 0644)
 
 	v := NewVerifier()
 	if !v.findAttestation(tmpDir, "build") {
@@ -746,13 +783,25 @@ func TestFindAttestation_InTotoJSON(t *testing.T) {
 	}
 }
 
-func TestFindAttestation_GlobMatch(t *testing.T) {
+func TestFindAttestation_ContentMatch(t *testing.T) {
 	tmpDir := t.TempDir()
-	os.WriteFile(filepath.Join(tmpDir, "build-abc123.json"), []byte("{}"), 0644)
+	// Timestamp-prefixed filename, but content has toolName="build"
+	os.WriteFile(filepath.Join(tmpDir, "20260210-143022-abc.intoto.json"), makeDSSEEnvelope(t, "build", "s1"), 0644)
 
 	v := NewVerifier()
 	if !v.findAttestation(tmpDir, "build") {
-		t.Error("Expected to find via glob match build*")
+		t.Error("Expected to find via content-based match")
+	}
+}
+
+func TestFindAttestation_InvalidStructure(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Invalid DSSE envelope (empty JSON)
+	os.WriteFile(filepath.Join(tmpDir, "build.json"), []byte("{}"), 0644)
+
+	v := NewVerifier()
+	if v.findAttestation(tmpDir, "build") {
+		t.Error("Expected not to find attestation with invalid structure")
 	}
 }
 
@@ -779,6 +828,207 @@ func TestFindAttestation_NonexistentDir(t *testing.T) {
 	if v.findAttestation("/nonexistent/path/for/verify/test", "build") {
 		t.Error("Expected not to find attestation in nonexistent dir")
 	}
+}
+
+// ---- Phase 1: Signature verification tests ----
+
+func TestVerifySession_Phase1_NoRootsSkipsSignatureCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sessionState := &aflock.SessionState{
+		SessionID: "sess-nosig",
+		StartedAt: time.Now(),
+		Policy: &aflock.Policy{
+			Name:    "no-roots-policy",
+			Version: "1.0",
+			// No Roots configured — signature verification should be skipped
+		},
+		Metrics: &aflock.SessionMetrics{Tools: map[string]int{}},
+	}
+
+	writeSessionState(t, tmpDir, "sess-nosig", sessionState)
+
+	v := newTestVerifier(tmpDir)
+	result, err := v.VerifySession("sess-nosig")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+
+	// Should pass — no roots means signature check is skipped
+	if !result.Success {
+		t.Errorf("Expected success=true when no roots configured. Errors: %v", result.Errors)
+	}
+
+	// Signature check should still be present and passing
+	found := false
+	for _, check := range result.Checks {
+		if check.Name == "signatures" {
+			found = true
+			if !check.Passed {
+				t.Error("Expected signatures check to pass when no roots configured")
+			}
+		}
+	}
+	if !found {
+		t.Error("Expected signatures check in results")
+	}
+}
+
+func TestVerifySession_Phase1_WithRootsVerifiesSignatures(t *testing.T) {
+	tmpDir := t.TempDir()
+	caCert, caKey := generateTestCA(t)
+
+	sessionState := &aflock.SessionState{
+		SessionID: "sess-sig",
+		StartedAt: time.Now(),
+		Policy: &aflock.Policy{
+			Name:    "sig-policy",
+			Version: "1.0",
+			Roots: map[string]aflock.Root{
+				"test-ca": {Certificate: certToPEM(caCert)},
+			},
+		},
+		Metrics: &aflock.SessionMetrics{Tools: map[string]int{}},
+	}
+
+	writeSessionState(t, tmpDir, "sess-sig", sessionState)
+
+	// Create attestation dir with a validly signed attestation
+	attestDir := filepath.Join(tmpDir, "sess-sig", "attestations")
+	os.MkdirAll(attestDir, 0755)
+
+	payload := makeCollectionPayload(t, "build", []string{"https://aflock.ai/attestations/action/v0.1"})
+	leafCert, leafKey := generateTestLeafCert(t, caCert, caKey, "test-signer")
+	envelope := signDSSEWithCert(t, "application/vnd.in-toto+json", payload, leafKey, "test-key", leafCert)
+	os.WriteFile(filepath.Join(attestDir, "build.intoto.json"), envelope, 0644)
+
+	v := newTestVerifier(tmpDir)
+	result, err := v.VerifySession("sess-sig")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+
+	if !result.Success {
+		t.Errorf("Expected success=true with valid signature. Errors: %v", result.Errors)
+	}
+}
+
+func TestVerifySession_Phase1_InvalidSignatureFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	caCert, _ := generateTestCA(t)
+
+	sessionState := &aflock.SessionState{
+		SessionID: "sess-badsig",
+		StartedAt: time.Now(),
+		Policy: &aflock.Policy{
+			Name:    "sig-policy",
+			Version: "1.0",
+			Roots: map[string]aflock.Root{
+				"test-ca": {Certificate: certToPEM(caCert)},
+			},
+		},
+		Metrics: &aflock.SessionMetrics{Tools: map[string]int{}},
+	}
+
+	writeSessionState(t, tmpDir, "sess-badsig", sessionState)
+
+	// Create attestation with fake/invalid signature
+	attestDir := filepath.Join(tmpDir, "sess-badsig", "attestations")
+	os.MkdirAll(attestDir, 0755)
+	os.WriteFile(filepath.Join(attestDir, "build.intoto.json"), makeDSSEEnvelope(t, "build", "sess-badsig"), 0644)
+
+	v := newTestVerifier(tmpDir)
+	result, err := v.VerifySession("sess-badsig")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+
+	if result.Success {
+		t.Error("Expected success=false when signature verification fails")
+	}
+
+	foundSigError := false
+	for _, e := range result.Errors {
+		if strings.Contains(e, "signature verification failed") {
+			foundSigError = true
+		}
+	}
+	if !foundSigError {
+		t.Errorf("Expected signature verification error, got: %v", result.Errors)
+	}
+}
+
+// ---- Session binding / anti-replay tests ----
+
+func TestVerifySessionBinding_SessionMismatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Attestation bound to "session-A" but being verified for "session-B"
+	os.WriteFile(filepath.Join(tmpDir, "att.intoto.json"), makeDSSEEnvelope(t, "build", "session-A"), 0644)
+
+	v := NewVerifier()
+	errors := v.verifySessionBinding(tmpDir, "session-B", time.Now().Add(-10*time.Minute))
+
+	if len(errors) == 0 {
+		t.Error("Expected session binding error for mismatched session ID")
+	}
+	found := false
+	for _, e := range errors {
+		if strings.Contains(e, "session ID mismatch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Expected 'session ID mismatch' error, got: %v", errors)
+	}
+}
+
+func TestVerifySessionBinding_CorrectSession(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "att.intoto.json"), makeDSSEEnvelope(t, "build", "session-ok"), 0644)
+
+	v := NewVerifier()
+	errors := v.verifySessionBinding(tmpDir, "session-ok", time.Now().Add(-10*time.Minute))
+
+	for _, e := range errors {
+		if strings.Contains(e, "session ID mismatch") {
+			t.Errorf("Unexpected session mismatch error: %v", e)
+		}
+	}
+}
+
+// ---- signDSSEWithCert helper ----
+
+// signDSSEWithCert creates a DSSE envelope with a valid signature and embedded leaf certificate.
+func signDSSEWithCert(t *testing.T, payloadType string, payload []byte, key *ecdsa.PrivateKey, keyID string, cert *x509.Certificate) []byte {
+	t.Helper()
+
+	payloadB64 := base64.StdEncoding.EncodeToString(payload)
+	pae := fmt.Sprintf("DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
+	paeBytes := append([]byte(pae), payload...)
+	hash := sha256.Sum256(paeBytes)
+
+	sig, err := ecdsa.SignASN1(rand.Reader, key, hash[:])
+	if err != nil {
+		t.Fatalf("sign DSSE: %v", err)
+	}
+
+	envelope := map[string]interface{}{
+		"payloadType": payloadType,
+		"payload":     payloadB64,
+		"signatures": []map[string]string{
+			{
+				"keyid":       keyID,
+				"sig":         base64.StdEncoding.EncodeToString(sig),
+				"certificate": certToPEM(cert),
+			},
+		},
+	}
+
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal DSSE envelope: %v", err)
+	}
+	return data
 }
 
 // ---- containsCheckPrefix tests ----
@@ -819,7 +1069,10 @@ func TestTopoSortSteps_NoDependencies(t *testing.T) {
 		"lint":  {Name: "lint"},
 	}
 
-	sorted := topoSortSteps(steps)
+	sorted, err := topoSortSteps(steps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(sorted) != 3 {
 		t.Fatalf("Expected 3 steps, got %d", len(sorted))
@@ -841,7 +1094,10 @@ func TestTopoSortSteps_LinearChain(t *testing.T) {
 		"test":   {Name: "test", ArtifactsFrom: []string{"deploy"}},
 	}
 
-	sorted := topoSortSteps(steps)
+	sorted, err := topoSortSteps(steps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(sorted) != 3 {
 		t.Fatalf("Expected 3 steps, got %d", len(sorted))
@@ -868,7 +1124,10 @@ func TestTopoSortSteps_Diamond(t *testing.T) {
 		"D": {Name: "D", ArtifactsFrom: []string{"B", "C"}},
 	}
 
-	sorted := topoSortSteps(steps)
+	sorted, err := topoSortSteps(steps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(sorted) != 4 {
 		t.Fatalf("Expected 4 steps, got %d", len(sorted))
@@ -900,31 +1159,23 @@ func TestTopoSortSteps_Cycle(t *testing.T) {
 		"C": {Name: "C", ArtifactsFrom: []string{"B"}},
 	}
 
-	sorted := topoSortSteps(steps)
-
-	if len(sorted) != 3 {
-		t.Fatalf("Expected 3 steps (cycle fallback), got %d: %v", len(sorted), sorted)
+	_, err := topoSortSteps(steps)
+	if err == nil {
+		t.Fatal("expected error for cyclic dependencies, got nil")
 	}
-
-	seen := make(map[string]bool)
-	for _, s := range sorted {
-		if seen[s] {
-			t.Errorf("Duplicate step %q in output", s)
-		}
-		seen[s] = true
+	if !strings.Contains(err.Error(), "dependency cycle detected") {
+		t.Errorf("expected cycle error, got: %v", err)
 	}
-	// Cycle: no nodes have in-degree 0, so all end up in the "remaining" fallback
-	// remaining is sorted alphabetically
-	expected := []string{"A", "B", "C"}
-	for i, name := range expected {
-		if sorted[i] != name {
-			t.Errorf("sorted[%d] = %q, want %q (alphabetical cycle fallback)", i, sorted[i], name)
-		}
+	if !strings.Contains(err.Error(), "A") || !strings.Contains(err.Error(), "B") || !strings.Contains(err.Error(), "C") {
+		t.Errorf("expected all cyclic steps listed in error, got: %v", err)
 	}
 }
 
 func TestTopoSortSteps_Empty(t *testing.T) {
-	sorted := topoSortSteps(map[string]aflock.Step{})
+	sorted, err := topoSortSteps(map[string]aflock.Step{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(sorted) != 0 {
 		t.Errorf("Expected empty slice, got %v", sorted)
 	}
@@ -934,7 +1185,10 @@ func TestTopoSortSteps_SingleStep(t *testing.T) {
 	steps := map[string]aflock.Step{
 		"only": {Name: "only"},
 	}
-	sorted := topoSortSteps(steps)
+	sorted, err := topoSortSteps(steps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(sorted) != 1 || sorted[0] != "only" {
 		t.Errorf("Expected [only], got %v", sorted)
 	}
@@ -947,7 +1201,10 @@ func TestTopoSortSteps_ExternalDependency(t *testing.T) {
 		"deploy": {Name: "deploy", ArtifactsFrom: []string{"external-step"}},
 	}
 
-	sorted := topoSortSteps(steps)
+	sorted, err := topoSortSteps(steps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(sorted) != 2 {
 		t.Fatalf("Expected 2 steps, got %d: %v", len(sorted), sorted)
 	}
@@ -970,24 +1227,16 @@ func TestTopoSortSteps_PartialCycle(t *testing.T) {
 		"D": {Name: "D", ArtifactsFrom: []string{"A"}},
 	}
 
-	sorted := topoSortSteps(steps)
-	if len(sorted) != 4 {
-		t.Fatalf("Expected 4 steps, got %d: %v", len(sorted), sorted)
+	_, err := topoSortSteps(steps)
+	if err == nil {
+		t.Fatal("expected error for partial cycle, got nil")
 	}
-
-	indexOf := make(map[string]int)
-	for i, s := range sorted {
-		indexOf[s] = i
+	if !strings.Contains(err.Error(), "dependency cycle detected") {
+		t.Errorf("expected cycle error, got: %v", err)
 	}
-
-	// A before D is guaranteed
-	if indexOf["A"] > indexOf["D"] {
-		t.Error("A should come before D")
+	if !strings.Contains(err.Error(), "B") || !strings.Contains(err.Error(), "C") {
+		t.Errorf("expected B and C in cycle error, got: %v", err)
 	}
-	// B and C are in cycle, appended after normal sort.
-	// A and D should be sorted first, then B and C appended.
-	// A comes first, D depends on A so D comes second,
-	// then B,C are remaining (cycle) appended alphabetically.
 }
 
 // ---- loadRootCertificates tests ----
@@ -1359,8 +1608,8 @@ func TestCertMatchesConstraint_EmptyConstraint(t *testing.T) {
 	caCert, _ := generateTestCA(t)
 	constraint := &aflock.CertConstraint{}
 
-	if !certMatchesConstraint(caCert, constraint) {
-		t.Error("Expected empty constraint to match any cert")
+	if certMatchesConstraint(caCert, constraint) {
+		t.Error("Expected empty constraint to NOT match — at least one field must be set")
 	}
 }
 
@@ -2668,7 +2917,7 @@ func TestVerifySession_FullIntegration(t *testing.T) {
 
 	attestDir := filepath.Join(tmpDir, "sess-full", "attestations")
 	os.MkdirAll(attestDir, 0755)
-	os.WriteFile(filepath.Join(attestDir, "session-summary.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(attestDir, "session-summary.json"), makeDSSEEnvelope(t, "session-summary", "sess-full"), 0644)
 
 	v := newTestVerifier(tmpDir)
 	result, err := v.VerifySession("sess-full")
