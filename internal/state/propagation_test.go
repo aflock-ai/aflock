@@ -288,6 +288,48 @@ func TestPropagation_NilLimits(t *testing.T) {
 	}
 }
 
+// TestPropagation_ConcurrentConsumeOnce exercises the atomic rename-based
+// consume-once path: N goroutines race to read the same propagation file,
+// exactly one should receive the record.
+func TestPropagation_ConcurrentConsumeOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmpDir := t.TempDir()
+	m := NewManager(tmpDir)
+
+	parent := testParentState()
+	parent.PolicyPath = "/concurrent/consume/.aflock"
+	if err := m.WritePropagation(parent); err != nil {
+		t.Fatalf("WritePropagation: %v", err)
+	}
+
+	const readers = 10
+	results := make(chan *aflock.PropagationRecord, readers)
+	errs := make(chan error, readers)
+	start := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		go func() {
+			<-start
+			rec, err := m.ReadPropagation(parent.PolicyPath)
+			errs <- err
+			results <- rec
+		}()
+	}
+	close(start)
+
+	winners := 0
+	for i := 0; i < readers; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("reader error: %v", err)
+		}
+		if rec := <-results; rec != nil {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Errorf("got %d winners, want exactly 1 (consume-once violated)", winners)
+	}
+}
+
 func TestPropagationKey_Deterministic(t *testing.T) {
 	k1 := propagationKey("/project/.aflock")
 	k2 := propagationKey("/project/.aflock")

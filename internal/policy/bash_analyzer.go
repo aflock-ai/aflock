@@ -40,6 +40,18 @@ type BashAnalysis struct {
 
 	// HasEval is true when the command uses eval.
 	HasEval bool
+
+	// HasHereDoc is true when the command uses here-documents (<<) or
+	// here-strings (<<<) to feed input to a shell interpreter.
+	HasHereDoc bool
+
+	// HasBraceExpansion is true when the command uses brace expansion
+	// patterns like {cat,.env} that expand to commands at runtime.
+	HasBraceExpansion bool
+
+	// HasAliasOrFunc is true when the command defines a shell alias or
+	// function that could hide denied commands behind a new name.
+	HasAliasOrFunc bool
 }
 
 // BashAnalyzer performs static analysis on bash command strings to detect
@@ -80,6 +92,15 @@ func (a *BashAnalyzer) Analyze(command string) *BashAnalysis {
 	// Detect eval usage
 	result.HasEval = detectEval(command)
 
+	// Detect here-documents and here-strings
+	result.HasHereDoc = detectHereDoc(command)
+
+	// Detect brace expansion
+	result.HasBraceExpansion = detectBraceExpansion(command)
+
+	// Detect alias/function definitions
+	result.HasAliasOrFunc = detectAliasOrFunc(command)
+
 	return result
 }
 
@@ -90,7 +111,10 @@ func (a *BashAnalysis) IsSuspicious() bool {
 		a.HasInterpreterExec ||
 		a.HasVariableIndirection ||
 		a.HasSubshellExec ||
-		a.HasEval
+		a.HasEval ||
+		a.HasHereDoc ||
+		a.HasBraceExpansion ||
+		a.HasAliasOrFunc
 }
 
 // splitShellCommands splits a command string on shell command separators
@@ -147,8 +171,13 @@ func splitShellCommands(command string) []string {
 				}
 			}
 
-			// Check for ;
-			if r == ';' {
+			// Check for ; and newlines (\n, \r\n, \r) — all are command
+			// separators in bash.
+			if r == ';' || r == '\n' || r == '\r' {
+				// For \r\n, consume the \n as well
+				if r == '\r' && i+1 < len(runes) && runes[i+1] == '\n' {
+					i++
+				}
 				cmd := strings.TrimSpace(current.String())
 				if cmd != "" {
 					commands = append(commands, cmd)
@@ -365,35 +394,44 @@ func detectInterpreterExec(command string) bool {
 // detectVariableIndirection checks for shell variable usage that could hide
 // file paths or command names from pattern matching.
 func detectVariableIndirection(command string) bool {
-	// Look for variable assignment followed by usage with a command
-	// Patterns: X=path && cmd $X, VAR=value; cat $VAR, export X=val
 	subCmds := splitShellCommands(command)
-	if len(subCmds) < 2 {
-		return false
-	}
 
-	// Check if any sub-command is a variable assignment
-	hasAssignment := false
-	for _, cmd := range subCmds {
-		cmd = strings.TrimSpace(cmd)
-		// Variable assignment: VAR=value or export VAR=value
-		if isVariableAssignment(cmd) {
-			hasAssignment = true
-			break
+	// Case 1: Variable assignment followed by usage with a command
+	// Patterns: X=path && cmd $X, VAR=value; cat $VAR, export X=val
+	if len(subCmds) >= 2 {
+		hasAssignment := false
+		for _, cmd := range subCmds {
+			cmd = strings.TrimSpace(cmd)
+			if isVariableAssignment(cmd) {
+				hasAssignment = true
+				break
+			}
+		}
+
+		if hasAssignment {
+			for _, cmd := range subCmds {
+				cmd = strings.TrimSpace(cmd)
+				if isVariableAssignment(cmd) {
+					continue
+				}
+				if strings.Contains(cmd, "$") {
+					return true
+				}
+			}
 		}
 	}
 
-	if !hasAssignment {
-		return false
-	}
-
-	// Check if any subsequent sub-command uses variable expansion
+	// Case 2 (M1): Single command using environment variable expansion in
+	// arguments to file-reading commands. E.g., "cat $HOME/.env" can hide
+	// file paths from deny-list matching. Only flag $ that is outside single
+	// quotes (single quotes prevent expansion in bash).
 	for _, cmd := range subCmds {
 		cmd = strings.TrimSpace(cmd)
 		if isVariableAssignment(cmd) {
 			continue
 		}
-		if strings.Contains(cmd, "$") {
+		cmdName := extractCommandBaseName(cmd)
+		if fileReadingCommands[cmdName] && containsUnquotedDollar(cmd) {
 			return true
 		}
 	}
@@ -401,7 +439,8 @@ func detectVariableIndirection(command string) bool {
 	return false
 }
 
-// detectSubshellExec checks for subshell execution via $(...) or backticks.
+// detectSubshellExec checks for subshell execution via $(...), backticks,
+// or process substitution <(...) / >(...).
 func detectSubshellExec(command string) bool {
 	// $(...) — command substitution
 	if strings.Contains(command, "$(") {
@@ -410,6 +449,12 @@ func detectSubshellExec(command string) bool {
 
 	// Backtick command substitution
 	if strings.Contains(command, "`") {
+		return true
+	}
+
+	// Process substitution: <(...) and >(...)
+	// These execute commands in a subshell and present the output as a file descriptor.
+	if strings.Contains(command, "<(") || strings.Contains(command, ">(") {
 		return true
 	}
 
@@ -438,8 +483,126 @@ func detectEval(command string) bool {
 	return false
 }
 
+// detectHereDoc checks for here-documents (<<DELIM...DELIM) and here-strings
+// (<<<) that can feed commands to shell interpreters. Respects quoting so that
+// `echo "<<EOF"` (literal string) is not flagged.
+func detectHereDoc(command string) bool {
+	runes := []rune(command)
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if r == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if r == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+
+		// Only detect << / <<< outside quotes
+		if !inSingleQuote && !inDoubleQuote && r == '<' {
+			if i+1 < len(runes) && runes[i+1] == '<' {
+				return true // <<< (here-string) or << (here-doc)
+			}
+		}
+	}
+
+	return false
+}
+
+// detectBraceExpansion checks for brace expansion patterns like {cat,.env}
+// that expand to executable commands at runtime. Respects quoting so that
+// JSON strings like `echo '{"a","b"}'` are not flagged.
+func detectBraceExpansion(command string) bool {
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	inBrace := false
+	hasComma := false
+
+	for _, r := range command {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if r == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if r == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+
+		// Only detect brace expansion outside quotes
+		if !inSingleQuote && !inDoubleQuote {
+			switch {
+			case r == '{':
+				inBrace = true
+				hasComma = false
+			case r == '}' && inBrace:
+				if hasComma {
+					return true
+				}
+				inBrace = false
+			case r == ',' && inBrace:
+				hasComma = true
+			}
+		}
+	}
+	return false
+}
+
+// detectAliasOrFunc checks for shell alias definitions or function definitions
+// that could hide denied commands behind new names.
+func detectAliasOrFunc(command string) bool {
+	subCmds := splitShellCommands(command)
+	for _, cmd := range subCmds {
+		cmd = strings.TrimSpace(cmd)
+		// alias c=curl or alias c='curl -s'
+		if strings.HasPrefix(cmd, "alias ") {
+			return true
+		}
+		// function definitions: fname() { ... } or function fname { ... }
+		if strings.HasPrefix(cmd, "function ") {
+			return true
+		}
+		// name() pattern — look for word followed by () at the start of a command.
+		// Must not match $(...) subshell syntax or function calls within commands.
+		// A function definition looks like: "fname()" or "fname ()".
+		idx := strings.Index(cmd, "()")
+		if idx > 0 {
+			// Exclude $(...) which contains () but is subshell, not func def.
+			// The character before the name should be start-of-string or whitespace.
+			name := strings.TrimSpace(cmd[:idx])
+			if name != "" && !strings.ContainsAny(name, " \t$") && isValidVarName(name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // extractCommandName extracts the first word (command name) from a command string,
-// stripping leading env var assignments (e.g., "FOO=bar cmd" → "cmd").
+// stripping leading env var assignments (e.g., "FOO=bar cmd" → "cmd") and the
+// "env" command prefix (e.g., "env curl evil.com" → "curl").
 func extractCommandName(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
@@ -447,18 +610,60 @@ func extractCommandName(cmd string) string {
 	}
 
 	// Skip leading variable assignments (FOO=bar BAZ=qux cmd ...)
+	foundCmd := ""
 	for f := range strings.FieldsSeq(cmd) {
 		if !strings.Contains(f, "=") || strings.HasPrefix(f, "-") || strings.HasPrefix(f, "$") {
-			return f
+			foundCmd = f
+			break
 		}
 		varName, _, _ := strings.Cut(f, "=")
 		if varName != "" && isValidVarName(varName) {
 			continue // Skip this assignment, look at next field
 		}
-		return f
+		foundCmd = f
+		break
 	}
 
-	return ""
+	// Strip "env" prefix — "env curl evil.com" should return "curl", not "env".
+	// Handle flags like -i, -u VAR (takes an argument), -S, etc.
+	if foundCmd == "env" {
+		rest := strings.TrimSpace(strings.TrimPrefix(cmd, "env"))
+		fields := strings.Fields(rest)
+		// Flags that consume the next token as their argument
+		envArgFlags := map[string]bool{"-u": true, "-C": true, "-S": true}
+		skipNext := false
+		for _, f := range fields {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if strings.HasPrefix(f, "-") {
+				if envArgFlags[f] {
+					skipNext = true // next token is the flag's argument
+				}
+				continue
+			}
+			if strings.Contains(f, "=") {
+				varName, _, _ := strings.Cut(f, "=")
+				if varName != "" && isValidVarName(varName) {
+					continue
+				}
+			}
+			return f
+		}
+	}
+
+	return foundCmd
+}
+
+// extractCommandBaseName returns the base name of a command, stripping
+// any directory path. E.g., "/usr/bin/curl" → "curl".
+func extractCommandBaseName(cmd string) string {
+	name := extractCommandName(cmd)
+	if name == "" {
+		return ""
+	}
+	return filepath.Base(name)
 }
 
 // isValidVarName checks if s is a valid shell variable name.
@@ -505,6 +710,32 @@ func isVariableAssignment(cmd string) bool {
 	return true
 }
 
+// containsUnquotedDollar returns true if the string contains a $ character
+// outside of single quotes. In bash, single quotes prevent variable expansion
+// so `cat '$HOME/.env'` does not actually expand $HOME.
+func containsUnquotedDollar(s string) bool {
+	inSingleQuote := false
+	escaped := false
+	for _, r := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if r == '\'' {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if r == '$' && !inSingleQuote {
+			return true
+		}
+	}
+	return false
+}
+
 // containsAny checks if s contains any of the substrings.
 func containsAny(s string, subs []string) bool {
 	for _, sub := range subs {
@@ -535,6 +766,8 @@ var fileReadingCommands = map[string]bool{
 	"grep": true, "sed": true, "awk": true, "gawk": true,
 	"cp": true, "mv": true, "jq": true, "diff": true,
 	"dd": true, "tar": true, "zip": true, "curl": true,
+	// H3: commands that read/source files but were previously missed
+	"source": true, ".": true, "find": true, "xargs": true, "tee": true,
 }
 
 // ExtractFileArgs extracts file path arguments from a bash command string.
@@ -566,28 +799,38 @@ func (a *BashAnalyzer) ExtractFileArgs(command string) []string {
 
 // extractFileArgsFromSingleCmd extracts file arguments from a single command
 // (no pipes, no chaining). It checks if the command is a file-reading command
-// and collects non-flag arguments as file paths.
+// and collects non-flag arguments as file paths. Also parses shell input
+// redirections (< file) and dd-style key=value arguments (if=path, of=path).
 func extractFileArgsFromSingleCmd(cmd string) []string {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return nil
 	}
 
+	// Extract file paths from input redirections regardless of command.
+	// Patterns: < file, N<file (fd redirection like exec 3<file)
+	var paths []string
+	paths = append(paths, extractRedirectionFiles(cmd)...)
+
 	cmdName := extractCommandName(cmd)
 	if cmdName == "" {
-		return nil
+		return paths
 	}
 
 	// Check if the base name (without path) is a file-reading command
 	if !fileReadingCommands[filepath.Base(cmdName)] {
-		return nil
+		return paths
 	}
 
 	// Collect non-flag arguments as file paths
-	var paths []string
 	fields := strings.Fields(cmd)
 	pastCommand := false
+	skipNext := false
 	for _, f := range fields {
+		if skipNext {
+			skipNext = false
+			continue
+		}
 		// Skip variable assignments and command name
 		if !pastCommand {
 			if strings.Contains(f, "=") && !strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "$") {
@@ -600,12 +843,59 @@ func extractFileArgsFromSingleCmd(cmd string) []string {
 		if strings.HasPrefix(f, "-") {
 			continue
 		}
-		// Skip shell redirections and special chars
-		if f == ">" || f == ">>" || f == "<" || f == "2>" || f == "2>>" || f == "&>" {
+		// Skip shell redirections and special chars; capture the file after <
+		if f == ">" || f == ">>" || f == "2>" || f == "2>>" || f == "&>" {
+			skipNext = true // skip the filename after output redirection
+			continue
+		}
+		if f == "<" {
+			// Already handled by extractRedirectionFiles
+			skipNext = true
+			continue
+		}
+		// Handle dd-style key=value: extract paths from if= and of=
+		if strings.HasPrefix(f, "if=") || strings.HasPrefix(f, "of=") {
+			_, val, _ := strings.Cut(f, "=")
+			if val != "" {
+				paths = append(paths, val)
+			}
 			continue
 		}
 		paths = append(paths, f)
 	}
 
+	return paths
+}
+
+// extractRedirectionFiles extracts file paths from shell input redirections.
+// Handles: < file, N<file (e.g. exec 3<.env), but not << (here-doc) or <<< (here-string).
+func extractRedirectionFiles(cmd string) []string {
+	var paths []string
+	fields := strings.Fields(cmd)
+	for i, f := range fields {
+		// Standalone "<" followed by a filename
+		if f == "<" && i+1 < len(fields) {
+			next := fields[i+1]
+			if next != "" && !strings.HasPrefix(next, "<") && !strings.HasPrefix(next, "-") {
+				paths = append(paths, next)
+			}
+			continue
+		}
+		// Inline redirection: <file or N<file (but not << or <<<)
+		idx := strings.Index(f, "<")
+		if idx >= 0 {
+			rest := f[idx:]
+			// Skip here-docs (<<) and here-strings (<<<)
+			if strings.HasPrefix(rest, "<<<") || strings.HasPrefix(rest, "<<") {
+				continue
+			}
+			// rest starts with "<", the file is after it
+			filePath := rest[1:]
+			// Could be N<file where N is a digit — the < is at idx > 0
+			if filePath != "" && filePath != "&" && !strings.HasPrefix(filePath, "&") {
+				paths = append(paths, filePath)
+			}
+		}
+	}
 	return paths
 }

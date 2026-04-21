@@ -1104,7 +1104,7 @@ func TestCheckLimits(t *testing.T) {
 			wantExceed:  false,
 		},
 		{
-			name: "within toolCalls limit",
+			name: "at exact toolCalls limit — triggers (>=)",
 			policy: &aflock.Policy{
 				Limits: &aflock.LimitsPolicy{
 					MaxToolCalls: &aflock.Limit{Value: 50, Enforcement: "fail-fast"},
@@ -1114,7 +1114,8 @@ func TestCheckLimits(t *testing.T) {
 				ToolCalls: 50,
 			},
 			enforcement: "fail-fast",
-			wantExceed:  false, // not exceeded: 50 is not > 50
+			wantExceed:  true, // issue #60 / L7: 50 >= 50 now triggers
+			wantLimit:   "maxToolCalls",
 		},
 		{
 			name: "post-hoc enforcement not checked during fail-fast",

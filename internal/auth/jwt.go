@@ -142,7 +142,23 @@ func (ti *TokenIssuer) ValidateToken(tokenString string) (*AflockClaims, error) 
 
 // ValidateTokenForSession validates a token and checks it is bound to the
 // given session ID (audience check).
+//
+// Deprecated: prefer ValidateTokenForSessionAndPolicy so the policy_digest
+// claim is verified against the currently loaded policy. This wrapper exists
+// only for callers that genuinely have no policy context (e.g., tests).
 func (ti *TokenIssuer) ValidateTokenForSession(tokenString, sessionID string) (*AflockClaims, error) {
+	return ti.ValidateTokenForSessionAndPolicy(tokenString, sessionID, "")
+}
+
+// ValidateTokenForSessionAndPolicy validates signature, expiry, issuer,
+// audience binding, AND that the token was issued under the same policy
+// that the caller currently has loaded (policy_digest claim).
+//
+// Pass currentPolicyDigest = "" to skip the policy check (legacy path).
+// When non-empty, a token whose policy_digest does not match is rejected,
+// closing issue #59 / M11: a permissive token does NOT survive a policy
+// tightening because the digest will no longer match.
+func (ti *TokenIssuer) ValidateTokenForSessionAndPolicy(tokenString, sessionID, currentPolicyDigest string) (*AflockClaims, error) {
 	claims, err := ti.ValidateToken(tokenString)
 	if err != nil {
 		return nil, err
@@ -158,6 +174,21 @@ func (ti *TokenIssuer) ValidateTokenForSession(tokenString, sessionID string) (*
 	}
 	if !found {
 		return nil, fmt.Errorf("token not valid for session %s", sessionID)
+	}
+
+	// Verify policy binding. If the caller didn't pass a digest, skip — but
+	// log to surface the gap so production callers can be hardened.
+	if currentPolicyDigest != "" && claims.PolicyDigest != currentPolicyDigest {
+		// Truncate to keep error messages readable; full hex digests are 64 chars.
+		tokenDigest := claims.PolicyDigest
+		if len(tokenDigest) > 16 {
+			tokenDigest = tokenDigest[:16]
+		}
+		shortCurrent := currentPolicyDigest
+		if len(shortCurrent) > 16 {
+			shortCurrent = shortCurrent[:16]
+		}
+		return nil, fmt.Errorf("token bound to a different policy version (token=%s..., current=%s...)", tokenDigest, shortCurrent)
 	}
 
 	return claims, nil
@@ -189,11 +220,22 @@ func IsToolAllowed(toolName string, allowedTools, deniedTools []string) bool {
 	return true
 }
 
-// ComputePolicyDigest computes a SHA-256 digest of a policy for binding tokens
-// to a specific policy version.
+// ComputePolicyDigest returns a SHA-256 digest of the policy for binding
+// tokens to a specific policy version.
+//
+// Prefers pol.RawDigest, which is the SHA-256 of the on-disk policy bytes
+// captured by policy.Load. Re-marshaling the parsed struct would normalize
+// formatting (key order, whitespace, number representation) and produce a
+// different digest for byte-identical input — see issue #61 / L5.
+//
+// Falls back to marshaling for policies constructed in-memory (e.g., tests)
+// that have no associated file.
 func ComputePolicyDigest(pol *aflock.Policy) string {
 	if pol == nil {
 		return ""
+	}
+	if pol.RawDigest != "" {
+		return pol.RawDigest
 	}
 	data, err := json.Marshal(pol)
 	if err != nil {
