@@ -379,8 +379,11 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	}
 	fmt.Fprintf(os.Stderr, "[aflock] peer credentials: pid=%d uid=%d gid=%d\n", pc.PID, pc.UID, pc.GID)
 
-	// Identity discovery + policy-digest binding from kernel-attested PID.
-	s.initAgentIdentityFromPID(pc.PID)
+	// Identity discovery + policy-digest binding from kernel-attested peer
+	// credentials. PID, UID, and GID all come from the kernel — and the
+	// peer's binary digest, container ID, and environment are read from
+	// the peer's PID directly, not from aflock's own process state.
+	s.initAgentIdentityFromPeer(pc)
 
 	s.initSigning()
 	if err := s.initAuth(); err != nil {
@@ -445,14 +448,16 @@ func (s *Server) initAgentIdentity() {
 	s.applyAgentIdentity(identity.DiscoverAgentIdentity)
 }
 
-// initAgentIdentityFromPID is the kernel-attested counterpart of
-// initAgentIdentity used by the UDS transport. The peerPID comes from
-// SO_PEERCRED/LOCAL_PEERPID on the accepted connection — it is not derived
-// from os.Getppid() and cannot be spoofed by a process renaming itself
-// "claude" in a parent slot.
-func (s *Server) initAgentIdentityFromPID(peerPID int) {
+// initAgentIdentityFromPeer is the kernel-attested counterpart of
+// initAgentIdentity used by the UDS transport. The PID, UID, and GID all
+// come from SO_PEERCRED (Linux) or LOCAL_PEERPID + LOCAL_PEERCRED (macOS)
+// on the accepted connection — they are not derived from os.Getppid() or
+// os.Getuid() and cannot be spoofed by a process renaming itself "claude"
+// in a parent slot. The peer's binary path/digest, container ID, and
+// environment are also read from the peer's PID directly per paper §3.1.
+func (s *Server) initAgentIdentityFromPeer(pc peercred.PeerCred) {
 	s.applyAgentIdentity(func() (*identity.AgentIdentity, error) {
-		return identity.DiscoverAgentIdentityFromPID(peerPID)
+		return identity.DiscoverAgentIdentityFromPeer(pc.PID, pc.UID, pc.GID)
 	})
 }
 

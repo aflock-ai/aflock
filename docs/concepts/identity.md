@@ -8,7 +8,9 @@ sidebar_position: 1
 Identity derivation has two modes today:
 
 - **Stdio / HTTP transports** (`aflock serve`, `aflock serve --http`): heuristic, walks the process tree from `os.Getppid()`. Spoofable by a process that names itself `claude` in the parent slot.
-- **Unix-domain-socket transport** (`aflock serve --unix /path/to/sock`): kernel-attested, extracts the connecting peer's PID from `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` (macOS) on accept. Cannot be spoofed by process renaming. Implemented for issue [#63](https://github.com/aflock-ai/aflock/issues/63).
+- **Unix-domain-socket transport** (`aflock serve --unix /path/to/sock`): kernel-attested per paper §3.1. PID, UID, and GID come from `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` + `LOCAL_PEERCRED` (macOS) on accept. Binary path/digest, container ID, and environment variables are read from the **peer's** PID — `/proc/<pid>/exe`, `/proc/<pid>/cgroup`, `/proc/<pid>/environ` on Linux; `ps -o comm=` on macOS — never from aflock's own process state. Cannot be spoofed by process renaming or PATH manipulation. Implemented for issue [#63](https://github.com/aflock-ai/aflock/issues/63).
+
+macOS has documented gaps: container IDs are not available (no cgroup analog) and peer environment variables are not read (KERN_PROCARGS2 has no stable API). Identity derivation on macOS therefore covers binary digest + UID/GID; verifiers should treat those fields as empty rather than absent.
 
 The SPIFFE ID format in the implementation may still differ from what's documented here. **We're looking for contributors in this area.**
 :::
