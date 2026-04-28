@@ -212,12 +212,26 @@ func (a *AgentIdentity) ToSPIFFEID(trustDomain string) (spiffeid.ID, error) {
 }
 
 // DiscoverAgentIdentity discovers the current agent's identity from the environment.
-// Uses PID-based discovery to trace the Claude process and session.
+// Uses PID-based discovery (os.Getppid()) to trace the Claude process and session.
+// For kernel-attested identity over a Unix-domain-socket transport, use
+// DiscoverAgentIdentityFromPID with the SO_PEERCRED/LOCAL_PEERPID PID.
 func DiscoverAgentIdentity() (*AgentIdentity, error) {
+	return discoverAgentIdentity(DiscoverFromMCPSocket)
+}
+
+// DiscoverAgentIdentityFromPID discovers the agent identity starting from a
+// kernel-attested peer PID (e.g. obtained via SO_PEERCRED on Linux or
+// LOCAL_PEERPID on macOS for an accepted UDS connection).
+func DiscoverAgentIdentityFromPID(peerPID int) (*AgentIdentity, error) {
+	return discoverAgentIdentity(func() (string, *ProcessMetadata, error) {
+		return DiscoverFromPID(peerPID)
+	})
+}
+
+func discoverAgentIdentity(discover func() (string, *ProcessMetadata, error)) (*AgentIdentity, error) {
 	identity := &AgentIdentity{}
 
-	// Use comprehensive PID-based discovery
-	model, meta, err := DiscoverFromMCPSocket()
+	model, meta, err := discover()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] PID-based discovery failed: %v\n", err)
 		identity.Model = "unknown"
@@ -230,14 +244,8 @@ func DiscoverAgentIdentity() (*AgentIdentity, error) {
 	}
 
 	identity.ModelVersion = parseModelVersion(identity.Model)
-
-	// Discover binary
 	identity.Binary = discoverBinary()
-
-	// Discover environment
 	identity.Environment = discoverEnvironment()
-
-	// Compute identity hash
 	identity.DeriveIdentity()
 
 	return identity, nil

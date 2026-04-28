@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,6 +24,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
 	"github.com/aflock-ai/aflock/internal/identity"
+	"github.com/aflock-ai/aflock/internal/identity/peercred"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -294,6 +296,116 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
 }
 
+// ServeUnix starts the MCP server on a Unix-domain-socket transport with
+// kernel-attested peer-credential identity (issue #63).
+//
+// On accept, the server extracts the connecting peer's PID via SO_PEERCRED
+// (Linux) or LOCAL_PEERPID (macOS), drives identity discovery from that PID
+// (rather than os.Getppid()), and serves a single MCP session as JSON-RPC
+// over the connection. The socket is created with 0600 permissions and
+// removed on shutdown. Refuses to start if the socket path already exists,
+// to avoid a hijack race against an attacker who pre-creates it.
+//
+// Single-connection by design: the connection itself is the MCP session, and
+// the kernel-attested PID is bound to that session's identity. A second client
+// connecting to the same socket path after the first disconnects starts a
+// fresh server invocation.
+func (s *Server) ServeUnix(policyPath, socketPath string) error {
+	if socketPath == "" {
+		return fmt.Errorf("socket path is required")
+	}
+
+	// Load policy if path provided
+	if policyPath != "" {
+		pol, path, err := policy.Load(policyPath)
+		if err != nil {
+			return fmt.Errorf("load policy: %w", err)
+		}
+		s.policy = pol
+		s.policyPath = path
+	} else {
+		cwd, _ := os.Getwd()
+		pol, path, err := policy.Load(cwd)
+		if err == nil {
+			s.policy = pol
+			s.policyPath = path
+		}
+	}
+
+	// Refuse to start if the socket path already exists. Lstat (not Stat)
+	// so a dangling symlink also blocks us — an attacker pre-creating either
+	// a file or a symlink at the path could otherwise win the bind race.
+	if _, err := os.Lstat(socketPath); err == nil {
+		return fmt.Errorf("socket path %q already exists; refusing to bind (avoid hijack race)", socketPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat socket path: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0700); err != nil {
+		return fmt.Errorf("create socket dir: %w", err)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("listen unix: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+	}()
+
+	// Tighten permissions to 0600. net.Listen creates with the umask-default
+	// mode, which is typically 0755 — wider than we want for a credential-
+	// bearing socket.
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on unix://%s (peer-cred identity)\n", socketPath)
+
+	conn, err := listener.Accept()
+	if err != nil {
+		return fmt.Errorf("accept: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Stop accepting further connections once we have one — single-session
+	// model. Closing the listener also unlinks-on-defer above.
+	_ = listener.Close()
+
+	pc, err := peercred.FromConn(conn)
+	if err != nil {
+		return fmt.Errorf("extract peer credentials: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[aflock] peer credentials: pid=%d uid=%d gid=%d\n", pc.PID, pc.UID, pc.GID)
+
+	// Identity discovery + policy-digest binding from kernel-attested PID.
+	s.initAgentIdentityFromPID(pc.PID)
+
+	s.initSigning()
+	if err := s.initAuth(); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] JWT authorization enabled\n")
+	}
+
+	if s.policy != nil {
+		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		if err := s.stateManager.Save(sessionState); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s\n", s.policy.Name)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
+	}
+
+	// Serve a single MCP session as JSON-RPC over the UDS connection. The
+	// connection is both Reader and Writer — same framing the stdio transport
+	// uses, just over a socket whose peer is kernel-attested.
+	stdioServer := server.NewStdioServer(s.mcpServer)
+	return stdioServer.Listen(context.Background(), conn, conn)
+}
+
 // computePolicyDigest returns the SHA-256 digest of the loaded policy.
 //
 // Prefers s.policy.RawDigest (set by policy.Load from the on-disk bytes) so
@@ -330,7 +442,22 @@ func (s *Server) computePolicyDigest() string {
 // under a Claude Code tree yet. Caller is responsible for deciding whether
 // to fail closed via policy.identity.allowedModels.
 func (s *Server) initAgentIdentity() {
-	agentID, err := identity.DiscoverAgentIdentity()
+	s.applyAgentIdentity(identity.DiscoverAgentIdentity)
+}
+
+// initAgentIdentityFromPID is the kernel-attested counterpart of
+// initAgentIdentity used by the UDS transport. The peerPID comes from
+// SO_PEERCRED/LOCAL_PEERPID on the accepted connection — it is not derived
+// from os.Getppid() and cannot be spoofed by a process renaming itself
+// "claude" in a parent slot.
+func (s *Server) initAgentIdentityFromPID(peerPID int) {
+	s.applyAgentIdentity(func() (*identity.AgentIdentity, error) {
+		return identity.DiscoverAgentIdentityFromPID(peerPID)
+	})
+}
+
+func (s *Server) applyAgentIdentity(discover func() (*identity.AgentIdentity, error)) {
+	agentID, err := discover()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
 		return

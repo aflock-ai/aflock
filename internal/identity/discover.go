@@ -483,14 +483,35 @@ type ProcessInfo struct {
 }
 
 // DiscoverFromMCPSocket discovers model and collects comprehensive process metadata.
-// This is called when aflock is started as an MCP server.
+// This is called when aflock is started as an MCP server on stdio or HTTP/SSE,
+// where there is no socket peer credential to attest the connecting process.
+// Identity is derived heuristically from the parent PID (os.Getppid()).
+//
+// For kernel-attested identity over a Unix-domain-socket transport, use
+// DiscoverFromPID with the PID returned by SO_PEERCRED/LOCAL_PEERPID.
+//
 // No fallback to environment variables - proper attestation requires PID-based discovery.
 //
 //nolint:gocognit,gocyclo // MCP socket discovery requires complex process parsing
 func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
+	return discoverFromPID(os.Getppid(), "pid_trace")
+}
+
+// DiscoverFromPID discovers the agent model and collects process metadata
+// starting from a kernel-attested peer PID (e.g. obtained via SO_PEERCRED on
+// Linux or LOCAL_PEERPID on macOS for an accepted UDS connection). The
+// resulting ProcessMetadata.DiscoveryMethod is set to "peercred" so callers
+// and attestations can distinguish kernel-attested identity from the
+// process-tree-walking heuristic used by DiscoverFromMCPSocket.
+func DiscoverFromPID(peerPID int) (string, *ProcessMetadata, error) {
+	return discoverFromPID(peerPID, "peercred")
+}
+
+//nolint:gocognit,gocyclo // shared discovery logic mirrors the original DiscoverFromMCPSocket
+func discoverFromPID(startPID int, method string) (string, *ProcessMetadata, error) {
 	meta := &ProcessMetadata{
 		AflockPID: os.Getpid(),
-		ParentPID: os.Getppid(),
+		ParentPID: startPID,
 		UserID:    os.Getuid(),
 	}
 
@@ -557,7 +578,7 @@ func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
 	}
 
 	// Discover model from process chain (no fallback)
-	model, sessionID, sessionPath, err := DiscoverModelWithSession()
+	model, sessionID, sessionPath, err := discoverModelWithSessionFromPID(startPID)
 	if err != nil {
 		meta.DiscoveryMethod = "failed"
 		return "", meta, err
@@ -566,15 +587,20 @@ func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
 	meta.Model = model
 	meta.SessionID = sessionID
 	meta.SessionPath = sessionPath
-	meta.DiscoveryMethod = "pid_trace"
+	meta.DiscoveryMethod = method
 
 	return model, meta, nil
 }
 
-// DiscoverModelWithSession discovers the model and returns session info.
+// DiscoverModelWithSession discovers the model and returns session info,
+// starting the process-chain walk from the current process's parent. Used
+// by stdio/HTTP transports where there is no socket peer credential.
 func DiscoverModelWithSession() (model, sessionID, sessionPath string, err error) {
-	ppid := os.Getppid()
-	pids := getProcessChain(ppid)
+	return discoverModelWithSessionFromPID(os.Getppid())
+}
+
+func discoverModelWithSessionFromPID(startPID int) (model, sessionID, sessionPath string, err error) {
+	pids := getProcessChain(startPID)
 
 	// Find Claude process and its working directory
 	for _, pid := range pids {

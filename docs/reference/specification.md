@@ -295,8 +295,8 @@ The agent communicates with ai-notary via **MCP (Model Context Protocol)**. This
 **Implementation Notes:**
 
 1. **PID from Socket**:
-   - Unix socket: `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS)
-   - TCP localhost: Parse `/proc/net/tcp` to find PID by port
+   - Unix socket: `SO_PEERCRED` (Linux) / `LOCAL_PEERPID` (macOS — `LOCAL_PEERCRED` returns only UID/GID, PID is a separate `LOCAL_PEERPID` getsockopt). Implemented in `internal/identity/peercred` and used by `aflock serve --unix` (issue #63).
+   - TCP localhost: Parse `/proc/net/tcp` to find PID by port (not implemented; HTTP transport currently falls back to `os.Getppid()` heuristic).
 
 2. **Process Inspection** (with PID):
    - `/proc/{pid}/cmdline` (Linux) or `ps -p {pid}` (macOS)

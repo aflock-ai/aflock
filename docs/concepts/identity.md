@@ -5,16 +5,19 @@ sidebar_position: 1
 # Agent Identity
 
 :::caution Active Development
-The identity derivation model described here is the target design. The current implementation uses **process-tree heuristics** (`os.Getppid()` and `ps`) rather than kernel-level socket credentials (`SO_PEERCRED`/`LOCAL_PEERCRED`). The MCP server currently uses stdio transport, not Unix domain sockets. See [#24](https://github.com/aflock-ai/aflock/issues/24). The SPIFFE ID format in the implementation also differs from what's documented here. **We're looking for contributors in this area.**
+Identity derivation has two modes today:
+
+- **Stdio / HTTP transports** (`aflock serve`, `aflock serve --http`): heuristic, walks the process tree from `os.Getppid()`. Spoofable by a process that names itself `claude` in the parent slot.
+- **Unix-domain-socket transport** (`aflock serve --unix /path/to/sock`): kernel-attested, extracts the connecting peer's PID from `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` (macOS) on accept. Cannot be spoofed by process renaming. Implemented for issue [#63](https://github.com/aflock-ai/aflock/issues/63).
+
+The SPIFFE ID format in the implementation may still differ from what's documented here. **We're looking for contributors in this area.**
 :::
 
 A core insight of aflock is that agent identity should be **derived from introspectable properties** rather than assigned. The agent cannot lie about its identity because the server independently verifies all components.
 
 ## Identity Derivation
 
-When an agent connects to the aflock server via MCP over a Unix domain socket, the server obtains the connecting process's PID through `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (macOS).
-
-> **Current implementation note:** The server currently uses process-tree walking (`os.Getppid()`) over stdio transport rather than socket credentials. See [#24](https://github.com/aflock-ai/aflock/issues/24).
+When an agent connects to the aflock server via MCP over a Unix domain socket, the server obtains the connecting process's PID through `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` (macOS — note: `LOCAL_PEERCRED` returns only UID/GID on macOS, the PID requires a separate `LOCAL_PEERPID` getsockopt call).
 
 From the PID, the server introspects:
 
