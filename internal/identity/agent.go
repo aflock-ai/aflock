@@ -145,7 +145,15 @@ func (a *AgentIdentity) canonicalEnv() string {
 	}
 
 	if a.Binary != nil {
-		add("binary", a.Binary.Name+"@"+a.Binary.Version)
+		// Elide the "@version" suffix when version is empty so the
+		// peer-cred path (where the digest is the authoritative version)
+		// doesn't emit a stray trailing "@". Heuristic-mode callers that
+		// pass a real version still get "name@version" as before.
+		bin := a.Binary.Name
+		if a.Binary.Version != "" {
+			bin = a.Binary.Name + "@" + a.Binary.Version
+		}
+		add("binary", bin)
 		add("binary_path", a.Binary.Path)
 		add("binary_digest", a.Binary.Digest)
 	}
@@ -237,11 +245,20 @@ func DiscoverAgentIdentityFromPID(peerPID int) (*AgentIdentity, error) {
 // derived entirely from peer-side data attested by the kernel. The peer
 // PID, UID, and GID must come from SO_PEERCRED (Linux) or LOCAL_PEERPID +
 // LOCAL_PEERCRED (macOS) on an accepted UDS connection. Binary path and
-// digest are read from /proc/<pid>/exe or `ps -o comm=`, container ID
-// from /proc/<pid>/cgroup, environment from /proc/<pid>/environ — never
-// from aflock's own process state.
+// digest are read from /proc/<pid>/exe (Linux) or libproc-via-lsof
+// (macOS), container ID from /proc/<pid>/cgroup, environment from
+// /proc/<pid>/environ — never from aflock's own process state.
+//
+// Returns an error if peer-binary attestation fails (e.g. PID recycled
+// during introspection, /proc/<pid>/exe unreadable). Callers MUST refuse
+// to serve the connection on error rather than fall back to heuristic
+// identity — the whole point of the kernel-attested path is that we
+// don't lie about identity when we can't prove it.
 func DiscoverAgentIdentityFromPeer(pid int, uid, gid uint32) (*AgentIdentity, error) {
-	peer := IntrospectPeer(pid, uid, gid)
+	peer, err := IntrospectPeer(pid, uid, gid)
+	if err != nil {
+		return nil, fmt.Errorf("introspect peer pid=%d: %w", pid, err)
+	}
 	return discoverAgentIdentity(func() (string, *ProcessMetadata, error) {
 		return DiscoverFromPeer(peer)
 	}, &peer)

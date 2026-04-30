@@ -37,13 +37,16 @@ func startSleeper(t *testing.T) (*exec.Cmd, int) {
 }
 
 // TestIntrospectPeer_BinaryPathFromKernel verifies that the peer's binary
-// path comes from the kernel-attested PID — /proc/<pid>/exe on Linux,
-// `ps -o comm=` on macOS — not from aflock's PATH. This is the core paper
-// §3.1 guarantee.
+// path comes from the kernel-attested PID — /proc/<pid>/exe FD on Linux,
+// libproc-via-lsof on macOS — not from aflock's PATH. This is the core
+// paper §3.1 guarantee.
 func TestIntrospectPeer_BinaryPathFromKernel(t *testing.T) {
 	_, pid := startSleeper(t)
 
-	info := IntrospectPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())) //nolint:gosec // G115: uid fits in uint32
+	info, err := IntrospectPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())) //nolint:gosec // G115: uid fits in uint32
+	if err != nil {
+		t.Fatalf("IntrospectPeer: %v", err)
+	}
 
 	if info.BinaryPath == "" {
 		t.Fatal("BinaryPath is empty — kernel PID introspection failed")
@@ -68,7 +71,10 @@ func TestIntrospectPeer_EnvironLinuxOnly(t *testing.T) {
 	}
 	_, pid := startSleeper(t)
 
-	info := IntrospectPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())) //nolint:gosec // G115
+	info, err := IntrospectPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())) //nolint:gosec // G115
+	if err != nil {
+		t.Fatalf("IntrospectPeer: %v", err)
+	}
 
 	if info.Environ == nil {
 		t.Fatal("Environ is nil on Linux — expected map populated from /proc/<pid>/environ")
@@ -180,5 +186,66 @@ func TestDiscoverAgentIdentityFromPeer_UIDFromKernel(t *testing.T) {
 	if id.Environment.UserID != int(syntheticUID) {
 		t.Errorf("Environment.UserID = %d, want %d (the kernel-attested UID we passed)",
 			id.Environment.UserID, syntheticUID)
+	}
+}
+
+// TestIntrospectPeer_DeadProcess verifies fail-closed behavior when the
+// peer process is gone before introspection. A dead PID makes the
+// /proc/<pid>/exe open (Linux) or lsof (Darwin) error out, and we MUST
+// surface that as an error rather than silently attest with an empty
+// digest. Any other behavior would mean a recycled-PID spoofer could
+// land their identity in an aflock attestation.
+func TestIntrospectPeer_DeadProcess(t *testing.T) {
+	cmd, pid := startSleeper(t)
+	// Kill it, wait for reap, then introspect. The PID is now either
+	// freed or pointing at a different process — both cases must error.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	_, _ = cmd.Process.Wait()
+
+	if _, err := IntrospectPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())); err == nil { //nolint:gosec // G115
+		t.Fatal("expected error introspecting dead PID, got nil — would silently attest with empty digest")
+	}
+}
+
+// TestPeerBinaryIdentity_PreservesDigestWithoutPath pins a security
+// invariant: if introspection produced a verified digest but no path
+// (Readlink failed after a successful FD-bound hash), the digest must
+// still flow through to the canonical identity. The previous code
+// returned an empty BinaryIdentity in this case, silently dropping the
+// load-bearing component of the identity hash.
+func TestPeerBinaryIdentity_PreservesDigestWithoutPath(t *testing.T) {
+	const knownDigest = "deadbeef" // not 64 chars, but that's fine — we're checking pass-through, not validation
+	bid := peerBinaryIdentity(&PeerInfo{BinaryDigest: knownDigest})
+	if bid == nil {
+		t.Fatal("peerBinaryIdentity returned nil")
+	}
+	if bid.Digest != knownDigest {
+		t.Errorf("Digest = %q, want %q (digest dropped when path is empty)", bid.Digest, knownDigest)
+	}
+	if bid.Path != "" {
+		t.Errorf("Path = %q, want empty", bid.Path)
+	}
+	if bid.Name != "" {
+		t.Errorf("Name = %q, want empty (no path → no basename)", bid.Name)
+	}
+}
+
+// TestDiscoverAgentIdentityFromPeer_DeadProcessFailsClosed makes sure
+// the error from IntrospectPeer propagates all the way out of the
+// public Discover entrypoint. If a refactor accidentally swallows the
+// error here, the UDS server would serve sessions with unattestable
+// identities and the kernel-attestation guarantee would be paper-thin.
+func TestDiscoverAgentIdentityFromPeer_DeadProcessFailsClosed(t *testing.T) {
+	cmd, pid := startSleeper(t)
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	_, _ = cmd.Process.Wait()
+
+	id, err := DiscoverAgentIdentityFromPeer(pid, uint32(os.Getuid()), uint32(os.Getgid())) //nolint:gosec // G115
+	if err == nil {
+		t.Fatalf("expected error from DiscoverAgentIdentityFromPeer on dead PID, got nil (id=%+v)", id)
 	}
 }

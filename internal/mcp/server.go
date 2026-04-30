@@ -345,7 +345,13 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
 
+	// Set umask 0077 around the bind so the socket is created with 0600
+	// permissions from the very first instant it exists on disk — closes
+	// the window where the umask-default-permissioned socket would be
+	// reachable before our explicit Chmod fires.
+	restoreUmask := withRestrictiveUmask()
 	listener, err := net.Listen("unix", socketPath)
+	restoreUmask()
 	if err != nil {
 		return fmt.Errorf("listen unix: %w", err)
 	}
@@ -354,9 +360,9 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		_ = os.Remove(socketPath)
 	}()
 
-	// Tighten permissions to 0600. net.Listen creates with the umask-default
-	// mode, which is typically 0755 — wider than we want for a credential-
-	// bearing socket.
+	// Defense in depth: explicitly Chmod 0600 in case a future refactor
+	// drops the umask wrapper. With umask 0077 above, the bind already
+	// created the socket as 0600.
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
@@ -383,7 +389,15 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	// credentials. PID, UID, and GID all come from the kernel — and the
 	// peer's binary digest, container ID, and environment are read from
 	// the peer's PID directly, not from aflock's own process state.
-	s.initAgentIdentityFromPeer(pc)
+	//
+	// Fail closed: if peer-binary attestation fails (e.g. PID recycled
+	// between SO_PEERCRED and our /proc/<pid>/exe read on Linux, or peer
+	// already gone on Darwin), refuse to serve rather than silently fall
+	// back to a heuristic identity. The whole point of the UDS transport
+	// is that we don't lie about who's connected.
+	if err := s.initAgentIdentityFromPeer(pc); err != nil {
+		return fmt.Errorf("peer identity attestation failed (refusing to serve): %w", err)
+	}
 
 	s.initSigning()
 	if err := s.initAuth(); err != nil {
@@ -455,10 +469,22 @@ func (s *Server) initAgentIdentity() {
 // os.Getuid() and cannot be spoofed by a process renaming itself "claude"
 // in a parent slot. The peer's binary path/digest, container ID, and
 // environment are also read from the peer's PID directly per paper §3.1.
-func (s *Server) initAgentIdentityFromPeer(pc peercred.PeerCred) {
-	s.applyAgentIdentity(func() (*identity.AgentIdentity, error) {
-		return identity.DiscoverAgentIdentityFromPeer(pc.PID, pc.UID, pc.GID)
-	})
+//
+// Returns an error if peer-binary attestation fails. Unlike the
+// stdio/HTTP heuristic path, the UDS path treats this as fatal: serving
+// a session with an unattestable identity defeats the purpose of the
+// kernel-attested transport.
+func (s *Server) initAgentIdentityFromPeer(pc peercred.PeerCred) error {
+	agentID, err := identity.DiscoverAgentIdentityFromPeer(pc.PID, pc.UID, pc.GID)
+	if err != nil {
+		return err
+	}
+	s.agentIdentity = agentID
+	if s.policy != nil {
+		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
+		s.agentIdentity.DeriveIdentity()
+	}
+	return nil
 }
 
 func (s *Server) applyAgentIdentity(discover func() (*identity.AgentIdentity, error)) {
