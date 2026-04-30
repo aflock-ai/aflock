@@ -616,10 +616,10 @@ func filterEnvAllowlist(env map[string]string) map[string]string {
 	out := make(map[string]string)
 	sensitive := []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"}
 	for key, value := range env {
-		if !(strings.HasPrefix(key, "CLAUDE_") ||
-			strings.HasPrefix(key, "ANTHROPIC_") ||
-			strings.HasPrefix(key, "SPIFFE_") ||
-			key == "USER" || key == "HOME") {
+		if !strings.HasPrefix(key, "CLAUDE_") &&
+			!strings.HasPrefix(key, "ANTHROPIC_") &&
+			!strings.HasPrefix(key, "SPIFFE_") &&
+			key != "USER" && key != "HOME" {
 			continue
 		}
 		upper := strings.ToUpper(key)

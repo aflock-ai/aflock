@@ -99,4 +99,3 @@ func peerEnvironmentIdentity(p *PeerInfo) *EnvironmentIdentity {
 	}
 	return env
 }
-
