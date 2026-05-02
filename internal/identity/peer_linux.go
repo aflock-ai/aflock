@@ -56,7 +56,9 @@ func peerBinaryAndDigest(pid int) (string, string, error) {
 	}
 	f, err := os.Open(fmt.Sprintf("/proc/%d/exe", pid)) //nolint:gosec // G304: kernel-attested PID
 	if err != nil {
-		return "", "", fmt.Errorf("open /proc/%d/exe: %w", pid, err)
+		// Don't double-prefix: os.Open already returns a *PathError that
+		// formats as "open /proc/<pid>/exe: <reason>".
+		return "", "", err
 	}
 	defer func() { _ = f.Close() }()
 	t2, err := peerStartTime(pid)
