@@ -240,7 +240,16 @@ func (s *Signer) CreateActionAttestation(
 			IdentityHash: agentIdentity.IdentityHash,
 		}
 		if agentIdentity.Binary != nil {
-			predicate.AgentIdentity.Binary = fmt.Sprintf("%s@%s", agentIdentity.Binary.Name, agentIdentity.Binary.Version)
+			// Version is intentionally empty on the kernel-attested path
+			// (peerBinaryIdentity leaves it unset because the digest is the
+			// authoritative version identifier). Only emit "@<version>" when
+			// we actually have one — otherwise the predicate would carry a
+			// dangling "@" suffix like "socat1@".
+			binary := agentIdentity.Binary.Name
+			if agentIdentity.Binary.Version != "" {
+				binary = agentIdentity.Binary.Name + "@" + agentIdentity.Binary.Version
+			}
+			predicate.AgentIdentity.Binary = binary
 			predicate.AgentIdentity.BinaryHash = agentIdentity.Binary.Digest
 		}
 		if agentIdentity.Environment != nil {
