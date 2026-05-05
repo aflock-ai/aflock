@@ -198,6 +198,12 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
+	// Refuse to start if the policy carries limits the MCP transport
+	// cannot enforce. Closes the silent-bypass UX trap (#94).
+	if err := validateMCPLimits(s.policy); err != nil {
+		return err
+	}
+
 	// Identity discovery + policy-digest binding per paper §3.1.
 	s.initAgentIdentity()
 
@@ -224,6 +230,63 @@ func (s *Server) Serve(policyPath string) error {
 
 	// Serve on stdio
 	return server.ServeStdio(s.mcpServer)
+}
+
+// validateMCPLimits guards against silently bypassed policy limits on
+// the MCP transport. The MCP protocol does not carry the agent's token
+// usage (Claude does not include it in tool/call results) or any
+// turn-boundary signal, so the metrics those limits depend on stay at
+// zero on MCP-only deployments. See issue #94.
+//
+// Behavior:
+//   - fail-fast enforcement on any of the affected limits returns an
+//     error; the server refuses to start because honoring the contract
+//     is impossible.
+//   - post-hoc enforcement logs a loud warning; verify will silently
+//     pass on these limits, but startup continues.
+//   - maxToolCalls and maxWallTimeSeconds are unaffected (those
+//     counters work on the MCP path).
+func validateMCPLimits(p *aflock.Policy) error {
+	if p == nil || p.Limits == nil {
+		return nil
+	}
+	bypassed := []struct {
+		name  string
+		limit *aflock.Limit
+	}{
+		{"maxSpendUSD", p.Limits.MaxSpendUSD},
+		{"maxTokensIn", p.Limits.MaxTokensIn},
+		{"maxTokensOut", p.Limits.MaxTokensOut},
+		{"maxTurns", p.Limits.MaxTurns},
+	}
+	var failFast []string
+	for _, e := range bypassed {
+		if e.limit == nil {
+			continue
+		}
+		// Treat empty enforcement as fail-fast — that matches the
+		// number-shorthand path in pkg/aflock/types.go's UnmarshalJSON.
+		switch e.limit.Enforcement {
+		case "post-hoc":
+			fmt.Fprintf(os.Stderr,
+				"[aflock] WARNING: policy limit %q is set to post-hoc enforcement,\n"+
+					"          but the MCP transport cannot observe token usage or\n"+
+					"          turn boundaries. The counter will stay at 0 and verify\n"+
+					"          will silently pass this limit. See issue #94.\n",
+				e.name)
+		default:
+			failFast = append(failFast, e.name)
+		}
+	}
+	if len(failFast) > 0 {
+		return fmt.Errorf(
+			"refusing to start: policy uses fail-fast enforcement on %v, but the "+
+				"MCP transport cannot observe the metrics required to enforce these "+
+				"limits (issue #94). Change enforcement to post-hoc, remove the "+
+				"limits, or run a hooks deployment instead",
+			failFast)
+	}
+	return nil
 }
 
 // projectRoot returns the directory containing the policy file.
@@ -254,6 +317,12 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 			s.policy = pol
 			s.policyPath = path
 		}
+	}
+
+	// Refuse to start if the policy carries limits the MCP transport
+	// cannot enforce. Closes the silent-bypass UX trap (#94).
+	if err := validateMCPLimits(s.policy); err != nil {
+		return err
 	}
 
 	// Identity discovery + policy-digest binding per paper §3.1. Mirrors
