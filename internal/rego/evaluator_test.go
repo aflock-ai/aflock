@@ -284,6 +284,34 @@ func TestEvaluate_FragmentPolicy_V1Syntax(t *testing.T) {
 	}
 }
 
+// TestEvaluate_FragmentPolicy_ContainsBuiltin guards the docs/paper §3.2
+// example: a fragment that calls the `contains(haystack, needle)` string
+// builtin. The auto-wrap header imports `future.keywords.contains` (which
+// promotes `contains` to a keyword for set rules); this test ensures the
+// builtin form keeps working under that import — i.e. there's no
+// keyword/builtin name conflict in the OPA version we depend on.
+func TestEvaluate_FragmentPolicy_ContainsBuiltin(t *testing.T) {
+	pol := Policy{
+		Name: "fragment-contains-builtin",
+		Module: `deny[msg] {
+  input.tool == "Bash"
+  contains(input.args, "rm -rf /")
+  msg := "destructive command"
+}`,
+	}
+	input := []byte(`{"tool": "Bash", "args": "echo hi && rm -rf / && echo bye"}`)
+	results, err := Evaluate([]Policy{pol}, input)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if results[0].Passed {
+		t.Error("expected deny for destructive command")
+	}
+	if len(results[0].Reasons) == 0 {
+		t.Error("expected a deny reason")
+	}
+}
+
 // TestEvaluate_FragmentWithLeadingComments verifies that auto-wrap detects
 // the missing package declaration even when leading `#` comments are present.
 func TestEvaluate_FragmentWithLeadingComments(t *testing.T) {
