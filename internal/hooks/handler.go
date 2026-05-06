@@ -24,6 +24,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/usage"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -1122,6 +1123,12 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		return output.WriteEmpty()
 	}
 
+	// Settle any final usage from the session JSONL before evaluating
+	// limits. Catches the trailing assistant message written after the
+	// last tool call (which the per-tool-call tracker on the MCP path
+	// would otherwise miss). Closes #96.
+	h.settleFinalUsage(input, sessionState)
+
 	// Check post-hoc limits
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
@@ -1146,6 +1153,34 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls)
 
 	return output.WriteEmpty()
+}
+
+// settleFinalUsage reads the session JSONL one last time at SessionEnd and
+// folds any token/turn deltas into sessionState.Metrics. The MCP path
+// updates incrementally per tool call, but the final assistant message
+// (the one whose response triggered the user's /exit) lands in the JSONL
+// AFTER the last tool call — so without this, post-hoc limit evaluation
+// would see one assistant turn short of reality. No-op if no transcript
+// path or no JSONL on disk.
+func (h *Handler) settleFinalUsage(input *aflock.HookInput, sessionState *aflock.SessionState) {
+	if input == nil || input.TranscriptPath == "" || sessionState == nil {
+		return
+	}
+	sessionDir := h.stateManager.SessionDir(input.SessionID)
+	tracker := usage.NewTracker(input.TranscriptPath, sessionDir)
+	delta, err := tracker.ReadDelta()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: SessionEnd usage settle failed: %v\n", err)
+		return
+	}
+	if delta.AssistantTurns == 0 && delta.InputTokens == 0 && delta.OutputTokens == 0 {
+		return
+	}
+	cost := usage.ComputeCostUSD(delta)
+	h.stateManager.UpdateMetrics(sessionState, delta.InputTokens, delta.OutputTokens, cost)
+	for i := 0; i < delta.AssistantTurns; i++ {
+		h.stateManager.IncrementTurns(sessionState)
+	}
 }
 
 // handleNotification logs notifications.

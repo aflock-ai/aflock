@@ -510,6 +510,12 @@ type SessionState struct {
 	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
 	// behavior without a state-shape migration.
 	SigningMode string `json:"signing_mode,omitempty"`
+	// TranscriptPath is the absolute path to the Claude Code session JSONL
+	// (~/.claude/projects/<encoded-cwd>/<uuid>.jsonl). Persisted so verify
+	// can re-read usage from the JSONL when state.Metrics are stale (e.g.
+	// after a Ctrl-C that bypassed SessionEnd). Empty when running against
+	// a non-Claude MCP client. Closes #96.
+	TranscriptPath string `json:"transcript_path,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.

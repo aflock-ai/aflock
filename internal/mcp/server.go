@@ -32,6 +32,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/identity/peercred"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/usage"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -84,6 +85,12 @@ type Server struct {
 	httpBootstrapSecret      string
 	httpBootstrapSecretPath  string
 	httpBootstrapSecretMu    sync.Mutex
+
+	// usageTracker reads the Claude Code session JSONL for token/cost/turn
+	// metrics that the MCP transport itself does not carry. Populated lazily
+	// after initAgentIdentity discovers the JSONL path. nil when running
+	// against a non-Claude MCP client (no JSONL exists). Closes #96.
+	usageTracker *usage.Tracker
 }
 
 // NewServer creates a new aflock MCP server.
@@ -239,6 +246,9 @@ func (s *Server) Serve(policyPath string) error {
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		if s.agentIdentity != nil && s.agentIdentity.SessionPath != "" {
+			sessionState.TranscriptPath = s.agentIdentity.SessionPath
+		}
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
@@ -627,6 +637,18 @@ func (s *Server) applyAgentIdentity(discover func() (*identity.AgentIdentity, er
 	if s.policy != nil {
 		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
 		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
+	}
+	// Initialize the usage tracker now that we know the JSONL path. The
+	// tracker is per-session; offset state persists at <session-dir>/usage.offset
+	// so aflock restarts mid-session don't double-count. Path is also
+	// persisted into the session state so verify can fall back to reading
+	// the JSONL directly if state.Metrics turn out stale (e.g. Ctrl-C
+	// bypassed SessionEnd).
+	if s.agentIdentity != nil && s.agentIdentity.SessionPath != "" {
+		s.usageTracker = usage.NewTracker(
+			s.agentIdentity.SessionPath,
+			s.stateManager.SessionDir(s.sessionID),
+		)
 	}
 }
 
@@ -1618,7 +1640,32 @@ func (s *Server) recordAction(toolName, decision, reason string) {
 		Reason:    reason,
 	}
 	s.stateManager.RecordAction(sessionState, record)
+	s.applyUsageDelta(sessionState)
 	_ = s.stateManager.Save(sessionState)
+}
+
+// applyUsageDelta polls the JSONL tracker for new token/turn data since the
+// last call and folds it into sessionState.Metrics. No-op when no tracker is
+// active (non-Claude MCP client, or pre-discovery). Errors are logged once
+// at debug-ish level and never block tool dispatch — usage tracking is
+// best-effort instrumentation, not a security gate.
+func (s *Server) applyUsageDelta(sessionState *aflock.SessionState) {
+	if s.usageTracker == nil || sessionState == nil {
+		return
+	}
+	delta, err := s.usageTracker.ReadDelta()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: usage tracker read failed: %v\n", err)
+		return
+	}
+	if delta.AssistantTurns == 0 && delta.InputTokens == 0 && delta.OutputTokens == 0 {
+		return
+	}
+	cost := usage.ComputeCostUSD(delta)
+	s.stateManager.UpdateMetrics(sessionState, delta.InputTokens, delta.OutputTokens, cost)
+	for i := 0; i < delta.AssistantTurns; i++ {
+		s.stateManager.IncrementTurns(sessionState)
+	}
 }
 
 // trackFile tracks a file access in the session state.

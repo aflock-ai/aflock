@@ -26,6 +26,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/policy"
 	aflockRego "github.com/aflock-ai/aflock/internal/rego"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/usage"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -108,6 +109,13 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 	}
 
 	result.PolicyName = sessionState.Policy.Name
+
+	// If state.Metrics has zero token usage but a transcript path is on
+	// record, the session may have been Ctrl-C'd before the per-tool-call
+	// or SessionEnd usage tracker could persist. Re-read the JSONL once
+	// to repair stale metrics so post-hoc limit checks see real numbers.
+	// Closes #96.
+	v.repairStaleMetricsFromJSONL(sessionState)
 
 	// Build metrics summary
 	if sessionState.Metrics != nil {
@@ -366,6 +374,46 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 	}
 
 	return result, nil
+}
+
+// repairStaleMetricsFromJSONL re-reads the Claude Code session JSONL when
+// state.Metrics show zero token usage despite a transcript path being on
+// record. Covers the Ctrl-C and SessionEnd-skipped paths where the
+// per-tool-call usage tracker on the MCP server didn't get to persist.
+//
+// No-op when the session was a non-Claude MCP client (TranscriptPath empty),
+// when metrics are already populated (we trust the recorded counts), or
+// when the JSONL is missing/unreadable. Failures here never block verify.
+func (v *Verifier) repairStaleMetricsFromJSONL(sessionState *aflock.SessionState) {
+	if sessionState == nil || sessionState.TranscriptPath == "" {
+		return
+	}
+	if sessionState.Metrics == nil {
+		sessionState.Metrics = &aflock.SessionMetrics{}
+	}
+	// Heuristic: only repair when metrics look untouched. If the user had
+	// real zero usage (impossible in practice — every assistant turn has
+	// at least one input/output token) we'd just re-read for nothing.
+	if sessionState.Metrics.TokensIn != 0 || sessionState.Metrics.TokensOut != 0 {
+		return
+	}
+
+	tracker := usage.NewTracker(sessionState.TranscriptPath, v.stateManager.SessionDir(sessionState.SessionID))
+	delta, err := tracker.ReadDelta()
+	if err != nil {
+		return
+	}
+	if delta.AssistantTurns == 0 && delta.InputTokens == 0 && delta.OutputTokens == 0 {
+		return
+	}
+	cost := usage.ComputeCostUSD(delta)
+	v.stateManager.UpdateMetrics(sessionState, delta.InputTokens, delta.OutputTokens, cost)
+	for i := 0; i < delta.AssistantTurns; i++ {
+		v.stateManager.IncrementTurns(sessionState)
+	}
+	// Persist the repair so future verify runs (or status commands) see the
+	// fixed metrics. Best-effort.
+	_ = v.stateManager.Save(sessionState)
 }
 
 // VerifyLatestSession finds and verifies the most recent session.
