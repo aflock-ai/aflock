@@ -261,6 +261,62 @@ func (s *Server) Serve(policyPath string) error {
 	return server.ServeStdio(s.mcpServer)
 }
 
+// discoverFreshJSONL finds the Claude Code session JSONL belonging to
+// the CURRENT aflock session by scanning ~/.claude/projects/<encoded-cwd>/
+// for the most-recently-modified *.jsonl whose mtime is at or after
+// sessionStart (with a small clock-skew buffer). Returns "" if no
+// matching file exists yet — caller should retry on later tool calls.
+//
+// Why mtime filtering? aflock's process spawns when claude starts the
+// MCP server, but claude only writes its new session JSONL after the
+// first assistant response. If a previous claude session left an older
+// JSONL in the same project dir, naive "newest jsonl" discovery would
+// return that stale file. Filtering by mtime >= sessionStart excludes
+// it and locks onto the current session as soon as claude writes turn 1.
+func discoverFreshJSONL(sessionStart time.Time) string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	// Claude Code encodes the cwd by replacing each '/' with '-' to form
+	// the project subdirectory name.
+	encoded := strings.ReplaceAll(cwd, "/", "-")
+	projectDir := filepath.Join(homeDir, ".claude", "projects", encoded)
+
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return ""
+	}
+
+	// 30-second buffer for clock skew / claude opening the file slightly
+	// before our StartedAt timestamp.
+	threshold := sessionStart.Add(-30 * time.Second)
+
+	var best string
+	var bestMtime time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(threshold) {
+			continue // pre-dates this session — stale
+		}
+		if info.ModTime().After(bestMtime) {
+			bestMtime = info.ModTime()
+			best = filepath.Join(projectDir, e.Name())
+		}
+	}
+	return best
+}
+
 // projectRoot returns the directory containing the policy file.
 func (s *Server) projectRoot() string {
 	if s.policyPath != "" {
@@ -1678,31 +1734,36 @@ func (s *Server) applyUsageDelta(sessionState *aflock.SessionState) {
 	}
 }
 
-// tryInitUsageTracker attempts to discover the Claude Code JSONL and
-// initialize a Tracker. If agent identity already carries a SessionPath
-// (eager discovery succeeded at startup), we use that; otherwise we
-// re-run discovery here and propagate the path forward.
+// tryInitUsageTracker attempts to discover the Claude Code JSONL for
+// THIS aflock session and initialize a Tracker. We can't trust the
+// init-time identity.SessionPath because it was resolved via
+// DiscoverModelWithSession before claude wrote any new JSONL — it
+// often points at a stale JSONL from a previous claude session whose
+// mtime happened to be the most recent at our startup moment.
 //
-// Persists the discovered path to sessionState.TranscriptPath so verify
-// can fall back to JSONL re-read for Ctrl-C'd sessions.
+// Strategy: re-run discovery on every call until we find a JSONL whose
+// mtime is at or after this session's StartedAt (allowing a small clock
+// skew). That filter excludes any leftover JSONL from a previous claude
+// session and locks onto the current one once claude writes its first
+// assistant turn.
+//
+// Once a valid JSONL is found, persist the path to sessionState.TranscriptPath
+// for the verify-side fallback.
 func (s *Server) tryInitUsageTracker(sessionState *aflock.SessionState) {
 	if s.usageTracker != nil {
 		return
 	}
-	var jsonlPath string
-	if s.agentIdentity != nil && s.agentIdentity.SessionPath != "" {
-		jsonlPath = s.agentIdentity.SessionPath
-	} else {
-		// Re-run JSONL discovery — claude may have created the file
-		// after our initial init pass.
-		_, _, p, err := identity.DiscoverModelWithSession()
-		if err != nil || p == "" {
-			return
-		}
-		jsonlPath = p
-		if s.agentIdentity != nil {
-			s.agentIdentity.SessionPath = p
-		}
+	if sessionState == nil {
+		return
+	}
+
+	jsonlPath := discoverFreshJSONL(sessionState.StartedAt)
+	if jsonlPath == "" {
+		return
+	}
+
+	if s.agentIdentity != nil {
+		s.agentIdentity.SessionPath = jsonlPath
 	}
 	s.usageTracker = usage.NewTracker(jsonlPath, s.stateManager.SessionDir(s.sessionID))
 	if sessionState.TranscriptPath == "" {
