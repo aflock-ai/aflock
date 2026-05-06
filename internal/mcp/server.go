@@ -1645,13 +1645,23 @@ func (s *Server) recordAction(toolName, decision, reason string) {
 }
 
 // applyUsageDelta polls the JSONL tracker for new token/turn data since the
-// last call and folds it into sessionState.Metrics. No-op when no tracker is
-// active (non-Claude MCP client, or pre-discovery). Errors are logged once
-// at debug-ish level and never block tool dispatch — usage tracking is
-// best-effort instrumentation, not a security gate.
+// last call and folds it into sessionState.Metrics. No-op when no tracker
+// can be initialized (non-Claude MCP client). Errors are logged and never
+// block tool dispatch — usage tracking is best-effort instrumentation,
+// not a security gate.
 func (s *Server) applyUsageDelta(sessionState *aflock.SessionState) {
-	if s.usageTracker == nil || sessionState == nil {
+	if sessionState == nil {
 		return
+	}
+	// Lazy discovery: claude often hasn't created the session JSONL yet
+	// when aflock starts (claude spawns MCP servers eagerly, but writes
+	// the JSONL only after the first user prompt). Re-attempt on each
+	// tool call until we find it.
+	if s.usageTracker == nil {
+		s.tryInitUsageTracker(sessionState)
+		if s.usageTracker == nil {
+			return
+		}
 	}
 	delta, err := s.usageTracker.ReadDelta()
 	if err != nil {
@@ -1665,6 +1675,38 @@ func (s *Server) applyUsageDelta(sessionState *aflock.SessionState) {
 	s.stateManager.UpdateMetrics(sessionState, delta.InputTokens, delta.OutputTokens, cost)
 	for i := 0; i < delta.AssistantTurns; i++ {
 		s.stateManager.IncrementTurns(sessionState)
+	}
+}
+
+// tryInitUsageTracker attempts to discover the Claude Code JSONL and
+// initialize a Tracker. If agent identity already carries a SessionPath
+// (eager discovery succeeded at startup), we use that; otherwise we
+// re-run discovery here and propagate the path forward.
+//
+// Persists the discovered path to sessionState.TranscriptPath so verify
+// can fall back to JSONL re-read for Ctrl-C'd sessions.
+func (s *Server) tryInitUsageTracker(sessionState *aflock.SessionState) {
+	if s.usageTracker != nil {
+		return
+	}
+	var jsonlPath string
+	if s.agentIdentity != nil && s.agentIdentity.SessionPath != "" {
+		jsonlPath = s.agentIdentity.SessionPath
+	} else {
+		// Re-run JSONL discovery — claude may have created the file
+		// after our initial init pass.
+		_, _, p, err := identity.DiscoverModelWithSession()
+		if err != nil || p == "" {
+			return
+		}
+		jsonlPath = p
+		if s.agentIdentity != nil {
+			s.agentIdentity.SessionPath = p
+		}
+	}
+	s.usageTracker = usage.NewTracker(jsonlPath, s.stateManager.SessionDir(s.sessionID))
+	if sessionState.TranscriptPath == "" {
+		sessionState.TranscriptPath = jsonlPath
 	}
 }
 
