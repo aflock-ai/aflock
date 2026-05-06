@@ -22,13 +22,14 @@ func TestComputeCostUSD_Opus47KnownTokens(t *testing.T) {
 	}
 }
 
-// TestComputeCostUSD_CacheTiers verifies cache writes apply the 1.25x
-// multiplier on input rate, and cache reads apply 0.10x.
+// TestComputeCostUSD_CacheTiersFallback exercises the scalar-only path
+// (no cache_creation breakdown). The scalar is credited entirely to the
+// 5m bucket, so cache_write at 1.25x:
 //
 //	100k cache_creation @ ($15/M * 1.25) = $1.875
 //	100k cache_read     @ ($15/M * 0.10) = $0.15
 //	Total = $2.025
-func TestComputeCostUSD_CacheTiers(t *testing.T) {
+func TestComputeCostUSD_CacheTiersFallback(t *testing.T) {
 	c := Cumulative{
 		CacheCreationInputTokens: 100_000,
 		CacheReadInputTokens:     100_000,
@@ -38,6 +39,50 @@ func TestComputeCostUSD_CacheTiers(t *testing.T) {
 	want := 2.025
 	if math.Abs(got-want) > 0.001 {
 		t.Errorf("ComputeCostUSD = %.4f, want %.4f", got, want)
+	}
+}
+
+// TestComputeCostUSD_CacheTiersBrokenOut verifies distinct multipliers
+// per tier when the breakdown is present:
+//
+//	50k 5m  @ ($15/M * 1.25) = $0.9375
+//	50k 1h  @ ($15/M * 2.00) = $1.5
+//	100k cr @ ($15/M * 0.10) = $0.15
+//	Total = $2.5875
+func TestComputeCostUSD_CacheTiersBrokenOut(t *testing.T) {
+	c := Cumulative{
+		CacheCreation5mTokens: 50_000,
+		CacheCreation1hTokens: 50_000,
+		CacheReadInputTokens:  100_000,
+		// CacheCreationInputTokens scalar intentionally NOT set — the
+		// per-tier fields must take precedence when populated.
+		Model: "claude-opus-4-7",
+	}
+	got := ComputeCostUSD(c)
+	want := 2.5875
+	if math.Abs(got-want) > 0.001 {
+		t.Errorf("ComputeCostUSD = %.4f, want %.4f", got, want)
+	}
+}
+
+// TestComputeCostUSD_CacheTiersIgnoreScalarWhenBrokenOut ensures the
+// scalar back-compat path is NOT additive — when 5m+1h are populated,
+// scalar must be ignored (it equals their sum, double-charging would
+// be a bug).
+func TestComputeCostUSD_CacheTiersIgnoreScalarWhenBrokenOut(t *testing.T) {
+	c := Cumulative{
+		CacheCreationInputTokens: 100_000, // would be 5m+1h sum on real data
+		CacheCreation5mTokens:    40_000,
+		CacheCreation1hTokens:    60_000,
+		Model:                    "claude-opus-4-7",
+	}
+	got := ComputeCostUSD(c)
+	// Only per-tier numbers should contribute:
+	//   40k * 15 * 1.25 / M = $0.75
+	//   60k * 15 * 2.00 / M = $1.80
+	want := 2.55
+	if math.Abs(got-want) > 0.001 {
+		t.Errorf("scalar must be ignored when tiers populated; got %.4f, want %.4f", got, want)
 	}
 }
 

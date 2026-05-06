@@ -11,13 +11,18 @@ import (
 
 // Pricing captures the cost weights for one Claude model.
 // PerMTok rates are USD per million tokens.
-// CacheWriteMult and CacheReadMult are multipliers on InputPerMTok
-// (Anthropic's published model: cache writes ~1.25x input, cache reads ~0.10x).
+// Cache multipliers are relative to InputPerMTok. Anthropic charges
+// distinct rates for the two cache write tiers:
+//
+//   - CacheWrite5mMult: 5-minute ephemeral writes (~1.25x)
+//   - CacheWrite1hMult: 1-hour ephemeral writes (~2.00x)
+//   - CacheReadMult:    cache reads (~0.10x)
 type Pricing struct {
-	InputPerMTok   float64
-	OutputPerMTok  float64
-	CacheWriteMult float64
-	CacheReadMult  float64
+	InputPerMTok     float64
+	OutputPerMTok    float64
+	CacheWrite5mMult float64
+	CacheWrite1hMult float64
+	CacheReadMult    float64
 }
 
 // defaultPricing is keyed on the canonical model string Claude Code writes
@@ -25,11 +30,11 @@ type Pricing struct {
 // drift. Unknown models fall through with a one-time WARNING log and zero
 // cost — we don't guess.
 var defaultPricing = map[string]Pricing{
-	"claude-opus-4-7":   {InputPerMTok: 15.00, OutputPerMTok: 75.00, CacheWriteMult: 1.25, CacheReadMult: 0.10},
-	"claude-opus-4-6":   {InputPerMTok: 15.00, OutputPerMTok: 75.00, CacheWriteMult: 1.25, CacheReadMult: 0.10},
-	"claude-sonnet-4-6": {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheWriteMult: 1.25, CacheReadMult: 0.10},
-	"claude-sonnet-4":   {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheWriteMult: 1.25, CacheReadMult: 0.10},
-	"claude-haiku-4-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.00, CacheWriteMult: 1.25, CacheReadMult: 0.10},
+	"claude-opus-4-7":   {InputPerMTok: 15.00, OutputPerMTok: 75.00, CacheWrite5mMult: 1.25, CacheWrite1hMult: 2.00, CacheReadMult: 0.10},
+	"claude-opus-4-6":   {InputPerMTok: 15.00, OutputPerMTok: 75.00, CacheWrite5mMult: 1.25, CacheWrite1hMult: 2.00, CacheReadMult: 0.10},
+	"claude-sonnet-4-6": {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheWrite5mMult: 1.25, CacheWrite1hMult: 2.00, CacheReadMult: 0.10},
+	"claude-sonnet-4":   {InputPerMTok: 3.00, OutputPerMTok: 15.00, CacheWrite5mMult: 1.25, CacheWrite1hMult: 2.00, CacheReadMult: 0.10},
+	"claude-haiku-4-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.00, CacheWrite5mMult: 1.25, CacheWrite1hMult: 2.00, CacheReadMult: 0.10},
 }
 
 var (
@@ -73,9 +78,25 @@ func ResolvePricing(model string) (p Pricing, known bool) {
 			known = true
 		}
 	}
+	// Cache-write multipliers — distinct envs per tier. Legacy
+	// AFLOCK_PRICE_CACHE_WRITE_MULT_<MODEL> sets BOTH tiers (back-compat
+	// for setups that overrode the previous single-multiplier API).
 	if v := os.Getenv("AFLOCK_PRICE_CACHE_WRITE_MULT_" + slug); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			p.CacheWriteMult = f
+			p.CacheWrite5mMult = f
+			p.CacheWrite1hMult = f
+			known = true
+		}
+	}
+	if v := os.Getenv("AFLOCK_PRICE_CACHE_WRITE_5M_MULT_" + slug); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			p.CacheWrite5mMult = f
+			known = true
+		}
+	}
+	if v := os.Getenv("AFLOCK_PRICE_CACHE_WRITE_1H_MULT_" + slug); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			p.CacheWrite1hMult = f
 			known = true
 		}
 	}
@@ -112,7 +133,16 @@ func ComputeCostUSD(c Cumulative) float64 {
 	cost := 0.0
 	cost += float64(c.InputTokens) * p.InputPerMTok / 1_000_000
 	cost += float64(c.OutputTokens) * p.OutputPerMTok / 1_000_000
-	cost += float64(c.CacheCreationInputTokens) * p.InputPerMTok * p.CacheWriteMult / 1_000_000
+	// Apply distinct multipliers per cache-write tier when broken out.
+	// If only the scalar CacheCreationInputTokens is populated (older
+	// JSONLs without cache_creation block), fall back to the 5m rate —
+	// matches Anthropic's pre-1h-tier default.
+	if c.CacheCreation5mTokens > 0 || c.CacheCreation1hTokens > 0 {
+		cost += float64(c.CacheCreation5mTokens) * p.InputPerMTok * p.CacheWrite5mMult / 1_000_000
+		cost += float64(c.CacheCreation1hTokens) * p.InputPerMTok * p.CacheWrite1hMult / 1_000_000
+	} else {
+		cost += float64(c.CacheCreationInputTokens) * p.InputPerMTok * p.CacheWrite5mMult / 1_000_000
+	}
 	cost += float64(c.CacheReadInputTokens) * p.InputPerMTok * p.CacheReadMult / 1_000_000
 	return cost
 }
@@ -130,7 +160,7 @@ func LogResolvedPricing() {
 	for _, m := range models {
 		p, _ := ResolvePricing(m)
 		fmt.Fprintf(os.Stderr,
-			"  %-22s input=$%.2f output=$%.2f cache_write=%.2fx cache_read=%.2fx\n",
-			m, p.InputPerMTok, p.OutputPerMTok, p.CacheWriteMult, p.CacheReadMult)
+			"  %-22s input=$%.2f output=$%.2f cache_write_5m=%.2fx cache_write_1h=%.2fx cache_read=%.2fx\n",
+			m, p.InputPerMTok, p.OutputPerMTok, p.CacheWrite5mMult, p.CacheWrite1hMult, p.CacheReadMult)
 	}
 }
