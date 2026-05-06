@@ -221,8 +221,8 @@ func parseLines(b []byte) Cumulative {
 // JSONL (subagent stops, attachments, etc.) are ignored by the standard
 // library JSON decoder.
 type jsonlEntry struct {
-	Type    string       `json:"type"`
-	Message *jsonlMsg    `json:"message,omitempty"`
+	Type    string    `json:"type"`
+	Message *jsonlMsg `json:"message,omitempty"`
 }
 
 type jsonlMsg struct {

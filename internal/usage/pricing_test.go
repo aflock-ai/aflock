@@ -100,9 +100,9 @@ func TestComputeCostUSD_EmptyModel(t *testing.T) {
 // TestModelSlug spot-checks the env-var slug normalization.
 func TestModelSlug(t *testing.T) {
 	cases := map[string]string{
-		"claude-opus-4-7":   "CLAUDE_OPUS_4_7",
-		"claude-haiku-4-5":  "CLAUDE_HAIKU_4_5",
-		"some.weird.model":  "SOME_WEIRD_MODEL",
+		"claude-opus-4-7":  "CLAUDE_OPUS_4_7",
+		"claude-haiku-4-5": "CLAUDE_HAIKU_4_5",
+		"some.weird.model": "SOME_WEIRD_MODEL",
 	}
 	for in, want := range cases {
 		if got := modelSlug(in); got != want {

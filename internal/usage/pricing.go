@@ -33,7 +33,7 @@ var defaultPricing = map[string]Pricing{
 }
 
 var (
-	unknownLogMu sync.Mutex
+	unknownLogMu  sync.Mutex
 	loggedUnknown = make(map[string]bool)
 )
 
