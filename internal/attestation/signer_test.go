@@ -1019,6 +1019,58 @@ func TestCreateActionAttestation_BinaryWithEmptyVersion(t *testing.T) {
 	}
 }
 
+// TestCreateActionAttestation_BinaryWithEmptyName guards the symmetric
+// edge case Copilot flagged on PR #93: if Name is empty but Version is
+// somehow set (e.g. discovery returns "0.0.0" default without resolving
+// a path), the predicate must NOT emit a leading "@0.0.0" — it should
+// stay empty. Closes the empty-name half of the @ formatting fix.
+func TestCreateActionAttestation_BinaryWithEmptyName(t *testing.T) {
+	signer, _, _ := newSignerWithIdentity(t)
+
+	record := aflock.ActionRecord{
+		Timestamp: time.Now(),
+		ToolName:  "Read",
+		ToolUseID: "tu_empty_name",
+		Decision:  "allow",
+	}
+
+	agentID := &identity.AgentIdentity{
+		Model: "claude-opus-4-7",
+		Binary: &identity.BinaryIdentity{
+			Name:    "",
+			Version: "0.0.0",
+			Digest:  "sha256:placeholder",
+		},
+		IdentityHash: "abcdef1234567890",
+	}
+
+	env, err := signer.CreateActionAttestation(
+		context.Background(), record, "session-empty-name", nil, agentID,
+	)
+	if err != nil {
+		t.Fatalf("CreateActionAttestation: %v", err)
+	}
+
+	payloadBytes, _ := base64.StdEncoding.DecodeString(env.Payload)
+	var stmt Statement
+	if err := json.Unmarshal(payloadBytes, &stmt); err != nil {
+		t.Fatalf("unmarshal statement: %v", err)
+	}
+	predicateJSON, _ := json.Marshal(stmt.Predicate)
+	var pred ActionPredicate
+	if err := json.Unmarshal(predicateJSON, &pred); err != nil {
+		t.Fatalf("unmarshal predicate: %v", err)
+	}
+
+	if pred.AgentIdentity == nil {
+		t.Fatal("agentIdentity should not be nil")
+	}
+	if pred.AgentIdentity.Binary != "" {
+		t.Errorf("binary = %q, want empty (no leading @ when Name is missing)",
+			pred.AgentIdentity.Binary)
+	}
+}
+
 func TestCreateActionAttestation_AgentIdentityWithoutBinary(t *testing.T) {
 	signer, _, _ := newSignerWithIdentity(t)
 

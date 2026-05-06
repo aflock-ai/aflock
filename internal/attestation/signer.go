@@ -240,14 +240,16 @@ func (s *Signer) CreateActionAttestation(
 			IdentityHash: agentIdentity.IdentityHash,
 		}
 		if agentIdentity.Binary != nil {
-			// Version is intentionally empty on the kernel-attested path
-			// (peerBinaryIdentity leaves it unset because the digest is the
-			// authoritative version identifier). Only emit "@<version>" when
-			// we actually have one — otherwise the predicate would carry a
-			// dangling "@" suffix like "socat1@".
+			// Format as "<name>@<version>", but only when both halves
+			// exist. Two edge cases the predicate must not produce:
+			//   - kernel-attested peer-cred path leaves Version empty
+			//     (digest is the authoritative version), so we'd otherwise
+			//     emit "socat1@" with a dangling @
+			//   - if Name resolution failed but Version was defaulted, we'd
+			//     otherwise emit a leading "@0.0.0"
 			binary := agentIdentity.Binary.Name
-			if agentIdentity.Binary.Version != "" {
-				binary = agentIdentity.Binary.Name + "@" + agentIdentity.Binary.Version
+			if binary != "" && agentIdentity.Binary.Version != "" {
+				binary = binary + "@" + agentIdentity.Binary.Version
 			}
 			predicate.AgentIdentity.Binary = binary
 			predicate.AgentIdentity.BinaryHash = agentIdentity.Binary.Digest
