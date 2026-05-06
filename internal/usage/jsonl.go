@@ -32,12 +32,15 @@ import (
 
 // Cumulative captures per-session usage totals.
 // Cache tokens are tracked separately so pricing can apply distinct
-// multipliers (cache writes ~1.25x input, cache reads ~0.10x).
+// multipliers (cache reads ~0.10x; cache writes split by tier:
+// 5-minute ephemeral ~1.25x, 1-hour ephemeral ~2.00x).
 type Cumulative struct {
 	InputTokens              int64  `json:"input_tokens"`
 	OutputTokens             int64  `json:"output_tokens"`
 	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"` // sum of 5m + 1h, kept for back-compat
+	CacheCreation5mTokens    int64  `json:"cache_creation_5m_input_tokens"`
+	CacheCreation1hTokens    int64  `json:"cache_creation_1h_input_tokens"`
 	AssistantTurns           int    `json:"assistant_turns"`
 	Model                    string `json:"model"` // last seen, for pricing lookup
 }
@@ -48,6 +51,8 @@ func (c *Cumulative) Add(other Cumulative) {
 	c.OutputTokens += other.OutputTokens
 	c.CacheReadInputTokens += other.CacheReadInputTokens
 	c.CacheCreationInputTokens += other.CacheCreationInputTokens
+	c.CacheCreation5mTokens += other.CacheCreation5mTokens
+	c.CacheCreation1hTokens += other.CacheCreation1hTokens
 	c.AssistantTurns += other.AssistantTurns
 	if other.Model != "" {
 		c.Model = other.Model
@@ -63,6 +68,14 @@ type Tracker struct {
 	mu         sync.Mutex
 	offset     int64
 	cumulative Cumulative
+	// seenIDs deduplicates assistant messages by message.id. Claude Code
+	// emits the same assistant turn as multiple JSONL lines (different
+	// parentUuid, identical message.id and identical usage block) when
+	// the message participates in a tool-use chain. Counting both copies
+	// double-counts tokens. Per-tracker in-memory only — duplicate IDs
+	// are always co-located in the JSONL so a single tracker instance
+	// catches them; we don't need cross-restart persistence.
+	seenIDs map[string]struct{}
 }
 
 // NewTracker constructs a Tracker for jsonlPath. If sessionDir is non-empty,
@@ -73,7 +86,7 @@ type Tracker struct {
 // If a sidecar offset exists, it is loaded; missing or corrupt sidecars
 // reset to offset 0 (safe — at worst we recompute cumulative from scratch).
 func NewTracker(jsonlPath, sessionDir string) *Tracker {
-	t := &Tracker{jsonlPath: jsonlPath}
+	t := &Tracker{jsonlPath: jsonlPath, seenIDs: make(map[string]struct{})}
 	if sessionDir != "" {
 		t.offsetPath = filepath.Join(sessionDir, "usage.offset")
 		t.loadOffset()
@@ -159,7 +172,7 @@ func (t *Tracker) ReadDelta() (Cumulative, error) {
 	}
 	consumed := data[:lastNL+1]
 
-	delta := parseLines(consumed)
+	delta := parseLines(consumed, t.seenIDs)
 
 	t.offset += int64(len(consumed))
 	t.saveOffset()
@@ -181,10 +194,13 @@ func (t *Tracker) JSONLPath() string {
 }
 
 // parseLines walks each newline-terminated line and accumulates usage from
-// assistant messages. Corrupt or incomplete lines are skipped (not fatal —
-// claude can mid-write, partial parses happen). Non-assistant types are
-// silently ignored.
-func parseLines(b []byte) Cumulative {
+// assistant messages. Lines whose message.id is already in seen are
+// skipped — Claude Code emits the same assistant turn multiple times
+// when it participates in a tool-use chain, with identical usage blocks
+// (see issue #96). Corrupt or incomplete lines are skipped silently
+// (claude can write mid-flush, partial parses happen). Non-assistant
+// types are ignored.
+func parseLines(b []byte, seen map[string]struct{}) Cumulative {
 	var c Cumulative
 	scanner := bufio.NewScanner(bytes.NewReader(b))
 	// Claude messages can be long (full prompts + responses) — give the
@@ -205,9 +221,29 @@ func parseLines(b []byte) Cumulative {
 		if entry.Message == nil || entry.Message.Usage == nil {
 			continue
 		}
+		// Dedupe by message.id. Empty IDs are treated as always-unique
+		// (defensive — every real Anthropic API response has an id).
+		if entry.Message.ID != "" {
+			if _, dup := seen[entry.Message.ID]; dup {
+				continue
+			}
+			seen[entry.Message.ID] = struct{}{}
+		}
 		c.InputTokens += entry.Message.Usage.InputTokens
 		c.OutputTokens += entry.Message.Usage.OutputTokens
 		c.CacheReadInputTokens += entry.Message.Usage.CacheReadInputTokens
+		// Anthropic prompt caching has two write tiers with different
+		// pricing. The top-level cache_creation_input_tokens equals
+		// 5m + 1h combined; we read the breakdown so pricing can apply
+		// the correct multiplier (5m: 1.25x, 1h: 2.0x).
+		if entry.Message.Usage.CacheCreation != nil {
+			c.CacheCreation5mTokens += entry.Message.Usage.CacheCreation.Ephemeral5mInputTokens
+			c.CacheCreation1hTokens += entry.Message.Usage.CacheCreation.Ephemeral1hInputTokens
+		} else {
+			// Older sessions or single-tier responses fall back to the
+			// scalar field, treated as 5m (Anthropic's pre-1h-tier default).
+			c.CacheCreation5mTokens += entry.Message.Usage.CacheCreationInputTokens
+		}
 		c.CacheCreationInputTokens += entry.Message.Usage.CacheCreationInputTokens
 		c.AssistantTurns++
 		if entry.Message.Model != "" {
@@ -226,14 +262,23 @@ type jsonlEntry struct {
 }
 
 type jsonlMsg struct {
+	ID    string      `json:"id"`
 	Role  string      `json:"role"`
 	Model string      `json:"model"`
 	Usage *jsonlUsage `json:"usage,omitempty"`
 }
 
 type jsonlUsage struct {
-	InputTokens              int64 `json:"input_tokens"`
-	OutputTokens             int64 `json:"output_tokens"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	InputTokens              int64               `json:"input_tokens"`
+	OutputTokens             int64               `json:"output_tokens"`
+	CacheReadInputTokens     int64               `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64               `json:"cache_creation_input_tokens"`
+	CacheCreation            *jsonlCacheCreation `json:"cache_creation,omitempty"`
+}
+
+// jsonlCacheCreation breaks the cache_creation_input_tokens scalar into
+// the 5-minute and 1-hour ephemeral tiers Anthropic prices distinctly.
+type jsonlCacheCreation struct {
+	Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
 }

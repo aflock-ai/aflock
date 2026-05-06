@@ -27,13 +27,20 @@ func TestTracker_RealFixture(t *testing.T) {
 	}
 
 	// Values verified against the fixture via:
-	//   jq -s 'map(select(.type=="assistant" and .message.usage) | .message.usage) | ...'
+	//   jq -s 'map(select(.type=="assistant" and .message.usage)) |
+	//          group_by(.message.id) | map(.[0]) | ... '
+	// The fixture contains 2 JSONL lines with the SAME message.id and
+	// identical usage blocks (the duplicate-emission pattern claude-code
+	// produces during tool-use chains). Dedup yields 1 turn, not 2 —
+	// see issue #96 / Bug 1.
 	want := Cumulative{
-		InputTokens:              12,
-		OutputTokens:             342,
-		CacheReadInputTokens:     23190,
-		CacheCreationInputTokens: 17582,
-		AssistantTurns:           2,
+		InputTokens:              6,
+		OutputTokens:             171,
+		CacheReadInputTokens:     11595,
+		CacheCreationInputTokens: 8791,
+		CacheCreation5mTokens:    0,
+		CacheCreation1hTokens:    8791,
+		AssistantTurns:           1,
 		Model:                    "claude-opus-4-7",
 	}
 	if delta != want {
@@ -197,6 +204,90 @@ func TestTracker_CorruptLine(t *testing.T) {
 	}
 	if d.InputTokens != 30 {
 		t.Errorf("expected 30 input tokens, got %d", d.InputTokens)
+	}
+}
+
+// TestTracker_DedupesByMessageID verifies that when claude-code writes
+// the same assistant message twice (tool-use chain re-emission), we
+// only count its usage once. Closes Bug 1 documented in #96.
+func TestTracker_DedupesByMessageID(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	// Same message.id, identical usage — should count exactly once.
+	dup := `{"type":"assistant","message":{"id":"msg_dupe1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(dup+dup+dup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.AssistantTurns != 1 {
+		t.Errorf("expected 1 turn after dedup, got %d", d.AssistantTurns)
+	}
+	if d.InputTokens != 10 || d.OutputTokens != 20 {
+		t.Errorf("expected single-message tokens, got input=%d output=%d", d.InputTokens, d.OutputTokens)
+	}
+}
+
+// TestTracker_DistinctIDsCounted ensures we don't accidentally
+// over-aggressively dedupe — distinct message.ids must each count.
+func TestTracker_DistinctIDsCounted(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	a := `{"type":"assistant","message":{"id":"msg_A","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	b := `{"type":"assistant","message":{"id":"msg_B","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":4}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(a+b+a), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.AssistantTurns != 2 {
+		t.Errorf("expected 2 turns (A and B, A's dup skipped), got %d", d.AssistantTurns)
+	}
+	if d.InputTokens != 4 || d.OutputTokens != 6 {
+		t.Errorf("expected sums of A+B only, got input=%d output=%d", d.InputTokens, d.OutputTokens)
+	}
+}
+
+// TestTracker_CacheTiersBrokenOut verifies that cache_creation.ephemeral_5m
+// and ephemeral_1h are extracted into the per-tier fields. Closes Bug 3
+// documented in #96.
+func TestTracker_CacheTiersBrokenOut(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	line := `{"type":"assistant","message":{"id":"msg_T","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":1500,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":1000}}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.CacheCreation5mTokens != 500 {
+		t.Errorf("expected 5m tokens=500, got %d", d.CacheCreation5mTokens)
+	}
+	if d.CacheCreation1hTokens != 1000 {
+		t.Errorf("expected 1h tokens=1000, got %d", d.CacheCreation1hTokens)
+	}
+	if d.CacheCreationInputTokens != 1500 {
+		t.Errorf("expected scalar (back-compat) cc=1500, got %d", d.CacheCreationInputTokens)
+	}
+}
+
+// TestTracker_CacheTiersFallback verifies that older JSONLs without the
+// cache_creation breakdown still credit the scalar to the 5m bucket
+// (Anthropic's pre-1h-tier default).
+func TestTracker_CacheTiersFallback(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	line := `{"type":"assistant","message":{"id":"msg_F","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":2500}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.CacheCreation5mTokens != 2500 {
+		t.Errorf("scalar fallback should credit 5m bucket, got 5m=%d", d.CacheCreation5mTokens)
+	}
+	if d.CacheCreation1hTokens != 0 {
+		t.Errorf("expected 1h bucket=0 in fallback path, got %d", d.CacheCreation1hTokens)
 	}
 }
 
