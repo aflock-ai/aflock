@@ -81,7 +81,32 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 		}
 	}
 
-	// 2. Check requireApproval patterns
+	// 2. Check allow list (if specified, tool must be in it).
+	// Whitelist semantics: anything NOT on the allow list is denied here,
+	// before requireApproval gets a chance to short-circuit. Otherwise a
+	// requireApproval pattern would let a non-allowed tool slip through
+	// after a user prompt — surprising for a "strict whitelist" mental
+	// model. See issue #98.
+	//
+	// Security (R3-230): Use MatchToolPattern to check both tool name AND
+	// command pattern. Previously only the tool name was checked, so
+	// Allow: ["Bash:git *"] would allow ALL Bash commands instead of only
+	// git commands.
+	if e.policy.Tools != nil && len(e.policy.Tools.Allow) > 0 {
+		allowed := false
+		for _, pattern := range e.policy.Tools.Allow {
+			if e.matcher.MatchToolPattern(pattern, toolName, inputStr) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return aflock.DecisionDeny, fmt.Sprintf("Tool '%s' not in allow list", toolName)
+		}
+	}
+
+	// 3. Check requireApproval patterns. Now refines behavior for tools
+	// already on the allow list rather than gating around it.
 	if e.policy.Tools != nil {
 		for _, pattern := range e.policy.Tools.RequireApproval {
 			if e.matcher.MatchToolPattern(pattern, toolName, inputStr) {
@@ -90,7 +115,7 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 		}
 	}
 
-	// 3. Check file access for file-related tools
+	// 4. Check file access for file-related tools
 	if isFileOperation(toolName) {
 		decision, reason := e.evaluateFileAccess(toolName, toolInput)
 		if decision != aflock.DecisionAllow {
@@ -98,7 +123,7 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 		}
 	}
 
-	// 3b. Check Bash commands for file-reading operations against files.deny.
+	// 4b. Check Bash commands for file-reading operations against files.deny.
 	// This catches "cat restricted/credentials.json" which bypasses the file
 	// access check above because isFileOperation("Bash") is false.
 	if toolName == "Bash" && e.policy.Files != nil && len(e.policy.Files.Deny) > 0 {
@@ -113,7 +138,7 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 		}
 	}
 
-	// 4. Check domain access for network tools
+	// 5. Check domain access for network tools.
 	// WebSearch doesn't have a target URL (only a search query), so domain
 	// restrictions don't apply — the search engine itself picks which sites
 	// to query. Only WebFetch has a user-specified URL to check.
@@ -121,23 +146,6 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 		decision, reason := e.evaluateDomainAccess(toolInput)
 		if decision != aflock.DecisionAllow {
 			return decision, reason
-		}
-	}
-
-	// 5. Check allow list (if specified, tool must be in it)
-	// Security (R3-230): Use MatchToolPattern to check both tool name AND command
-	// pattern. Previously only the tool name was checked, so Allow: ["Bash:git *"]
-	// would allow ALL Bash commands instead of only git commands.
-	if e.policy.Tools != nil && len(e.policy.Tools.Allow) > 0 {
-		allowed := false
-		for _, pattern := range e.policy.Tools.Allow {
-			if e.matcher.MatchToolPattern(pattern, toolName, inputStr) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return aflock.DecisionDeny, fmt.Sprintf("Tool '%s' not in allow list", toolName)
 		}
 	}
 

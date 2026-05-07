@@ -297,6 +297,22 @@ func TestEvaluatePreToolUse_RequireApproval(t *testing.T) {
 			wantDecision:   aflock.DecisionAsk,
 			wantReasonPart: "requires approval",
 		},
+		{
+			// Closes #98: requireApproval must NOT bypass the allow-list.
+			// Allow=[Read] establishes whitelist semantics. requireApproval
+			// matching a non-allowed tool must NOT short-circuit to ASK.
+			name: "allow-list denies before requireApproval can ask",
+			policy: &aflock.Policy{
+				Tools: &aflock.ToolsPolicy{
+					Allow:           []string{"Read"},
+					RequireApproval: []string{"Bash:curl *"},
+				},
+			},
+			toolName:       "Bash",
+			toolInput:      `{"command": "curl https://example.com"}`,
+			wantDecision:   aflock.DecisionDeny,
+			wantReasonPart: "not in allow list",
+		},
 	}
 
 	for _, tt := range tests {
