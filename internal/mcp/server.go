@@ -3,6 +3,9 @@ package mcp
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -44,6 +47,7 @@ type Server struct {
 	// entirely to satisfy golangci-lint's unused check.)
 	signer         *attestation.Signer
 	signingEnabled bool
+	signingMode    string     // "spire", "fulcio", "ephemeral", or "" — set by initSigning, read by initAuth (#71)
 	attestDir      string     // Directory for storing step attestations by git tree hash
 	sessionMu      sync.Mutex // Protects session state access for dataFlow tracking
 
@@ -549,6 +553,7 @@ func (s *Server) initSigning() {
 
 	if err := s.signer.Initialize(ctx); err == nil {
 		s.signingEnabled = true
+		s.signingMode = "spire"
 		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: SPIRE\n")
 		// Note: trusted-model enforcement happens in the policy evaluator via
 		// identity.allowedModels at SessionStart (issue #67 review). We no
@@ -559,25 +564,41 @@ func (s *Server) initSigning() {
 
 	if err := s.signer.InitializeFulcio(ctx); err == nil {
 		s.signingEnabled = true
+		s.signingMode = "fulcio"
 		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: Fulcio (keyless)\n")
 		return
 	}
 
 	if err := s.signer.InitializeEphemeral(identityHash); err == nil {
 		s.signingEnabled = true
+		s.signingMode = "ephemeral"
 		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: ephemeral key\n")
 		return
 	}
 
 	s.signingEnabled = false
+	s.signingMode = ""
 	fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)\n")
 }
 
-// initAuth initializes the JWT token issuer. If SPIRE is available and provides
-// a signing key, it is used; otherwise an ephemeral ECDSA P-256 key is generated.
+// initAuth initializes the JWT token issuer. When SPIRE is the active
+// signing source, the SVID's ECDSA P-256 key is reused so the JWT shares
+// the agent's SPIFFE identity (paper §3.2, issue #71). Fulcio is skipped
+// because its cert TTL (~10 min) is shorter than typical JWT TTLs. The
+// ephemeral attestation key is process-scoped just like a fresh JWT key,
+// so a separate ephemeral key is fine there.
 func (s *Server) initAuth() error {
-	// For now, always use ephemeral key. When SPIRE integration provides a
-	// crypto.Signer, use auth.NewTokenIssuerFromSigner instead.
+	if s.signingMode == "spire" && s.signer != nil {
+		if id, _ := s.signer.GetSigningIdentity(); id != nil {
+			if priv, ok := id.PrivateKey.(crypto.Signer); ok {
+				if ecPub, ok := priv.Public().(*ecdsa.PublicKey); ok && ecPub.Curve == elliptic.P256() {
+					s.tokenIssuer = auth.NewTokenIssuerFromSigner(priv, id.SPIFFEID.String())
+					return nil
+				}
+				fmt.Fprintf(os.Stderr, "[aflock] JWT: SPIRE SVID is not ECDSA P-256, falling back to ephemeral JWT key\n")
+			}
+		}
+	}
 	issuer, err := auth.NewTokenIssuer()
 	if err != nil {
 		return fmt.Errorf("create token issuer: %w", err)
