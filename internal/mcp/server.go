@@ -709,7 +709,12 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 }
 
 // signAndStoreAttestation creates a signed attestation for an action and stores it to disk.
-func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.ActionRecord) error {
+//
+// jwtBinding may be nil — for graceful-adoption calls that arrived before
+// any get_token, or for paths where no JWT was presented. When non-nil it
+// is embedded in the predicate so verifiers can prove the action was
+// signed only under the listed token scope (issue #40).
+func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.ActionRecord, jwtBinding *attestation.JWTBinding) error {
 	if !s.signingEnabled {
 		return fmt.Errorf("attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)")
 	}
@@ -722,13 +727,40 @@ func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.Acti
 	}
 
 	// Create and sign attestation
-	envelope, err := s.signer.CreateActionAttestation(ctx, record, s.sessionID, metrics, s.agentIdentity)
+	envelope, err := s.signer.CreateActionAttestation(ctx, record, s.sessionID, metrics, s.agentIdentity, jwtBinding)
 	if err != nil {
 		return fmt.Errorf("create attestation: %w", err)
 	}
 
 	// Store to disk
 	return s.storeAttestation(envelope, record.ToolUseID)
+}
+
+// buildJWTBinding constructs an attestation predicate binding from the
+// validated claims and the token presented on the wire. Returns nil if
+// either is missing — the attestation is still produced, just without
+// JWT context, marking it as a graceful-adoption call (issue #40).
+func (s *Server) buildJWTBinding(request mcp.CallToolRequest, claims *auth.AflockClaims) *attestation.JWTBinding {
+	if claims == nil {
+		return nil
+	}
+	tokenStr, _ := request.GetArguments()["_token"].(string)
+	if tokenStr == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(tokenStr))
+	binding := &attestation.JWTBinding{
+		SessionID:    s.sessionID,
+		JTI:          claims.ID,
+		PolicyDigest: claims.PolicyDigest,
+		TokenSHA256:  hex.EncodeToString(digest[:]),
+		AllowedTools: claims.AllowedTools,
+		DeniedTools:  claims.DeniedTools,
+	}
+	if s.tokenIssuer != nil {
+		binding.KeyID = s.tokenIssuer.KeyID()
+	}
+	return binding
 }
 
 // storeAttestation writes an attestation envelope to the session's attestations directory.
@@ -822,11 +854,14 @@ func (s *Server) handleCheckTool(ctx context.Context, request mcp.CallToolReques
 // handleBash executes a command with policy enforcement.
 func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit,gocyclo,funlen // bash handler requires complex policy + execution logic
 	// JWT authorization check
-	if claims, err := s.validateJWT(request); err != nil {
+	claims, err := s.validateJWT(request)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
-	} else if claims != nil && !auth.IsToolAllowed("Bash", claims.AllowedTools, claims.DeniedTools) {
+	}
+	if claims != nil && !auth.IsToolAllowed("Bash", claims.AllowedTools, claims.DeniedTools) {
 		return mcp.NewToolResultError("Authorization denied: tool 'Bash' not permitted by token scope"), nil
 	}
+	jwtBinding := s.buildJWTBinding(request, claims)
 
 	command := request.GetString("command", "")
 	timeoutSec := request.GetFloat("timeout", 30)
@@ -870,7 +905,7 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 				Reason:    policyReason,
 			}
 			s.recordAction("Bash", "deny", policyReason)
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Policy denied: %s", policyReason)), nil
@@ -886,7 +921,7 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 				Decision:  string(aflock.DecisionAsk),
 				Reason:    policyReason,
 			}
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Policy requires approval: %s", policyReason)), nil
@@ -928,7 +963,7 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 				Reason:    flowReason,
 			}
 			s.recordAction("Bash", "deny", flowReason)
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			fmt.Fprintf(os.Stderr, "[aflock] BLOCKED data exfiltration: %s\n", flowReason)
@@ -946,11 +981,11 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 
 	// Standard execution without attestation
-	return s.executeCommand(ctx, command, workdir, timeoutSec, toolUseID, inputJSON)
+	return s.executeCommand(ctx, command, workdir, timeoutSec, toolUseID, inputJSON, jwtBinding)
 }
 
 // executeCommand executes a command without attestation.
-func (s *Server) executeCommand(ctx context.Context, command, workdir string, timeoutSec float64, toolUseID string, inputJSON []byte) (*mcp.CallToolResult, error) {
+func (s *Server) executeCommand(ctx context.Context, command, workdir string, timeoutSec float64, toolUseID string, inputJSON []byte, jwtBinding *attestation.JWTBinding) (*mcp.CallToolResult, error) {
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
@@ -973,7 +1008,7 @@ func (s *Server) executeCommand(ctx context.Context, command, workdir string, ti
 	s.recordAction("Bash", "allow", "")
 
 	// Sign and store attestation
-	if signErr := s.signAndStoreAttestation(ctx, record); signErr != nil {
+	if signErr := s.signAndStoreAttestation(ctx, record, jwtBinding); signErr != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", signErr)
 	}
 
@@ -1070,11 +1105,14 @@ func (s *Server) storeStepAttestation(envelope any, treeHash, step string) error
 // handleReadFile reads a file with policy enforcement.
 func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// JWT authorization check
-	if claims, err := s.validateJWT(request); err != nil {
+	claims, err := s.validateJWT(request)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
-	} else if claims != nil && !auth.IsToolAllowed("Read", claims.AllowedTools, claims.DeniedTools) {
+	}
+	if claims != nil && !auth.IsToolAllowed("Read", claims.AllowedTools, claims.DeniedTools) {
 		return mcp.NewToolResultError("Authorization denied: tool 'Read' not permitted by token scope"), nil
 	}
+	jwtBinding := s.buildJWTBinding(request, claims)
 
 	filePath := request.GetString("path", "")
 
@@ -1103,7 +1141,7 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 				Reason:    reason,
 			}
 			s.recordAction("Read", "deny", reason)
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Policy denied: %s", reason)), nil
@@ -1152,7 +1190,7 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 	s.trackFile("Read", filePath)
 
 	// Sign and store attestation
-	if err := s.signAndStoreAttestation(ctx, record); err != nil {
+	if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 	}
 
@@ -1162,11 +1200,14 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 // handleWriteFile writes content to a file with policy enforcement.
 func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit,funlen // file write handler has complex policy + attestation logic
 	// JWT authorization check
-	if claims, err := s.validateJWT(request); err != nil {
+	claims, err := s.validateJWT(request)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
-	} else if claims != nil && !auth.IsToolAllowed("Write", claims.AllowedTools, claims.DeniedTools) {
+	}
+	if claims != nil && !auth.IsToolAllowed("Write", claims.AllowedTools, claims.DeniedTools) {
 		return mcp.NewToolResultError("Authorization denied: tool 'Write' not permitted by token scope"), nil
 	}
+	jwtBinding := s.buildJWTBinding(request, claims)
 
 	filePath := request.GetString("path", "")
 	content := request.GetString("content", "")
@@ -1196,7 +1237,7 @@ func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolReques
 				Reason:    reason,
 			}
 			s.recordAction("Write", "deny", reason)
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Policy denied: %s", reason)), nil
@@ -1231,7 +1272,7 @@ func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolReques
 				Reason:    flowReason,
 			}
 			s.recordAction("Write", "deny", flowReason)
-			if err := s.signAndStoreAttestation(ctx, record); err != nil {
+			if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 			}
 			fmt.Fprintf(os.Stderr, "[aflock] BLOCKED data exfiltration: %s\n", flowReason)
@@ -1258,7 +1299,7 @@ func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolReques
 	s.trackFile("Write", filePath)
 
 	// Sign and store attestation
-	if err := s.signAndStoreAttestation(ctx, record); err != nil {
+	if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
 	}
 
