@@ -306,10 +306,18 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 // removed on shutdown. Refuses to start if the socket path already exists,
 // to avoid a hijack race against an attacker who pre-creates it.
 //
-// Single-connection by design: the connection itself is the MCP session, and
-// the kernel-attested PID is bound to that session's identity. A second client
-// connecting to the same socket path after the first disconnects starts a
-// fresh server invocation.
+// The parent directory of socketPath MUST be owned by the current UID and
+// have mode 0700; otherwise we refuse to bind. This closes the
+// Lstat→Listen window where a local attacker on a world-writable parent
+// (e.g. /tmp) could pre-create the socket between our existence check
+// and net.Listen. Operators should pass a path under a private dir like
+// `~/.aflock/aflock.sock` rather than `/tmp/aflock.sock`.
+//
+// Single-session-per-process by design: the connection itself is the MCP
+// session, and the kernel-attested PID is bound to that session's
+// identity. After the peer disconnects, this function returns; a second
+// client requires the operator to re-run `aflock serve --unix`. This
+// matches the stdio transport's lifecycle.
 func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	if socketPath == "" {
 		return fmt.Errorf("socket path is required")
@@ -341,8 +349,17 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		return fmt.Errorf("stat socket path: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0700); err != nil {
+	parentDir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(parentDir, 0700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
+	}
+
+	// MkdirAll is a no-op on existing directories — it does NOT tighten
+	// existing perms. Verify the parent is 0700 and owned by us before
+	// binding; otherwise the Lstat→Listen window can be won by a local
+	// attacker on a world-writable parent (PR #88 review, colek42).
+	if err := assertParentDirSecure(parentDir); err != nil {
+		return fmt.Errorf("refusing to bind under insecure parent dir: %w", err)
 	}
 
 	// Set umask 0077 around the bind so the socket is created with 0600
@@ -383,6 +400,17 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	if err != nil {
 		return fmt.Errorf("extract peer credentials: %w", err)
 	}
+
+	// Defense in depth: refuse cross-UID connections explicitly. The 0600
+	// socket and same-UID requirement of /proc/<pid>/environ already make
+	// this fail in practice on Linux, but an explicit check makes the
+	// trust boundary unambiguous and keeps the property intact if UDS
+	// perms are ever loosened (PR #88 review, colek42).
+	//nolint:gosec // G115: os.Getuid() is non-negative on unix
+	if pc.UID != uint32(os.Getuid()) {
+		return fmt.Errorf("peer uid %d does not match server uid %d (refusing cross-UID connection)", pc.UID, os.Getuid())
+	}
+
 	fmt.Fprintf(os.Stderr, "[aflock] peer credentials: pid=%d uid=%d gid=%d\n", pc.PID, pc.UID, pc.GID)
 
 	// Identity discovery + policy-digest binding from kernel-attested peer

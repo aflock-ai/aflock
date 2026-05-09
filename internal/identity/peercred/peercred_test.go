@@ -1,7 +1,6 @@
 package peercred
 
 import (
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -102,12 +101,5 @@ func TestFromConn_NonUnixConn(t *testing.T) {
 	res := <-resultCh
 	if res.err == nil {
 		t.Fatal("expected error from FromConn on TCP connection, got nil")
-	}
-}
-
-// TestErrUnsupportedPlatform_IsExported verifies the sentinel is reachable.
-func TestErrUnsupportedPlatform_IsExported(t *testing.T) {
-	if !errors.Is(ErrUnsupportedPlatform, ErrUnsupportedPlatform) {
-		t.Fatal("ErrUnsupportedPlatform should match itself")
 	}
 }

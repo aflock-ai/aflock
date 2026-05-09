@@ -79,7 +79,17 @@ func peerBinaryAndDigest(pid int) (string, string, error) {
 	//
 	// If the readlink fails (rare — file unlinked, etc.) we accept an
 	// empty path; peerBinaryIdentity preserves the digest in that case.
+	//
+	// When the peer's binary was unlinked between open and readlink, the
+	// kernel returns "/foo/bar (deleted)". The FD-pinned digest is still
+	// valid (that's the whole point of pinning) but the path string would
+	// otherwise leak the literal " (deleted)" suffix into BinaryIdentity.
+	// Drop the path in that case — the digest is the load-bearing identity
+	// component and peerBinaryIdentity preserves it without a path.
 	path, _ := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if strings.HasSuffix(path, " (deleted)") {
+		path = ""
+	}
 
 	digest, err := hashReader(f)
 	if err != nil {

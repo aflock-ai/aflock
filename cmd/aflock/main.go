@@ -655,10 +655,6 @@ For HTTP (OpenClaw via mcporter):
 For Unix-domain socket (kernel-attested peer-cred identity, issue #63):
   aflock serve --unix /tmp/aflock.sock --policy .aflock`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if serveUnixSocket != "" && serveHTTPPort > 0 {
-			fmt.Fprintln(os.Stderr, "Error: --unix and --http are mutually exclusive (pick one transport)")
-			os.Exit(2)
-		}
 		server := mcp.NewServer()
 		var err error
 		switch {
@@ -721,7 +717,7 @@ func init() {
 	serveCmd.Flags().StringVarP(&servePolicyPath, "policy", "p", "", "Path to .aflock policy file")
 	serveCmd.Flags().IntVar(&serveHTTPPort, "http", 0, "HTTP port for SSE transport (default: stdio)")
 	serveCmd.Flags().StringVar(&serveUnixSocket, "unix", "", "Unix-domain socket path for kernel-attested peer-cred identity (mutually exclusive with --http)")
-	serveCmd.MarkFlagsMutuallyExclusive("http", "unix") //nolint:errcheck // flag validation is best-effort; serve still guards at runtime
+	serveCmd.MarkFlagsMutuallyExclusive("http", "unix")
 }
 
 func main() {

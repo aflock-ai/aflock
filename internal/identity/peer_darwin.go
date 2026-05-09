@@ -67,15 +67,19 @@ func peerBinaryAndDigest(pid int) (string, string, error) {
 //
 // The 'n' line that immediately follows 'ftxt' is the executable path.
 func lsofExecPath(pid int) (string, error) {
-	lsofPath, err := exec.LookPath("lsof")
-	if err != nil {
-		// macOS ships lsof at /usr/sbin/lsof, but /usr/sbin is not always in PATH
-		// for non-interactive launches.
-		if _, statErr := os.Stat("/usr/sbin/lsof"); statErr == nil {
-			lsofPath = "/usr/sbin/lsof"
-		} else {
-			return "", fmt.Errorf("lsof not found in PATH and /usr/sbin/lsof missing: %w", err)
+	// Prefer the absolute system path unconditionally — the whole point of
+	// peer-cred attestation is that we don't trust aflock's $PATH for
+	// identity binaries. A hostile PATH shadowing /usr/sbin/lsof would
+	// otherwise defeat that property here. Only fall back to PATH lookup
+	// if the absolute path is missing on this host.
+	const systemLsof = "/usr/sbin/lsof"
+	lsofPath := systemLsof
+	if _, statErr := os.Stat(systemLsof); statErr != nil {
+		fallback, err := exec.LookPath("lsof")
+		if err != nil {
+			return "", fmt.Errorf("%s missing and lsof not on PATH: %w", systemLsof, err)
 		}
+		lsofPath = fallback
 	}
 
 	cmd := exec.Command(lsofPath, "-p", strconv.Itoa(pid), "-Fn") //nolint:gosec // G204: kernel-attested PID
