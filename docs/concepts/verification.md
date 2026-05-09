@@ -123,6 +123,22 @@ Deterministic, cross-step constraint verification:
 }
 ```
 
+#### Fragment-style policies
+
+Policy sources without a `package` declaration are auto-wrapped under
+`package aflock.evaluator` with `future.keywords` imported, so a fragment
+like the following compiles and runs as-is:
+
+```rego
+deny[msg] {
+    input.tool == "Bash"
+    contains(input.args, "rm -rf /")
+    msg := "destructive command"
+}
+```
+
+Sources that already declare a `package` are passed through unchanged.
+
 ### AI Evaluators
 
 > **Status: Schema defined, runtime not yet implemented** — [#16](https://github.com/aflock-ai/aflock/issues/16)
