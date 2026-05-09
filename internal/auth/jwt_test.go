@@ -287,3 +287,65 @@ func TestNewTokenIssuerFromSigner(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "a1", claims.AgentID)
 }
+
+// TestPublicKeyRoundtrip exercises issue #48: hooks mode persists the JWT
+// public key to disk so a separate PreToolUse subprocess can validate the
+// token. Marshal → Parse must reproduce a working validation-only issuer.
+func TestPublicKeyRoundtrip(t *testing.T) {
+	signer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	tokenStr, err := signer.IssueToken("s1", "a1", "h1", nil, time.Hour)
+	require.NoError(t, err)
+
+	pemBytes, err := signer.MarshalPublicKey()
+	require.NoError(t, err)
+	assert.Contains(t, string(pemBytes), "-----BEGIN PUBLIC KEY-----")
+
+	validator, err := NewTokenIssuerFromPublicKey(pemBytes)
+	require.NoError(t, err)
+
+	// The cross-process validator accepts tokens issued by the original signer.
+	claims, err := validator.ValidateToken(tokenStr)
+	require.NoError(t, err)
+	assert.Equal(t, "a1", claims.AgentID)
+}
+
+// TestNewTokenIssuerFromPublicKey_RejectsTamperedPEM guards the parser
+// against malformed inputs that could otherwise turn into nil-pointer
+// surprises during validation.
+func TestNewTokenIssuerFromPublicKey_RejectsTamperedPEM(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":       []byte(""),
+		"not pem":     []byte("not a pem block"),
+		"empty block": []byte("-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n"),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewTokenIssuerFromPublicKey(data)
+			assert.Error(t, err)
+		})
+	}
+}
+
+// TestValidatorRejectsForeignToken — a token issued by a different signer
+// must fail validation, even though both keys are valid ECDSA P-256. This
+// is the security claim of the hooks-mode design: an attacker who swaps
+// the persisted pubkey file invalidates the existing token.
+func TestValidatorRejectsForeignToken(t *testing.T) {
+	signerA, err := NewTokenIssuer()
+	require.NoError(t, err)
+	signerB, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	tokenA, err := signerA.IssueToken("s1", "a1", "h1", nil, time.Hour)
+	require.NoError(t, err)
+
+	pemB, err := signerB.MarshalPublicKey()
+	require.NoError(t, err)
+	validatorB, err := NewTokenIssuerFromPublicKey(pemB)
+	require.NoError(t, err)
+
+	_, err = validatorB.ValidateToken(tokenA)
+	assert.Error(t, err)
+}
