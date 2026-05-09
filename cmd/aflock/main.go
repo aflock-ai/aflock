@@ -622,11 +622,12 @@ Examples:
 
 var servePolicyPath string
 var serveHTTPPort int
+var serveUnixSocket string
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the aflock MCP server",
-	Long: `Start the aflock MCP server on stdio or HTTP.
+	Long: `Start the aflock MCP server on stdio, HTTP, or Unix-domain socket.
 
 The MCP server provides tools for AI agents with policy enforcement:
 - get_identity: Get the agent's derived identity
@@ -649,13 +650,19 @@ For stdio (Claude Code):
 
 For HTTP (OpenClaw via mcporter):
   aflock serve --http 8787 --policy .aflock
-  mcporter config add aflock http://localhost:8787/sse`,
+  mcporter config add aflock http://localhost:8787/sse
+
+For Unix-domain socket (kernel-attested peer-cred identity, issue #63):
+  aflock serve --unix /tmp/aflock.sock --policy .aflock`,
 	Run: func(cmd *cobra.Command, args []string) {
 		server := mcp.NewServer()
 		var err error
-		if serveHTTPPort > 0 {
+		switch {
+		case serveUnixSocket != "":
+			err = server.ServeUnix(servePolicyPath, serveUnixSocket)
+		case serveHTTPPort > 0:
 			err = server.ServeHTTP(servePolicyPath, serveHTTPPort)
-		} else {
+		default:
 			err = server.Serve(servePolicyPath)
 		}
 		if err != nil {
@@ -709,6 +716,8 @@ func init() {
 	// Serve command flags
 	serveCmd.Flags().StringVarP(&servePolicyPath, "policy", "p", "", "Path to .aflock policy file")
 	serveCmd.Flags().IntVar(&serveHTTPPort, "http", 0, "HTTP port for SSE transport (default: stdio)")
+	serveCmd.Flags().StringVar(&serveUnixSocket, "unix", "", "Unix-domain socket path for kernel-attested peer-cred identity (mutually exclusive with --http)")
+	serveCmd.MarkFlagsMutuallyExclusive("http", "unix")
 }
 
 func main() {

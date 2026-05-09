@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,6 +24,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
 	"github.com/aflock-ai/aflock/internal/identity"
+	"github.com/aflock-ai/aflock/internal/identity/peercred"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -294,6 +296,161 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
 }
 
+// ServeUnix starts the MCP server on a Unix-domain-socket transport with
+// kernel-attested peer-credential identity (issue #63).
+//
+// On accept, the server extracts the connecting peer's PID via SO_PEERCRED
+// (Linux) or LOCAL_PEERPID (macOS), drives identity discovery from that PID
+// (rather than os.Getppid()), and serves a single MCP session as JSON-RPC
+// over the connection. The socket is created with 0600 permissions and
+// removed on shutdown. Refuses to start if the socket path already exists,
+// to avoid a hijack race against an attacker who pre-creates it.
+//
+// The parent directory of socketPath MUST be owned by the current UID and
+// have mode 0700; otherwise we refuse to bind. This closes the
+// Lstat→Listen window where a local attacker on a world-writable parent
+// (e.g. /tmp) could pre-create the socket between our existence check
+// and net.Listen. Operators should pass a path under a private dir like
+// `~/.aflock/aflock.sock` rather than `/tmp/aflock.sock`.
+//
+// Single-session-per-process by design: the connection itself is the MCP
+// session, and the kernel-attested PID is bound to that session's
+// identity. After the peer disconnects, this function returns; a second
+// client requires the operator to re-run `aflock serve --unix`. This
+// matches the stdio transport's lifecycle.
+func (s *Server) ServeUnix(policyPath, socketPath string) error {
+	if socketPath == "" {
+		return fmt.Errorf("socket path is required")
+	}
+
+	// Load policy if path provided
+	if policyPath != "" {
+		pol, path, err := policy.Load(policyPath)
+		if err != nil {
+			return fmt.Errorf("load policy: %w", err)
+		}
+		s.policy = pol
+		s.policyPath = path
+	} else {
+		cwd, _ := os.Getwd()
+		pol, path, err := policy.Load(cwd)
+		if err == nil {
+			s.policy = pol
+			s.policyPath = path
+		}
+	}
+
+	// Refuse to start if the socket path already exists. Lstat (not Stat)
+	// so a dangling symlink also blocks us — an attacker pre-creating either
+	// a file or a symlink at the path could otherwise win the bind race.
+	if _, err := os.Lstat(socketPath); err == nil {
+		return fmt.Errorf("socket path %q already exists; refusing to bind (avoid hijack race)", socketPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat socket path: %w", err)
+	}
+
+	parentDir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(parentDir, 0700); err != nil {
+		return fmt.Errorf("create socket dir: %w", err)
+	}
+
+	// MkdirAll is a no-op on existing directories — it does NOT tighten
+	// existing perms. Verify the parent is 0700 and owned by us before
+	// binding; otherwise the Lstat→Listen window can be won by a local
+	// attacker on a world-writable parent (PR #88 review, colek42).
+	if err := assertParentDirSecure(parentDir); err != nil {
+		return fmt.Errorf("refusing to bind under insecure parent dir: %w", err)
+	}
+
+	// Set umask 0077 around the bind so the socket is created with 0600
+	// permissions from the very first instant it exists on disk — closes
+	// the window where the umask-default-permissioned socket would be
+	// reachable before our explicit Chmod fires.
+	restoreUmask := withRestrictiveUmask()
+	listener, err := net.Listen("unix", socketPath)
+	restoreUmask()
+	if err != nil {
+		return fmt.Errorf("listen unix: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+	}()
+
+	// Defense in depth: explicitly Chmod 0600 in case a future refactor
+	// drops the umask wrapper. With umask 0077 above, the bind already
+	// created the socket as 0600.
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on unix://%s (peer-cred identity)\n", socketPath)
+
+	conn, err := listener.Accept()
+	if err != nil {
+		return fmt.Errorf("accept: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Stop accepting further connections once we have one — single-session
+	// model. Closing the listener also unlinks-on-defer above.
+	_ = listener.Close()
+
+	pc, err := peercred.FromConn(conn)
+	if err != nil {
+		return fmt.Errorf("extract peer credentials: %w", err)
+	}
+
+	// Defense in depth: refuse cross-UID connections explicitly. The 0600
+	// socket and same-UID requirement of /proc/<pid>/environ already make
+	// this fail in practice on Linux, but an explicit check makes the
+	// trust boundary unambiguous and keeps the property intact if UDS
+	// perms are ever loosened (PR #88 review, colek42).
+	//nolint:gosec // G115: os.Getuid() is non-negative on unix
+	if pc.UID != uint32(os.Getuid()) {
+		return fmt.Errorf("peer uid %d does not match server uid %d (refusing cross-UID connection)", pc.UID, os.Getuid())
+	}
+
+	fmt.Fprintf(os.Stderr, "[aflock] peer credentials: pid=%d uid=%d gid=%d\n", pc.PID, pc.UID, pc.GID)
+
+	// Identity discovery + policy-digest binding from kernel-attested peer
+	// credentials. PID, UID, and GID all come from the kernel — and the
+	// peer's binary digest, container ID, and environment are read from
+	// the peer's PID directly, not from aflock's own process state.
+	//
+	// Fail closed: if peer-binary attestation fails (e.g. PID recycled
+	// between SO_PEERCRED and our /proc/<pid>/exe read on Linux, or peer
+	// already gone on Darwin), refuse to serve rather than silently fall
+	// back to a heuristic identity. The whole point of the UDS transport
+	// is that we don't lie about who's connected.
+	if err := s.initAgentIdentityFromPeer(pc); err != nil {
+		return fmt.Errorf("peer identity attestation failed (refusing to serve): %w", err)
+	}
+
+	s.initSigning()
+	if err := s.initAuth(); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] JWT authorization enabled\n")
+	}
+
+	if s.policy != nil {
+		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		if err := s.stateManager.Save(sessionState); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s\n", s.policy.Name)
+	} else {
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
+	}
+
+	// Serve a single MCP session as JSON-RPC over the UDS connection. The
+	// connection is both Reader and Writer — same framing the stdio transport
+	// uses, just over a socket whose peer is kernel-attested.
+	stdioServer := server.NewStdioServer(s.mcpServer)
+	return stdioServer.Listen(context.Background(), conn, conn)
+}
+
 // computePolicyDigest returns the SHA-256 digest of the loaded policy.
 //
 // Prefers s.policy.RawDigest (set by policy.Load from the on-disk bytes) so
@@ -330,7 +487,36 @@ func (s *Server) computePolicyDigest() string {
 // under a Claude Code tree yet. Caller is responsible for deciding whether
 // to fail closed via policy.identity.allowedModels.
 func (s *Server) initAgentIdentity() {
-	agentID, err := identity.DiscoverAgentIdentity()
+	s.applyAgentIdentity(identity.DiscoverAgentIdentity)
+}
+
+// initAgentIdentityFromPeer is the kernel-attested counterpart of
+// initAgentIdentity used by the UDS transport. The PID, UID, and GID all
+// come from SO_PEERCRED (Linux) or LOCAL_PEERPID + LOCAL_PEERCRED (macOS)
+// on the accepted connection — they are not derived from os.Getppid() or
+// os.Getuid() and cannot be spoofed by a process renaming itself "claude"
+// in a parent slot. The peer's binary path/digest, container ID, and
+// environment are also read from the peer's PID directly per paper §3.1.
+//
+// Returns an error if peer-binary attestation fails. Unlike the
+// stdio/HTTP heuristic path, the UDS path treats this as fatal: serving
+// a session with an unattestable identity defeats the purpose of the
+// kernel-attested transport.
+func (s *Server) initAgentIdentityFromPeer(pc peercred.PeerCred) error {
+	agentID, err := identity.DiscoverAgentIdentityFromPeer(pc.PID, pc.UID, pc.GID)
+	if err != nil {
+		return err
+	}
+	s.agentIdentity = agentID
+	if s.policy != nil {
+		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
+		s.agentIdentity.DeriveIdentity()
+	}
+	return nil
+}
+
+func (s *Server) applyAgentIdentity(discover func() (*identity.AgentIdentity, error)) {
+	agentID, err := discover()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
 		return

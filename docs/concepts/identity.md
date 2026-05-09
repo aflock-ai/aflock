@@ -5,16 +5,23 @@ sidebar_position: 1
 # Agent Identity
 
 :::caution Active Development
-The identity derivation model described here is the target design. The current implementation uses **process-tree heuristics** (`os.Getppid()` and `ps`) rather than kernel-level socket credentials (`SO_PEERCRED`/`LOCAL_PEERCRED`). The MCP server currently uses stdio transport, not Unix domain sockets. See [#24](https://github.com/aflock-ai/aflock/issues/24). The SPIFFE ID format in the implementation also differs from what's documented here. **We're looking for contributors in this area.**
+Identity derivation has two modes today:
+
+- **Stdio / HTTP transports** (`aflock serve`, `aflock serve --http`): heuristic, walks the process tree from `os.Getppid()`. Spoofable by a process that names itself `claude` in the parent slot.
+- **Unix-domain-socket transport** (`aflock serve --unix /path/to/sock`): kernel-attested per paper §3.1. PID, UID, and GID come from `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` + `LOCAL_PEERCRED` (macOS) on accept. Binary path/digest, container ID, and environment variables are read from the **peer's** PID — `/proc/<pid>/exe`, `/proc/<pid>/cgroup`, `/proc/<pid>/environ` on Linux; libproc-via-`lsof` on macOS — never from aflock's own process state. Cannot be spoofed by process renaming or PATH manipulation. Implemented for issue [#63](https://github.com/aflock-ai/aflock/issues/63).
+
+The Linux path is TOCTOU-validated: the binary digest is computed through an FD opened on `/proc/<pid>/exe` (which pins the inode the kernel mapped at `SO_PEERCRED` time, even if the peer subsequently `exec()`s or exits), and `/proc/<pid>/stat`'s `starttime` is checked before and after the open to detect PID recycle. If recycle is detected the server fails closed and refuses the connection rather than attesting with a possibly-different process's binary.
+
+macOS has documented gaps: container IDs are not available (no cgroup analog), peer environment variables are not read (KERN_PROCARGS2 has no stable API), and there is no FD-pinning analog of `/proc/<pid>/exe`, so darwin attestation is "hardened heuristic" — we verify the peer is alive after hashing (catches outright recycle) but cannot detect in-flight `exec()` races within a single PID. Identity derivation on macOS therefore covers binary digest + UID/GID; verifiers should treat the missing fields as empty rather than absent.
+
+The SPIFFE ID format in the implementation may still differ from what's documented here. **We're looking for contributors in this area.**
 :::
 
 A core insight of aflock is that agent identity should be **derived from introspectable properties** rather than assigned. The agent cannot lie about its identity because the server independently verifies all components.
 
 ## Identity Derivation
 
-When an agent connects to the aflock server via MCP over a Unix domain socket, the server obtains the connecting process's PID through `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (macOS).
-
-> **Current implementation note:** The server currently uses process-tree walking (`os.Getppid()`) over stdio transport rather than socket credentials. See [#24](https://github.com/aflock-ai/aflock/issues/24).
+When an agent connects to the aflock server via MCP over a Unix domain socket, the server obtains the connecting process's PID through `SO_PEERCRED` (Linux) or `LOCAL_PEERPID` (macOS — note: `LOCAL_PEERCRED` returns only UID/GID on macOS, the PID requires a separate `LOCAL_PEERPID` getsockopt call).
 
 From the PID, the server introspects:
 

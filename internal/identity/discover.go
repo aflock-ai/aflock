@@ -483,15 +483,57 @@ type ProcessInfo struct {
 }
 
 // DiscoverFromMCPSocket discovers model and collects comprehensive process metadata.
-// This is called when aflock is started as an MCP server.
+// This is called when aflock is started as an MCP server on stdio or HTTP/SSE,
+// where there is no socket peer credential to attest the connecting process.
+// Identity is derived heuristically from the parent PID (os.Getppid()).
+//
+// For kernel-attested identity over a Unix-domain-socket transport, use
+// DiscoverFromPID with the PID returned by SO_PEERCRED/LOCAL_PEERPID.
+//
 // No fallback to environment variables - proper attestation requires PID-based discovery.
 //
 //nolint:gocognit,gocyclo // MCP socket discovery requires complex process parsing
 func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
+	return discoverFromPID(os.Getppid(), "pid_trace", nil)
+}
+
+// DiscoverFromPID discovers the agent model and collects process metadata
+// starting from a kernel-attested peer PID (e.g. obtained via SO_PEERCRED on
+// Linux or LOCAL_PEERPID on macOS for an accepted UDS connection). The
+// resulting ProcessMetadata.DiscoveryMethod is set to "peercred" so callers
+// and attestations can distinguish kernel-attested identity from the
+// process-tree-walking heuristic used by DiscoverFromMCPSocket.
+//
+// Deprecated: prefer DiscoverFromPeer, which additionally records peer
+// UID/GID and reads the peer's /proc/<pid>/environ rather than aflock's
+// own environment.
+func DiscoverFromPID(peerPID int) (string, *ProcessMetadata, error) {
+	return discoverFromPID(peerPID, "peercred", nil)
+}
+
+// DiscoverFromPeer is the kernel-attested counterpart of DiscoverFromPID
+// that uses peer-derived data — peer UID instead of os.Getuid(), peer's
+// /proc/<pid>/environ instead of aflock's environment — to populate the
+// returned ProcessMetadata. Use this when the caller has a full PeerInfo
+// from SO_PEERCRED + IntrospectPeer; use DiscoverFromMCPSocket for the
+// stdio/HTTP heuristic path where no peer credentials are available.
+func DiscoverFromPeer(peer PeerInfo) (string, *ProcessMetadata, error) {
+	return discoverFromPID(peer.PID, "peercred", &peer)
+}
+
+//nolint:gocognit,gocyclo // shared discovery logic mirrors the original DiscoverFromMCPSocket
+func discoverFromPID(startPID int, method string, peer *PeerInfo) (string, *ProcessMetadata, error) {
 	meta := &ProcessMetadata{
 		AflockPID: os.Getpid(),
-		ParentPID: os.Getppid(),
-		UserID:    os.Getuid(),
+		ParentPID: startPID,
+	}
+	if peer != nil {
+		// Kernel-attested peer UID — not aflock's UID. Differs when aflock
+		// runs as a different user than the connecting agent (rare today,
+		// but the trust boundary requires we never lie about it).
+		meta.UserID = int(peer.UID)
+	} else {
+		meta.UserID = os.Getuid()
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -528,36 +570,31 @@ func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
 		meta.ProcessChain = append(meta.ProcessChain, pinfo)
 	}
 
-	// Collect Claude-related environment variables (excluding secrets).
-	// Only capture non-sensitive keys; skip any that contain API keys, tokens, or secrets.
-	meta.Environment = make(map[string]string)
-	sensitiveSubstrings := []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"}
-	for _, env := range os.Environ() {
-		if idx := strings.Index(env, "="); idx > 0 { //nolint:nestif
-
-			key := env[:idx]
-			if strings.HasPrefix(key, "CLAUDE_") ||
-				strings.HasPrefix(key, "ANTHROPIC_") ||
-				strings.HasPrefix(key, "SPIFFE_") ||
-				key == "USER" || key == "HOME" {
-				// Skip sensitive keys to prevent API key leakage in attestations
-				isSensitive := false
-				upperKey := strings.ToUpper(key)
-				for _, substr := range sensitiveSubstrings {
-					if strings.Contains(upperKey, substr) {
-						isSensitive = true
-						break
-					}
-				}
-				if !isSensitive {
-					meta.Environment[key] = env[idx+1:]
-				}
+	// Collect Claude-related environment variables. In peer mode, read the
+	// peer's /proc/<pid>/environ so the attestation reflects the agent's
+	// configuration, not aflock's. If peer.Environ is nil (macOS, where
+	// reading another process's env is not supported), record an empty map
+	// rather than falling back to aflock's environment — the whole point
+	// of peer-cred mode is that aflock's state is untrusted for identity.
+	// In heuristic mode (no peer), os.Environ() is acceptable because the
+	// caller is aflock's own parent (stdio MCP transport).
+	var rawEnv map[string]string
+	switch {
+	case peer != nil:
+		rawEnv = peer.Environ // may be nil on macOS — that's fine, treat as empty
+	default:
+		rawEnv = make(map[string]string)
+		for _, kv := range os.Environ() {
+			if idx := strings.Index(kv, "="); idx > 0 {
+				rawEnv[kv[:idx]] = kv[idx+1:]
 			}
 		}
 	}
 
+	meta.Environment = filterEnvAllowlist(rawEnv)
+
 	// Discover model from process chain (no fallback)
-	model, sessionID, sessionPath, err := DiscoverModelWithSession()
+	model, sessionID, sessionPath, err := discoverModelWithSessionFromPID(startPID)
 	if err != nil {
 		meta.DiscoveryMethod = "failed"
 		return "", meta, err
@@ -566,15 +603,49 @@ func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
 	meta.Model = model
 	meta.SessionID = sessionID
 	meta.SessionPath = sessionPath
-	meta.DiscoveryMethod = "pid_trace"
+	meta.DiscoveryMethod = method
 
 	return model, meta, nil
 }
 
-// DiscoverModelWithSession discovers the model and returns session info.
+// filterEnvAllowlist keeps only env vars relevant to attestation —
+// CLAUDE_*, ANTHROPIC_*, SPIFFE_*, plus USER/HOME — and drops any whose
+// key contains a sensitivity marker (KEY, TOKEN, SECRET, PASSWORD,
+// CREDENTIAL) to prevent API-key leakage in attestations.
+func filterEnvAllowlist(env map[string]string) map[string]string {
+	out := make(map[string]string)
+	sensitive := []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"}
+	for key, value := range env {
+		if !strings.HasPrefix(key, "CLAUDE_") &&
+			!strings.HasPrefix(key, "ANTHROPIC_") &&
+			!strings.HasPrefix(key, "SPIFFE_") &&
+			key != "USER" && key != "HOME" {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		drop := false
+		for _, s := range sensitive {
+			if strings.Contains(upper, s) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+// DiscoverModelWithSession discovers the model and returns session info,
+// starting the process-chain walk from the current process's parent. Used
+// by stdio/HTTP transports where there is no socket peer credential.
 func DiscoverModelWithSession() (model, sessionID, sessionPath string, err error) {
-	ppid := os.Getppid()
-	pids := getProcessChain(ppid)
+	return discoverModelWithSessionFromPID(os.Getppid())
+}
+
+func discoverModelWithSessionFromPID(startPID int) (model, sessionID, sessionPath string, err error) {
+	pids := getProcessChain(startPID)
 
 	// Find Claude process and its working directory
 	for _, pid := range pids {
