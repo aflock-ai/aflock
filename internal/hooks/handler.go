@@ -209,6 +209,21 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		} else {
 			sessionState.AuthToken = token
 			fmt.Fprintf(os.Stderr, "[aflock] JWT issued for session %s (ttl=%s)\n", input.SessionID, ttl)
+
+			// Persist the public key alongside the session so PreToolUse — a
+			// separate subprocess that has no in-memory access to the signer —
+			// can validate this token (issue #48). Best-effort: a write failure
+			// downgrades to policy-only enforcement, with a stderr warning.
+			if pubPEM, marshalErr := issuer.MarshalPublicKey(); marshalErr != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal JWT public key: %v\n", marshalErr)
+			} else {
+				sessionDir := h.stateManager.SessionDir(input.SessionID)
+				if mkErr := os.MkdirAll(sessionDir, 0700); mkErr != nil {
+					fmt.Fprintf(os.Stderr, "[aflock] Warning: create session dir for JWT pubkey: %v\n", mkErr)
+				} else if writeErr := os.WriteFile(filepath.Join(sessionDir, "jwt-pubkey.pem"), pubPEM, 0600); writeErr != nil {
+					fmt.Fprintf(os.Stderr, "[aflock] Warning: write JWT public key: %v\n", writeErr)
+				}
+			}
 		}
 	}
 
@@ -355,6 +370,41 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 	if pol.IsExpired() {
 		return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
 	}
+
+	// Validate the session JWT (#48). The signing key dies with the
+	// SessionStart subprocess, so we reconstruct a validation-only issuer
+	// from the public key persisted next to state.json. If the pubkey file
+	// is missing — pre-existing sessions, or SessionStart failed to write
+	// it — we fall through to policy-only enforcement (preserves backward
+	// compatibility on upgrade). All other failures are deny.
+	if sessionState.AuthToken != "" && input.SessionID != "" {
+		pubKeyPath := filepath.Join(h.stateManager.SessionDir(input.SessionID), "jwt-pubkey.pem")
+		pubPEM, readErr := os.ReadFile(pubKeyPath) //nolint:gosec // G304: path under managed state dir
+		switch {
+		case os.IsNotExist(readErr):
+			// Legacy session — fall through, no JWT enforcement.
+		case readErr != nil:
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] BLOCKED: read JWT public key: %v", readErr)))
+		default:
+			validator, valErr := auth.NewTokenIssuerFromPublicKey(pubPEM)
+			if valErr != nil {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: parse JWT public key: %v", valErr)))
+			}
+			claims, valErr := validator.ValidateTokenForSessionAndPolicy(
+				sessionState.AuthToken, input.SessionID, auth.ComputePolicyDigest(pol))
+			if valErr != nil {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: JWT validation failed: %v", valErr)))
+			}
+			if !auth.IsToolAllowed(input.ToolName, claims.AllowedTools, claims.DeniedTools) {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: tool '%s' not permitted by JWT scope", input.ToolName)))
+			}
+		}
+	}
+
 	// Use cwd as projectRoot when policy path is outside cwd (e.g., AFLOCK_POLICY env var
 	// pointing to a tenant-specific policy in a subdirectory). Otherwise use the policy
 	// file's directory (standard case where .aflock is at project root).

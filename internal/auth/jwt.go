@@ -16,8 +16,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"time"
 
@@ -248,6 +250,36 @@ func ComputePolicyDigest(pol *aflock.Policy) string {
 // PublicKey returns the issuer's public key (useful for testing/debugging).
 func (ti *TokenIssuer) PublicKey() crypto.PublicKey {
 	return ti.publicKey
+}
+
+// MarshalPublicKey returns the issuer's public key as PEM-encoded PKIX bytes.
+// Used by hooks mode to persist the validation key across PreToolUse
+// subprocesses — the private key dies with the SessionStart process, but the
+// public key on disk lets a separate hook process validate the JWT (issue #48).
+func (ti *TokenIssuer) MarshalPublicKey() ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(ti.publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
+// NewTokenIssuerFromPublicKey reconstructs a validation-only TokenIssuer from
+// PEM-encoded public key bytes produced by MarshalPublicKey. The returned
+// issuer can validate tokens but cannot sign new ones (no private key).
+func NewTokenIssuerFromPublicKey(pemData []byte) (*TokenIssuer, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in public key data")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse public key: %w", err)
+	}
+	if _, ok := pub.(*ecdsa.PublicKey); !ok {
+		return nil, fmt.Errorf("public key is not ECDSA: %T", pub)
+	}
+	return &TokenIssuer{publicKey: pub}, nil
 }
 
 // KeyID returns the key identifier.
