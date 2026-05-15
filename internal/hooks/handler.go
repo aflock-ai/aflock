@@ -3,8 +3,10 @@ package hooks
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -634,6 +636,13 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		Decision:  "allow",
 	}
 
+	// Build the JWT binding for the attestation predicate (#40). PreToolUse
+	// already validated the token (#48); we re-validate here so the binding
+	// reflects ground truth at signing time, not state captured upstream.
+	// Failure to validate skips the binding but still produces an attestation
+	// — consistent with "attestation is evidence, not enforcement."
+	jwtBinding := h.buildJWTBindingForSession(sessionState)
+
 	// Create signed attestation
 	envelope, err := signer.CreateActionAttestation(
 		context.Background(),
@@ -641,6 +650,7 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		sessionState.SessionID,
 		sessionState.Metrics,
 		agentIdentity,
+		jwtBinding,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation creation failed: %v\n", err)
@@ -677,6 +687,46 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 	}
 
 	fmt.Fprintf(os.Stderr, "[aflock] Attestation signed: %s\n", filename)
+}
+
+// buildJWTBindingForSession constructs an attestation predicate binding
+// from the session's stored JWT, validated against the public key
+// persisted at SessionStart (#48). Returns nil on any failure — missing
+// pubkey, missing token, or validation error — so the attestation is
+// still produced. Validation failures are logged but do not block.
+func (h *Handler) buildJWTBindingForSession(sessionState *aflock.SessionState) *attestation.JWTBinding {
+	if sessionState == nil || sessionState.AuthToken == "" || sessionState.SessionID == "" {
+		return nil
+	}
+	pubKeyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "jwt-pubkey.pem")
+	pubPEM, err := os.ReadFile(pubKeyPath) //nolint:gosec // G304: managed state dir
+	if err != nil {
+		return nil // legacy session or absent pubkey — skip binding silently
+	}
+	validator, err := auth.NewTokenIssuerFromPublicKey(pubPEM)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: parse JWT public key for binding: %v\n", err)
+		return nil
+	}
+	currentDigest := ""
+	if sessionState.Policy != nil {
+		currentDigest = auth.ComputePolicyDigest(sessionState.Policy)
+	}
+	claims, err := validator.ValidateTokenForSessionAndPolicy(
+		sessionState.AuthToken, sessionState.SessionID, currentDigest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT failed validation at signing time: %v\n", err)
+		return nil
+	}
+	digest := sha256.Sum256([]byte(sessionState.AuthToken))
+	return &attestation.JWTBinding{
+		SessionID:    sessionState.SessionID,
+		JTI:          claims.ID,
+		PolicyDigest: claims.PolicyDigest,
+		TokenSHA256:  hex.EncodeToString(digest[:]),
+		AllowedTools: claims.AllowedTools,
+		DeniedTools:  claims.DeniedTools,
+	}
 }
 
 // handlePermissionRequest auto-approves or denies based on policy.

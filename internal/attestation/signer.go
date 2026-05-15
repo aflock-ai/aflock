@@ -165,6 +165,22 @@ type ActionPredicate struct {
 	AgentID       string                 `json:"agentId,omitempty"`
 	AgentIdentity *TransitiveIdentity    `json:"agentIdentity,omitempty"`
 	Metrics       *MetricsPredicate      `json:"metrics,omitempty"`
+	JWTBinding    *JWTBinding            `json:"jwtBinding,omitempty"`
+}
+
+// JWTBinding records the authorization context that permitted this action,
+// closing the issue #40 gap where JWT claims were not embedded in the
+// resulting attestation. A reviewer can prove the action was signed only
+// because the agent presented a token with the listed scope, and can
+// cross-reference the token digest with their own audit log.
+type JWTBinding struct {
+	SessionID    string   `json:"sessionId"`
+	JTI          string   `json:"jti"`
+	KeyID        string   `json:"kid,omitempty"`
+	PolicyDigest string   `json:"policyDigest,omitempty"`
+	TokenSHA256  string   `json:"tokenSha256"` // hex digest, NOT the token
+	AllowedTools []string `json:"allowedTools,omitempty"`
+	DeniedTools  []string `json:"deniedTools,omitempty"`
 }
 
 // TransitiveIdentity represents the full transitive agent identity.
@@ -202,13 +218,29 @@ type Signature struct {
 }
 
 // CreateActionAttestation creates an attestation for an action.
+//
+// jwtBindings is a 0-or-1 variadic so legacy callers (replay, tests, hook
+// paths that did not present a token) compile unchanged. When a binding is
+// supplied, it is embedded in the predicate so verifiers can confirm the
+// action was signed only because a JWT with the listed scope was
+// presented (issue #40). Passing more than one binding is a programming
+// error and panics.
 func (s *Signer) CreateActionAttestation(
 	ctx context.Context,
 	record aflock.ActionRecord,
 	sessionID string,
 	metrics *aflock.SessionMetrics,
 	agentIdentity *identity.AgentIdentity,
+	jwtBindings ...*JWTBinding,
 ) (*Envelope, error) {
+	if len(jwtBindings) > 1 {
+		panic("CreateActionAttestation: at most one JWTBinding allowed")
+	}
+	var jwtBinding *JWTBinding
+	if len(jwtBindings) == 1 {
+		jwtBinding = jwtBindings[0]
+	}
+
 	// Parse tool input (best-effort, ignore errors)
 	var toolInput map[string]interface{}
 	if record.ToolInput != nil {
@@ -217,14 +249,15 @@ func (s *Signer) CreateActionAttestation(
 
 	// Build predicate
 	predicate := ActionPredicate{
-		Action:    "tool_call",
-		SessionID: sessionID,
-		ToolName:  record.ToolName,
-		ToolUseID: record.ToolUseID,
-		ToolInput: toolInput,
-		Decision:  record.Decision,
-		Reason:    record.Reason,
-		Timestamp: record.Timestamp,
+		Action:     "tool_call",
+		SessionID:  sessionID,
+		ToolName:   record.ToolName,
+		ToolUseID:  record.ToolUseID,
+		ToolInput:  toolInput,
+		Decision:   record.Decision,
+		Reason:     record.Reason,
+		Timestamp:  record.Timestamp,
+		JWTBinding: jwtBinding,
 	}
 
 	if s.identity != nil {
