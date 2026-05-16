@@ -6,7 +6,9 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -66,6 +68,22 @@ type Server struct {
 	// AFLOCK_REQUIRE_TOKEN=1 env var. Closes the unauthenticated bootstrap
 	// window (issue #59 / M10). Default false for backward compatibility.
 	requireToken bool
+
+	// transportMode records which Serve* method was invoked: "stdio", "unix",
+	// or "http". get_token's bootstrap-secret gate (issue #42) is scoped to
+	// "http" because stdio inherits process-tree isolation and unix has
+	// SO_PEERCRED + UID-match at accept time — both already prove same-UID
+	// without an extra secret. Empty until a Serve* method runs.
+	transportMode string
+
+	// httpBootstrapSecret is the random secret a caller must present (via the
+	// _bootstrap arg) to get_token in HTTP transport mode (issue #42). It's
+	// generated when ServeHTTP starts, written to a 0600 file under the
+	// session dir so only the same-UID caller can read it, and cleared from
+	// memory + disk once consumed (one-time use).
+	httpBootstrapSecret      string
+	httpBootstrapSecretPath  string
+	httpBootstrapSecretMu    sync.Mutex
 }
 
 // NewServer creates a new aflock MCP server.
@@ -186,6 +204,7 @@ func (s *Server) registerTools() {
 
 // Serve starts the MCP server on stdio.
 func (s *Server) Serve(policyPath string) error {
+	s.transportMode = "stdio"
 	// Load policy if path provided
 	if policyPath != "" {
 		pol, path, err := policy.Load(policyPath)
@@ -243,7 +262,18 @@ func (s *Server) projectRoot() string {
 
 // ServeHTTP starts the MCP server on HTTP with SSE transport.
 // This keeps the server running so session state persists across calls.
+//
+// SECURITY (issue #42): unlike stdio (process-tree isolation) and Unix-domain
+// (SO_PEERCRED + UID check at accept), HTTP/SSE has no kernel-attested peer
+// identity — any local process at any UID could reach 127.0.0.1:port and
+// mint a JWT via get_token. To close that bootstrap gap, ServeHTTP writes a
+// random secret to a 0600 file under the session dir. get_token in HTTP
+// mode requires the caller to present this secret via the _bootstrap arg;
+// since the file is same-UID-only by FS permission, this matches the trust
+// boundary the other transports get for free. The secret is one-time-use
+// and removed after the first successful get_token.
 func (s *Server) ServeHTTP(policyPath string, port int) error {
+	s.transportMode = "http"
 	// Load policy if path provided
 	if policyPath != "" {
 		pol, path, err := policy.Load(policyPath)
@@ -289,6 +319,14 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		fmt.Fprintf(os.Stderr, "[aflock] HTTP MCP server starting (no policy loaded)\n")
 	}
 
+	// Issue #42: HTTP transport has no kernel-attested peer, so guard
+	// get_token behind a same-UID-readable bootstrap secret. Refuse to start
+	// if the secret can't be written — failing closed beats running an
+	// unauthenticated token dispenser.
+	if err := s.initHTTPBootstrapSecret(); err != nil {
+		return fmt.Errorf("init HTTP bootstrap secret: %w", err)
+	}
+
 	// Create SSE server
 	sseServer := server.NewSSEServer(s.mcpServer)
 
@@ -296,8 +334,60 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://%s/sse\n", addr)
 	fmt.Fprintf(os.Stderr, "[aflock] Session ID: %s (state will persist across calls)\n", s.sessionID)
+	fmt.Fprintf(os.Stderr, "[aflock] HTTP bootstrap secret: %s (0600 — pass via _bootstrap arg on get_token)\n", s.httpBootstrapSecretPath)
 
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
+}
+
+// initHTTPBootstrapSecret generates a 32-byte random secret and writes it to
+// a 0600 file under the session dir (issue #42). Returns an error if the
+// secret cannot be generated or persisted — ServeHTTP fails closed rather
+// than running without the gate. The path is recorded on the Server so
+// handleGetToken can read it back, compare in constant time, and remove the
+// file on first successful use.
+func (s *Server) initHTTPBootstrapSecret() error {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("generate bootstrap secret: %w", err)
+	}
+	secret := hex.EncodeToString(raw)
+
+	sessionDir := s.stateManager.SessionDir(s.sessionID)
+	if err := os.MkdirAll(sessionDir, 0700); err != nil {
+		return fmt.Errorf("create session dir: %w", err)
+	}
+	path := filepath.Join(sessionDir, "http-bootstrap-secret")
+	if err := os.WriteFile(path, []byte(secret), 0600); err != nil {
+		return fmt.Errorf("write bootstrap secret: %w", err)
+	}
+
+	s.httpBootstrapSecretMu.Lock()
+	s.httpBootstrapSecret = secret
+	s.httpBootstrapSecretPath = path
+	s.httpBootstrapSecretMu.Unlock()
+	return nil
+}
+
+// consumeHTTPBootstrapSecret performs a constant-time comparison between the
+// presented secret and the in-memory secret. On match, the secret is cleared
+// from memory and the on-disk file is removed — one-time use closes the
+// window where the same secret could be replayed by a different caller
+// after it leaked (e.g., via a verbose request log).
+func (s *Server) consumeHTTPBootstrapSecret(presented string) bool {
+	s.httpBootstrapSecretMu.Lock()
+	defer s.httpBootstrapSecretMu.Unlock()
+	if s.httpBootstrapSecret == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(s.httpBootstrapSecret)) != 1 {
+		return false
+	}
+	s.httpBootstrapSecret = ""
+	if s.httpBootstrapSecretPath != "" {
+		_ = os.Remove(s.httpBootstrapSecretPath)
+		s.httpBootstrapSecretPath = ""
+	}
+	return true
 }
 
 // ServeUnix starts the MCP server on a Unix-domain-socket transport with
@@ -323,6 +413,7 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 // client requires the operator to re-run `aflock serve --unix`. This
 // matches the stdio transport's lifecycle.
 func (s *Server) ServeUnix(policyPath, socketPath string) error {
+	s.transportMode = "unix"
 	if socketPath == "" {
 		return fmt.Errorf("socket path is required")
 	}
@@ -608,9 +699,24 @@ func (s *Server) initAuth() error {
 }
 
 // handleGetToken issues a JWT for the current session.
-func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+//
+// In HTTP transport mode (issue #42) the caller must present the
+// one-time bootstrap secret in the _bootstrap arg. stdio and unix transports
+// already prove same-UID via process-tree isolation / SO_PEERCRED, so they
+// skip this gate.
+func (s *Server) handleGetToken(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if s.tokenIssuer == nil {
 		return mcp.NewToolResultError("Token issuer not initialized"), nil
+	}
+
+	if s.transportMode == "http" {
+		presented, _ := request.GetArguments()["_bootstrap"].(string)
+		if presented == "" {
+			return mcp.NewToolResultError("missing _bootstrap arg; HTTP transport requires the secret written at server start"), nil
+		}
+		if !s.consumeHTTPBootstrapSecret(presented) {
+			return mcp.NewToolResultError("invalid or already-consumed bootstrap secret"), nil
+		}
 	}
 
 	ttl := 1 * time.Hour
