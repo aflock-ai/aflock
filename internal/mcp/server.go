@@ -368,26 +368,33 @@ func (s *Server) initHTTPBootstrapSecret() error {
 	return nil
 }
 
-// consumeHTTPBootstrapSecret performs a constant-time comparison between the
-// presented secret and the in-memory secret. On match, the secret is cleared
-// from memory and the on-disk file is removed — one-time use closes the
-// window where the same secret could be replayed by a different caller
-// after it leaked (e.g., via a verbose request log).
-func (s *Server) consumeHTTPBootstrapSecret(presented string) bool {
+// verifyHTTPBootstrapSecret performs a constant-time comparison between the
+// presented secret and the in-memory secret WITHOUT clearing on match. The
+// caller is expected to clear via clearHTTPBootstrapSecret only after the
+// downstream operation (token issuance) succeeds — otherwise a transient
+// IssueToken failure would burn the only credential the client has, locking
+// the session out until server restart (Copilot review on PR #109).
+func (s *Server) verifyHTTPBootstrapSecret(presented string) bool {
 	s.httpBootstrapSecretMu.Lock()
 	defer s.httpBootstrapSecretMu.Unlock()
 	if s.httpBootstrapSecret == "" {
 		return false
 	}
-	if subtle.ConstantTimeCompare([]byte(presented), []byte(s.httpBootstrapSecret)) != 1 {
-		return false
-	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.httpBootstrapSecret)) == 1
+}
+
+// clearHTTPBootstrapSecret zeroes the in-memory secret and removes the
+// on-disk file. Idempotent. Called only after a successful get_token
+// issuance so that a one-time-use guarantee holds without burning the
+// credential on retriable failures.
+func (s *Server) clearHTTPBootstrapSecret() {
+	s.httpBootstrapSecretMu.Lock()
+	defer s.httpBootstrapSecretMu.Unlock()
 	s.httpBootstrapSecret = ""
 	if s.httpBootstrapSecretPath != "" {
 		_ = os.Remove(s.httpBootstrapSecretPath)
 		s.httpBootstrapSecretPath = ""
 	}
-	return true
 }
 
 // ServeUnix starts the MCP server on a Unix-domain-socket transport with
@@ -700,22 +707,42 @@ func (s *Server) initAuth() error {
 
 // handleGetToken issues a JWT for the current session.
 //
-// In HTTP transport mode (issue #42) the caller must present the
-// one-time bootstrap secret in the _bootstrap arg. stdio and unix transports
-// already prove same-UID via process-tree isolation / SO_PEERCRED, so they
-// skip this gate.
+// In HTTP transport mode (issue #42) the caller must prove same-UID either by
+// presenting the bootstrap secret (_bootstrap) on the first call OR by
+// presenting a valid existing JWT (_token) on subsequent calls. Either path
+// lets the legitimate client refresh tokens after expiry without a server
+// restart (Copilot review on PR #109). The bootstrap secret is consumed only
+// after a successful IssueToken — a transient signing failure must not burn
+// the credential.
+//
+// stdio and unix transports already prove same-UID via process-tree
+// isolation / SO_PEERCRED, so they skip this gate.
 func (s *Server) handleGetToken(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if s.tokenIssuer == nil {
 		return mcp.NewToolResultError("Token issuer not initialized"), nil
 	}
 
+	// Track whether this call authenticated via bootstrap, so we can clear
+	// the secret if and only if IssueToken succeeds below.
+	usedBootstrap := false
 	if s.transportMode == "http" {
-		presented, _ := request.GetArguments()["_bootstrap"].(string)
-		if presented == "" {
-			return mcp.NewToolResultError("missing _bootstrap arg; HTTP transport requires the secret written at server start"), nil
+		args := request.GetArguments()
+		validRefresh := false
+		if existing, _ := args["_token"].(string); existing != "" {
+			if _, err := s.tokenIssuer.ValidateTokenForSessionAndPolicy(
+				existing, s.sessionID, s.computePolicyDigest()); err == nil {
+				validRefresh = true
+			}
 		}
-		if !s.consumeHTTPBootstrapSecret(presented) {
-			return mcp.NewToolResultError("invalid or already-consumed bootstrap secret"), nil
+		if !validRefresh {
+			presented, _ := args["_bootstrap"].(string)
+			if presented == "" {
+				return mcp.NewToolResultError("missing _bootstrap arg; HTTP transport requires the secret written at server start (or a valid _token for refresh)"), nil
+			}
+			if !s.verifyHTTPBootstrapSecret(presented) {
+				return mcp.NewToolResultError("invalid or already-consumed bootstrap secret"), nil
+			}
+			usedBootstrap = true
 		}
 	}
 
@@ -745,7 +772,13 @@ func (s *Server) handleGetToken(_ context.Context, request mcp.CallToolRequest) 
 		ttl,
 	)
 	if err != nil {
+		// Bootstrap secret stays intact — a retry after fixing the signer
+		// must be able to use the same credential (Copilot review on PR #109).
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to issue token: %v", err)), nil
+	}
+
+	if usedBootstrap {
+		s.clearHTTPBootstrapSecret()
 	}
 
 	// Persist the token AND flip authActive under sessionMu so concurrent
