@@ -251,10 +251,17 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 // persists material that PostToolUse and the Stop gate need:
 //
 //   - signer-pubkey.pem (0600) — pubkey used by the Stop gate for verification
-//   - signer-key.pem (0600) — ephemeral private key; only written when running
-//     without SPIRE / Fulcio so PostToolUse subprocesses can reload it. SPIRE
-//     and Fulcio re-fetch their identities directly, so the private key is
-//     never written to disk in those modes.
+//   - signer-key.pem (0600) — ephemeral private key reloaded by PostToolUse
+//     subprocesses so every attestation in the session is signed by the same
+//     pinned key
+//
+// Hooks mode is intentionally ephemeral-only. SPIRE and Fulcio are not
+// selected here because (a) Fulcio mints a fresh cert per InitializeFulcio
+// call, so its pubkey wouldn't match the SessionStart pin and the Stop gate
+// would reject every attestation, and (b) hooks-mode SPIRE/Fulcio doesn't
+// give real key separation anyway — the key lives in the same trust domain
+// as the agent (issue #62). MCP-mode still uses the SPIRE → Fulcio →
+// ephemeral fallback because that path has its own verification pipeline.
 //
 // Failures here are non-fatal: SessionStart still completes, but
 // SignerPubKeyFingerprint stays empty and the Stop gate will deny any
@@ -267,26 +274,23 @@ func (h *Handler) establishSessionSigner(sessionState *aflock.SessionState, agen
 	signer := attestation.NewSigner("")
 	defer signer.Close() //nolint:errcheck // best-effort cleanup
 
-	mode := ""
-	if err := signer.Initialize(context.Background()); err == nil {
-		mode = "spire"
-	} else if fulcioErr := signer.InitializeFulcio(context.Background()); fulcioErr == nil {
-		mode = "fulcio"
-	} else {
-		identityHash := ""
-		if agentIdentity != nil {
-			identityHash = agentIdentity.IdentityHash
-		}
-		if err := signer.InitializeEphemeral(identityHash); err != nil {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: signer init failed at SessionStart: %v\n", err)
-			return
-		}
-		mode = "ephemeral"
+	identityHash := ""
+	if agentIdentity != nil {
+		identityHash = agentIdentity.IdentityHash
+	}
+	if err := signer.InitializeEphemeral(identityHash); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: signer init failed at SessionStart: %v\n", err)
+		return
 	}
 
 	pubPEM, fingerprint, err := signer.MarshalSigningPublicKey()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal signer pubkey: %v\n", err)
+		return
+	}
+	keyPEM, keyErr := signer.MarshalEphemeralKey()
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal ephemeral signer key: %v\n", keyErr)
 		return
 	}
 
@@ -299,23 +303,15 @@ func (h *Handler) establishSessionSigner(sessionState *aflock.SessionState, agen
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: write signer pubkey: %v\n", writeErr)
 		return
 	}
-
-	if mode == "ephemeral" {
-		keyPEM, keyErr := signer.MarshalEphemeralKey()
-		if keyErr != nil {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal ephemeral signer key: %v\n", keyErr)
-			return
-		}
-		// The persisted private key is the durable session signing material —
-		// 0600 keeps it owner-only; broader permissions defeat the pin entirely.
-		if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-key.pem"), keyPEM, 0600); writeErr != nil {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: write ephemeral signer key: %v\n", writeErr)
-			return
-		}
+	// The persisted private key is the durable session signing material —
+	// 0600 keeps it owner-only; broader permissions defeat the pin entirely.
+	if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-key.pem"), keyPEM, 0600); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write ephemeral signer key: %v\n", writeErr)
+		return
 	}
 
 	sessionState.SignerPubKeyFingerprint = fingerprint
-	sessionState.SigningMode = mode
+	sessionState.SigningMode = "ephemeral"
 }
 
 // buildPolicyContext creates context string describing the active policy.
@@ -683,32 +679,21 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		}
 	}
 
-	// Create signer. In ephemeral mode reuse the per-session key established at
-	// SessionStart (issue #68); otherwise re-fetch from SPIRE / Fulcio.
+	// Create signer. Hooks mode always uses the per-session ephemeral key
+	// established at SessionStart (issue #68) — no SPIRE/Fulcio branches here
+	// because those mint fresh keys per call and would fail the SPKI pin.
 	signer := attestation.NewSigner("")
 	signerInitialized := false
-	switch sessionState.SigningMode {
-	case "spire":
-		if err := signer.Initialize(context.Background()); err == nil {
-			signerInitialized = true
+	keyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "signer-key.pem")
+	if keyPEM, readErr := os.ReadFile(keyPath); readErr == nil { //nolint:gosec // G304: keyPath is under SessionDir
+		identityHash := ""
+		if agentIdentity != nil {
+			identityHash = agentIdentity.IdentityHash
 		}
-	case "fulcio":
-		if err := signer.InitializeFulcio(context.Background()); err == nil {
+		if err := signer.InitializeFromPersistedKey(keyPEM, identityHash); err == nil {
 			signerInitialized = true
-		}
-	case "ephemeral", "":
-		keyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "signer-key.pem")
-		keyPEM, readErr := os.ReadFile(keyPath) //nolint:gosec // G304: keyPath is under SessionDir
-		if readErr == nil {
-			identityHash := ""
-			if agentIdentity != nil {
-				identityHash = agentIdentity.IdentityHash
-			}
-			if err := signer.InitializeFromPersistedKey(keyPEM, identityHash); err == nil {
-				signerInitialized = true
-			} else {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: load persisted signer key: %v\n", err)
-			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: load persisted signer key: %v\n", err)
 		}
 	}
 	if !signerInitialized {

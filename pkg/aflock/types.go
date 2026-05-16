@@ -487,9 +487,12 @@ type SessionState struct {
 	// the pinned one (issue #68). Empty for legacy sessions established
 	// before pinning was introduced.
 	SignerPubKeyFingerprint string `json:"signer_pubkey_fingerprint,omitempty"`
-	// SigningMode records how the session's signing key was established:
-	// "ephemeral", "spire", "fulcio". Determines how the Stop gate verifies
-	// attestations.
+	// SigningMode records how the session's signing key was established.
+	// Hooks mode always sets this to "ephemeral" today (see
+	// establishSessionSigner in internal/hooks/handler.go for why SPIRE/Fulcio
+	// aren't selected in hooks). The field is kept on the wire so future
+	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
+	// behavior without a state-shape migration.
 	SigningMode string `json:"signing_mode,omitempty"`
 }
 

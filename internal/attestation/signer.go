@@ -121,11 +121,12 @@ func (s *Signer) GetSigningIdentity() (*identity.Identity, string) {
 }
 
 // InitializeFromPersistedKey reconstructs an ephemeral signing identity from
-// a PEM-encoded ECDSA P-256 private key previously written by
-// PersistEphemeralKey. Used by PostToolUse subprocesses to reuse the
-// session-scoped key established at SessionStart (issue #68) rather than
-// minting a fresh key per attestation — which made attestations from one
-// session unverifiable against any pinned key.
+// a PEM-encoded ECDSA P-256 private key previously written via
+// MarshalEphemeralKey (the hook writes it to <session-dir>/signer-key.pem at
+// SessionStart). Used by PostToolUse subprocesses to reuse the session-scoped
+// key rather than minting a fresh one per attestation — which made
+// attestations from one session unverifiable against any pinned key
+// (issue #68).
 func (s *Signer) InitializeFromPersistedKey(keyPEM []byte, agentIdentityHash string) error {
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
