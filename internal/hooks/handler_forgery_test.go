@@ -50,7 +50,7 @@ func newSignedAttestationForSession(t *testing.T, h *Handler, sessionID, toolNam
 		ToolUseID: toolUseID,
 		Decision:  decision,
 	}
-	env, err := signer.CreateActionAttestation(t.Context(), rec, sessionID, nil, nil)
+	env, err := signer.CreateActionAttestation(t.Context(), rec, sessionID, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
 	}

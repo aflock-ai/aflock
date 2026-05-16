@@ -870,7 +870,8 @@ func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.Acti
 	}
 
 	// Create and sign attestation
-	envelope, err := s.signer.CreateActionAttestation(ctx, record, s.sessionID, metrics, s.agentIdentity, jwtBinding)
+	envelope, err := s.signer.CreateActionAttestation(ctx, record, s.sessionID, metrics, s.agentIdentity,
+		&attestation.AttestationContext{JWT: jwtBinding})
 	if err != nil {
 		return fmt.Errorf("create attestation: %w", err)
 	}

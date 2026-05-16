@@ -484,6 +484,12 @@ type SessionState struct {
 	// sublayout declarations. Used by verification to confirm a child stayed
 	// within the sublayout's promised scope (issue #26).
 	ParentSublayoutName string `json:"parent_sublayout_name,omitempty"`
+	// AttestationPrefix is the parent sublayout's AttestationPrefix string,
+	// inherited via propagation. Stamped into every attestation predicate so
+	// audit tools can group child attestations under the declared sublayout
+	// slot (issue #26 gap 1). Empty when the parent had no sublayouts or the
+	// matched sublayout didn't set a prefix.
+	AttestationPrefix string `json:"attestation_prefix,omitempty"`
 	// ChildSessionIDs tracks subagent sessions spawned from this session
 	ChildSessionIDs []string `json:"child_session_ids,omitempty"`
 	// AgentIdentityMeta stores identity discovered at SessionStart for reuse in PostToolUse
@@ -536,6 +542,10 @@ type PropagationRecord struct {
 	// session is bound to this sublayout for verification (issue #26 gaps
 	// 4 and 5).
 	SublayoutName string `json:"sublayout_name,omitempty"`
+	// AttestationPrefix carries the matched sublayout's AttestationPrefix
+	// over to the child so its PostToolUse attestations can stamp it into
+	// the predicate (issue #26 gap 1).
+	AttestationPrefix string `json:"attestation_prefix,omitempty"`
 }
 
 // IsExpiredPropagation checks if the propagation record has exceeded the given TTL.
