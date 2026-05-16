@@ -23,10 +23,13 @@ func newTestHandler(t *testing.T) *Handler {
 	return h
 }
 
-// seedSession initializes a session with the given policy and returns the session state.
+// seedSession initializes a session with the given policy and returns the
+// session state. It also establishes the per-session signing pin (issue #68)
+// the same way SessionStart does, so Stop-gate tests see realistic state.
 func seedSession(t *testing.T, h *Handler, sessionID string, pol *aflock.Policy) *aflock.SessionState {
 	t.Helper()
 	ss := h.stateManager.Initialize(sessionID, pol, "/fake/policy.aflock")
+	h.establishSessionSigner(ss, nil)
 	if err := h.stateManager.Save(ss); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}

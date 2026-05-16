@@ -3,6 +3,7 @@ package hooks
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -229,6 +230,13 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		}
 	}
 
+	// Establish the per-session attestation signing key and pin its pubkey
+	// fingerprint to session state (issue #68). Subsequent PostToolUse
+	// invocations reuse this key instead of minting one per attestation, and
+	// the Stop gate verifies attestations against the pinned pubkey rather
+	// than the envelope-embedded cert.
+	h.establishSessionSigner(sessionState, agentIdentity)
+
 	if err := h.stateManager.Save(sessionState); err != nil {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
 		return nil
@@ -237,6 +245,73 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	// Build context to inject
 	context := h.buildPolicyContext(pol, agentIdentity)
 	return output.Write(output.SessionStartContext(context))
+}
+
+// establishSessionSigner initializes the per-session attestation signer and
+// persists material that PostToolUse and the Stop gate need:
+//
+//   - signer-pubkey.pem (0600) — pubkey used by the Stop gate for verification
+//   - signer-key.pem (0600) — ephemeral private key reloaded by PostToolUse
+//     subprocesses so every attestation in the session is signed by the same
+//     pinned key
+//
+// Hooks mode is intentionally ephemeral-only. SPIRE and Fulcio are not
+// selected here because (a) Fulcio mints a fresh cert per InitializeFulcio
+// call, so its pubkey wouldn't match the SessionStart pin and the Stop gate
+// would reject every attestation, and (b) hooks-mode SPIRE/Fulcio doesn't
+// give real key separation anyway — the key lives in the same trust domain
+// as the agent (issue #62). MCP-mode still uses the SPIRE → Fulcio →
+// ephemeral fallback because that path has its own verification pipeline.
+//
+// Failures here are non-fatal: SessionStart still completes, but
+// SignerPubKeyFingerprint stays empty and the Stop gate will deny any
+// required-attestation check (fail-closed, issue #68).
+func (h *Handler) establishSessionSigner(sessionState *aflock.SessionState, agentIdentity *identity.AgentIdentity) {
+	if sessionState == nil || sessionState.SessionID == "" {
+		return
+	}
+
+	signer := attestation.NewSigner("")
+	defer signer.Close() //nolint:errcheck // best-effort cleanup
+
+	identityHash := ""
+	if agentIdentity != nil {
+		identityHash = agentIdentity.IdentityHash
+	}
+	if err := signer.InitializeEphemeral(identityHash); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: signer init failed at SessionStart: %v\n", err)
+		return
+	}
+
+	pubPEM, fingerprint, err := signer.MarshalSigningPublicKey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal signer pubkey: %v\n", err)
+		return
+	}
+	keyPEM, keyErr := signer.MarshalEphemeralKey()
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal ephemeral signer key: %v\n", keyErr)
+		return
+	}
+
+	sessionDir := h.stateManager.SessionDir(sessionState.SessionID)
+	if mkErr := os.MkdirAll(sessionDir, 0700); mkErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: create session dir for signer pubkey: %v\n", mkErr)
+		return
+	}
+	if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-pubkey.pem"), pubPEM, 0600); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write signer pubkey: %v\n", writeErr)
+		return
+	}
+	// The persisted private key is the durable session signing material —
+	// 0600 keeps it owner-only; broader permissions defeat the pin entirely.
+	if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-key.pem"), keyPEM, 0600); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write ephemeral signer key: %v\n", writeErr)
+		return
+	}
+
+	sessionState.SignerPubKeyFingerprint = fingerprint
+	sessionState.SigningMode = "ephemeral"
 }
 
 // buildPolicyContext creates context string describing the active policy.
@@ -604,20 +679,36 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		}
 	}
 
-	// Create signer — try SPIRE first, then Fulcio keyless, fall back to ephemeral key
+	// Create signer. Hooks mode always uses the per-session ephemeral key
+	// established at SessionStart (issue #68) — no SPIRE/Fulcio branches here
+	// because those mint fresh keys per call and would fail the SPKI pin.
 	signer := attestation.NewSigner("")
-	if err := signer.Initialize(context.Background()); err != nil {
-		// SPIRE not available — try Fulcio keyless (CI/CD environments with OIDC)
-		if fulcioErr := signer.InitializeFulcio(context.Background()); fulcioErr != nil {
-			// Fulcio not available — use ephemeral key
-			identityHash := ""
-			if agentIdentity != nil {
-				identityHash = agentIdentity.IdentityHash
-			}
-			if err := signer.InitializeEphemeral(identityHash); err != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable: %v\n", err)
-				return
-			}
+	signerInitialized := false
+	keyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "signer-key.pem")
+	if keyPEM, readErr := os.ReadFile(keyPath); readErr == nil { //nolint:gosec // G304: keyPath is under SessionDir
+		identityHash := ""
+		if agentIdentity != nil {
+			identityHash = agentIdentity.IdentityHash
+		}
+		if err := signer.InitializeFromPersistedKey(keyPEM, identityHash); err == nil {
+			signerInitialized = true
+		} else {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: load persisted signer key: %v\n", err)
+		}
+	}
+	if !signerInitialized {
+		// Last-resort fallback: pre-pinning sessions, or a SessionStart that
+		// failed to persist a key. Mint a fresh ephemeral key — the Stop gate
+		// will not be able to pin this key, so required-attestation enforcement
+		// will fail closed for the session, but PostToolUse still produces an
+		// attestation record on disk for forensic value.
+		identityHash := ""
+		if agentIdentity != nil {
+			identityHash = agentIdentity.IdentityHash
+		}
+		if err := signer.InitializeEphemeral(identityHash); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable: %v\n", err)
+			return
 		}
 	}
 	defer signer.Close() //nolint:errcheck // best-effort cleanup
@@ -812,6 +903,25 @@ func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *af
 		usedToolUseIDs[action.ToolName] = append(usedToolUseIDs[action.ToolName], action.ToolUseID)
 	}
 
+	// Load the per-session signing pubkey pin established at SessionStart.
+	// Without this pin we cannot tell "real attestation" from "attacker-dropped
+	// envelope signed with the attacker's own key" (issue #68). Fail-closed:
+	// if the pin is missing or doesn't match what's recorded in state, every
+	// required attestation reports as missing.
+	pin, pinErr := h.loadSessionSignerPin(sessionID, sessionState)
+	if pinErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Cannot verify required attestations: %v\n", pinErr)
+		var missing []string
+		for tool := range usedToolUseIDs {
+			for _, required := range sessionState.Policy.RequiredAttestations {
+				if tool == required {
+					missing = append(missing, required)
+				}
+			}
+		}
+		return missing
+	}
+
 	attestDir := h.stateManager.AttestationsDir(sessionID)
 	var missing []string
 	for _, required := range sessionState.Policy.RequiredAttestations {
@@ -819,11 +929,52 @@ func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *af
 		if !used {
 			continue // tool wasn't used → no attestation needed
 		}
-		if !findVerifiedAttestation(attestDir, sessionID, required, toolUseIDs) {
+		if !findVerifiedAttestation(attestDir, sessionID, required, toolUseIDs, pin) {
 			missing = append(missing, required)
 		}
 	}
 	return missing
+}
+
+// sessionSignerPin captures the trust anchor for required-attestation
+// verification within a session: the pinned public key and the expected SPKI
+// fingerprint recorded in state.json at SessionStart. Stop / SubagentStop
+// refuse any envelope whose embedded cert does not present this exact key.
+type sessionSignerPin struct {
+	pub         crypto.PublicKey
+	fingerprint string
+}
+
+// loadSessionSignerPin reads <session-dir>/signer-pubkey.pem and verifies the
+// SPKI fingerprint matches what was recorded in session state at
+// SessionStart. Any mismatch — missing file, missing recorded fingerprint,
+// fingerprint divergence — is treated as a tampered or pre-pinning session
+// and yields an error so the caller fails closed.
+func (h *Handler) loadSessionSignerPin(sessionID string, sessionState *aflock.SessionState) (*sessionSignerPin, error) {
+	if sessionState == nil || sessionState.SignerPubKeyFingerprint == "" {
+		return nil, fmt.Errorf("session %s has no pinned signer fingerprint — restart the session to re-establish the pin", sessionID)
+	}
+	pubPath := filepath.Join(h.stateManager.SessionDir(sessionID), "signer-pubkey.pem")
+	pubPEM, err := os.ReadFile(pubPath) //nolint:gosec // G304: path under SessionDir
+	if err != nil {
+		return nil, fmt.Errorf("read pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	block, _ := pem.Decode(pubPEM)
+	if block == nil {
+		return nil, fmt.Errorf("decode pinned signer pubkey for session %s: no PEM block", sessionID)
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	fp, err := attestation.SPKIFingerprint(pub)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	if fp != sessionState.SignerPubKeyFingerprint {
+		return nil, fmt.Errorf("signer pin fingerprint mismatch for session %s (signer-pubkey.pem or state.json was tampered with)", sessionID)
+	}
+	return &sessionSignerPin{pub: pub, fingerprint: fp}, nil
 }
 
 // handleStop checks if required attestations are complete.
@@ -977,14 +1128,15 @@ func (h *Handler) handlePreCompact(_ *aflock.HookInput) error {
 //  3. Payload binds to THIS session (sessionID) and THIS tool (toolName)
 //  4. Payload's toolUseID appears in the session's recorded "allow" actions
 //
-// The embedded cert is trusted by virtue of "whoever signed this had the
-// private key at the time" — which is exactly what keeps a file-drop
-// attacker without key access from forging evidence. Chain validation to an
-// external root (SPIRE/Fulcio) is a stronger mode reserved for the
-// `aflock verify` command; at runtime we use the lighter self-attested
-// signature check because the signing key that produced these files is the
-// hook process's own key, and we want to reject files NOT signed by it.
-func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs []string) bool {
+// The trust anchor is the per-session signing pubkey pinned at SessionStart
+// (issue #68). Envelopes whose embedded cert's SPKI does not match the pin
+// are rejected outright — closes the "drop a self-signed forgery in the
+// attestations dir" attack. Chain validation against an external root
+// (SPIRE/Fulcio) remains the stronger mode used by `aflock verify`.
+func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs []string, pin *sessionSignerPin) bool {
+	if pin == nil {
+		return false
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
@@ -1001,7 +1153,7 @@ func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs 
 		if !validateAttestationIntegrity(p) {
 			continue
 		}
-		if cryptographicallyVerifyAttestation(p, sessionID, toolName, allowed) {
+		if cryptographicallyVerifyAttestation(p, sessionID, toolName, allowed, pin) {
 			return true
 		}
 	}
@@ -1009,9 +1161,13 @@ func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs 
 }
 
 // cryptographicallyVerifyAttestation does the heavy lifting for
-// findVerifiedAttestation. Returns true only when the signature verifies and
-// the payload binds to the expected session and tool use.
-func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowedToolUseIDs map[string]bool) bool {
+// findVerifiedAttestation. Returns true only when the envelope was signed by
+// the per-session pinned key (issue #68) AND the payload binds to the
+// expected session and tool use.
+func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowedToolUseIDs map[string]bool, pin *sessionSignerPin) bool {
+	if pin == nil {
+		return false
+	}
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path from AttestationsDir
 	if err != nil {
 		return false
@@ -1021,28 +1177,15 @@ func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowe
 		return false
 	}
 
-	// Extract each signature's embedded leaf cert and treat them as the
-	// trusted set for this file. VerifyEnvelope handles PAE + Ed25519 /
-	// ECDSA / RSA selection and tries both spec + legacy PAE encodings.
-	var leafCerts []*x509.Certificate
-	for _, sig := range envelope.Signatures {
-		if sig.Certificate == "" {
-			continue
-		}
-		block, _ := pem.Decode([]byte(sig.Certificate))
-		if block == nil {
-			continue
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
-		}
-		leafCerts = append(leafCerts, cert)
-	}
-	if len(leafCerts) == 0 {
+	// Only accept envelopes whose embedded cert encodes the pinned pubkey.
+	// Without this gate the verifier trusts whatever key the envelope ships
+	// with, which is exactly the issue #68 forgery path (any attacker with
+	// write access to the attestations dir generates their own keypair).
+	pinnedCerts := envelopeCertsMatchingPin(&envelope, pin)
+	if len(pinnedCerts) == 0 {
 		return false
 	}
-	if err := attestation.VerifyEnvelope(&envelope, leafCerts); err != nil {
+	if err := attestation.VerifyEnvelope(&envelope, pinnedCerts); err != nil {
 		return false
 	}
 
@@ -1082,6 +1225,37 @@ func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowe
 		}
 	}
 	return true
+}
+
+// envelopeCertsMatchingPin returns the subset of certificates embedded in the
+// envelope whose SPKI hash matches the pinned fingerprint. Used by the Stop
+// gate to confine VerifyEnvelope's trusted-cert set to the session's pinned
+// key (issue #68) — without this filter VerifyEnvelope would trust whichever
+// key the envelope shipped with, which is the vulnerability we're closing.
+func envelopeCertsMatchingPin(envelope *attestation.Envelope, pin *sessionSignerPin) []*x509.Certificate {
+	if pin == nil {
+		return nil
+	}
+	var matched []*x509.Certificate
+	for _, sig := range envelope.Signatures {
+		if sig.Certificate == "" {
+			continue
+		}
+		block, _ := pem.Decode([]byte(sig.Certificate))
+		if block == nil {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		fp, err := attestation.SPKIFingerprint(cert.PublicKey)
+		if err != nil || fp != pin.fingerprint {
+			continue
+		}
+		matched = append(matched, cert)
+	}
+	return matched
 }
 
 // findAttestation checks if a structurally valid attestation file exists for the given name.

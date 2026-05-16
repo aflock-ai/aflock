@@ -481,6 +481,19 @@ type SessionState struct {
 	// AuthToken is the JWT issued at SessionStart for request-level authorization.
 	// Scoped to the session, agent identity, and policy grants.
 	AuthToken string `json:"auth_token,omitempty"`
+	// SignerPubKeyFingerprint is the hex-encoded SHA-256 of the SPKI for the
+	// per-session attestation signing pubkey persisted at SessionStart. The
+	// Stop gate uses this to reject attestations signed by any key other than
+	// the pinned one (issue #68). Empty for legacy sessions established
+	// before pinning was introduced.
+	SignerPubKeyFingerprint string `json:"signer_pubkey_fingerprint,omitempty"`
+	// SigningMode records how the session's signing key was established.
+	// Hooks mode always sets this to "ephemeral" today (see
+	// establishSessionSigner in internal/hooks/handler.go for why SPIRE/Fulcio
+	// aren't selected in hooks). The field is kept on the wire so future
+	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
+	// behavior without a state-shape migration.
+	SigningMode string `json:"signing_mode,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.

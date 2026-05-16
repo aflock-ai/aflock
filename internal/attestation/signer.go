@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -117,6 +118,118 @@ func (s *Signer) InitializeEphemeral(agentIdentityHash string) error {
 // GetSigningIdentity returns the identity to use for signing.
 func (s *Signer) GetSigningIdentity() (*identity.Identity, string) {
 	return s.identity, ""
+}
+
+// InitializeFromPersistedKey reconstructs an ephemeral signing identity from
+// a PEM-encoded ECDSA P-256 private key previously written via
+// MarshalEphemeralKey (the hook writes it to <session-dir>/signer-key.pem at
+// SessionStart). Used by PostToolUse subprocesses to reuse the session-scoped
+// key rather than minting a fresh one per attestation — which made
+// attestations from one session unverifiable against any pinned key
+// (issue #68).
+func (s *Signer) InitializeFromPersistedKey(keyPEM []byte, agentIdentityHash string) error {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return fmt.Errorf("decode signer key PEM: no PEM block found")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse persisted EC private key: %w", err)
+	}
+
+	serialMax := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialMax)
+	if err != nil {
+		return fmt.Errorf("generate certificate serial: %w", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return fmt.Errorf("create ephemeral certificate: %w", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return fmt.Errorf("parse ephemeral certificate: %w", err)
+	}
+
+	spiffeID, err := spiffeid.FromString(fmt.Sprintf("spiffe://aflock.ai/agent/ephemeral/%s", agentIdentityHash))
+	if err != nil {
+		spiffeID = spiffeid.RequireFromString("spiffe://aflock.ai/agent/ephemeral/unknown")
+	}
+
+	s.identity = &identity.Identity{
+		SPIFFEID:    spiffeID,
+		Certificate: cert,
+		PrivateKey:  key,
+		ExpiresAt:   template.NotAfter,
+	}
+	return nil
+}
+
+// MarshalEphemeralKey returns the PEM-encoded SEC1 representation of the
+// ephemeral private key, for persistence at SessionStart. Errors if the
+// signer is not in ephemeral mode (SPIRE/Fulcio private keys are not
+// exportable through this path).
+func (s *Signer) MarshalEphemeralKey() ([]byte, error) {
+	if s.identity == nil || s.identity.PrivateKey == nil {
+		return nil, fmt.Errorf("no signing identity available")
+	}
+	key, ok := s.identity.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("ephemeral key export only supported for ECDSA keys (got %T)", s.identity.PrivateKey)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EC private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
+}
+
+// MarshalSigningPublicKey returns the PEM-encoded PKIX representation of the
+// signer's public key plus the hex SHA-256 of the SPKI bytes. Used by the
+// Stop gate as the pin (issue #68): the gate refuses any attestation whose
+// signing cert's SPKI hash does not match this fingerprint.
+func (s *Signer) MarshalSigningPublicKey() (pubPEM []byte, spkiFingerprint string, err error) {
+	if s.identity == nil {
+		return nil, "", fmt.Errorf("no signing identity available")
+	}
+	var pubKey crypto.PublicKey
+	switch {
+	case s.identity.Certificate != nil:
+		pubKey = s.identity.Certificate.PublicKey
+	case s.identity.PrivateKey != nil:
+		signer, ok := s.identity.PrivateKey.(crypto.Signer)
+		if !ok {
+			return nil, "", fmt.Errorf("private key does not implement crypto.Signer (got %T)", s.identity.PrivateKey)
+		}
+		pubKey = signer.Public()
+	default:
+		return nil, "", fmt.Errorf("no public key material available")
+	}
+	spkiDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal PKIX public key: %w", err)
+	}
+	sum := sha256.Sum256(spkiDER)
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: spkiDER}), hex.EncodeToString(sum[:]), nil
+}
+
+// SPKIFingerprint computes the hex-encoded SHA-256 of a public key's PKIX
+// SubjectPublicKeyInfo encoding. Exported so the Stop gate can compute
+// fingerprints of envelope-embedded certs and compare them to the pin
+// recorded in session state.
+func SPKIFingerprint(pub crypto.PublicKey) (string, error) {
+	spkiDER, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("marshal PKIX public key: %w", err)
+	}
+	sum := sha256.Sum256(spkiDER)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // Close releases resources and securely wipes ephemeral key material from
