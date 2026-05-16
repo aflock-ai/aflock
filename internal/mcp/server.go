@@ -849,13 +849,17 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 
 // signAndStoreAttestation creates a signed attestation for an action and stores it to disk.
 //
-// jwtBinding may be nil — for graceful-adoption calls that arrived before
-// any get_token, or for paths where no JWT was presented. When non-nil it
-// is embedded in the predicate so verifiers can prove the action was
-// signed only under the listed token scope (issue #40).
+// jwtBinding is required once authActive is true — i.e., after the first
+// successful get_token. Before that ("graceful adoption"), nil is accepted
+// to preserve the documented pre-bootstrap window. This closes the issue
+// #40 gap where any caller could mint an attestation regardless of JWT
+// scope as long as it happened to bypass the tool-handler validation path.
 func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.ActionRecord, jwtBinding *attestation.JWTBinding) error {
 	if !s.signingEnabled {
 		return fmt.Errorf("attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)")
+	}
+	if jwtBinding == nil && s.authActive.Load() {
+		return fmt.Errorf("JWT required for attestation signing once auth is active (issue #40)")
 	}
 
 	// Get session metrics
@@ -1495,10 +1499,17 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 
 // handleSignAttestation signs an attestation for arbitrary data.
 func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) { //nolint:gocognit // attestation signing requires complex validation
-	// JWT authorization check — signing is the most sensitive operation
-	if claims, err := s.validateJWT(request); err != nil {
+	// JWT authorization check — signing is the most sensitive operation.
+	// Issue #40: once authActive is true, claims must be present (no
+	// graceful-adoption escape for the explicit signing tool).
+	claims, err := s.validateJWT(request)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
-	} else if claims != nil && !auth.IsToolAllowed("sign_attestation", claims.AllowedTools, claims.DeniedTools) {
+	}
+	if claims == nil && s.authActive.Load() {
+		return mcp.NewToolResultError("Authorization denied: sign_attestation requires a valid JWT once auth is active (issue #40)"), nil
+	}
+	if claims != nil && !auth.IsToolAllowed("sign_attestation", claims.AllowedTools, claims.DeniedTools) {
 		return mcp.NewToolResultError("Authorization denied: tool 'sign_attestation' not permitted by token scope"), nil
 	}
 
