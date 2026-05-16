@@ -730,9 +730,16 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 	// Build the JWT binding for the attestation predicate (#40). PreToolUse
 	// already validated the token (#48); we re-validate here so the binding
 	// reflects ground truth at signing time, not state captured upstream.
-	// Failure to validate skips the binding but still produces an attestation
-	// — consistent with "attestation is evidence, not enforcement."
 	jwtBinding := h.buildJWTBindingForSession(sessionState)
+
+	// Issue #40 hardening: if SessionStart issued a JWT for this session
+	// (the normal path), refuse to sign without a successful JWT binding.
+	// Sessions without an AuthToken (legacy / no-policy) keep the old
+	// behavior so this is not a backward-incompatible break.
+	if sessionState.AuthToken != "" && jwtBinding == nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Skipping attestation: JWT validation failed at signing time (issue #40)\n")
+		return
+	}
 
 	// Create signed attestation
 	envelope, err := signer.CreateActionAttestation(
