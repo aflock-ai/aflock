@@ -111,9 +111,9 @@ func TestPropagation_TTLExpiration(t *testing.T) {
 		t.Fatalf("WritePropagation: %v", err)
 	}
 
-	// Tamper with the file to set an old CreatedAt
-	key := propagationKey(parent.PolicyPath)
-	path := filepath.Join(propagationBaseDir(), key)
+	// Tamper with the file to set an old CreatedAt. Files now have a random
+	// per-write suffix (issue #26 gap 6) so look up by the policy's prefix.
+	path := singlePropagationFile(t, parent.PolicyPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read propagation file: %v", err)
@@ -179,12 +179,13 @@ func TestPropagation_MalformedJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(tmpDir)
 
-	// Write garbage to the propagation file
+	// Write garbage to the propagation file. Use the prefix-only key form so
+	// ReadPropagation finds it via its enumeration step (issue #26 gap 6).
 	dir := propagationBaseDir()
-	os.MkdirAll(dir, 0700)
-	key := propagationKey("/project/.aflock")
-	path := filepath.Join(dir, key)
-	os.WriteFile(path, []byte("not json{{{"), 0600)
+	_ = os.MkdirAll(dir, 0700)
+	prefix := propagationKeyPrefix("/project/.aflock")
+	path := filepath.Join(dir, prefix+".garbage.json")
+	_ = os.WriteFile(path, []byte("not json{{{"), 0600)
 
 	rec, err := m.ReadPropagation("/project/.aflock")
 	if err == nil {
@@ -331,14 +332,46 @@ func TestPropagation_ConcurrentConsumeOnce(t *testing.T) {
 }
 
 func TestPropagationKey_Deterministic(t *testing.T) {
-	k1 := propagationKey("/project/.aflock")
-	k2 := propagationKey("/project/.aflock")
+	k1 := propagationKeyPrefix("/project/.aflock")
+	k2 := propagationKeyPrefix("/project/.aflock")
 	if k1 != k2 {
-		t.Errorf("same path should produce same key: %q != %q", k1, k2)
+		t.Errorf("same path should produce same prefix: %q != %q", k1, k2)
 	}
 
-	k3 := propagationKey("/other/.aflock")
+	k3 := propagationKeyPrefix("/other/.aflock")
 	if k1 == k3 {
-		t.Error("different paths should produce different keys")
+		t.Error("different paths should produce different prefixes")
 	}
+}
+
+// singlePropagationFile locates the single propagation file under the test's
+// state dir for the given policy path, failing if there is none or more than
+// one. Helper for tests that need to introspect or tamper with the on-disk
+// file when filenames carry a random per-write suffix (issue #26 gap 6).
+func singlePropagationFile(t *testing.T, policyPath string) string {
+	t.Helper()
+	prefix := propagationKeyPrefix(policyPath)
+	dir := propagationBaseDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read propagation dir: %v", err)
+	}
+	var found []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) < len(prefix)+1 || name[:len(prefix)] != prefix || name[len(prefix)] != '.' {
+			continue
+		}
+		if containsConsumedMarker(name) {
+			continue
+		}
+		found = append(found, filepath.Join(dir, name))
+	}
+	if len(found) != 1 {
+		t.Fatalf("expected exactly 1 propagation file for %q, got %d", policyPath, len(found))
+	}
+	return found[0]
 }
