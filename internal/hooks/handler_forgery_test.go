@@ -21,11 +21,23 @@ import (
 // (hooks-mode signing key lives in the agent's trust domain).
 
 // Helper: produce a valid signed attestation using the ephemeral signer so
-// the test is independent of SPIRE/Fulcio availability.
-func newSignedAttestation(t *testing.T, sessionID, toolName, toolUseID, decision string) *attestation.Envelope {
+// the test is independent of SPIRE/Fulcio availability. Pass a non-empty
+// handler if the attestation needs to be signed with a session's pinned
+// key (issue #68) — pass nil to use a fresh ephemeral key, which is what
+// cross-session-replay and foreign-key-forgery tests want.
+func newSignedAttestationForSession(t *testing.T, h *Handler, sessionID, toolName, toolUseID, decision string) *attestation.Envelope {
 	t.Helper()
 	signer := attestation.NewSigner("")
-	if err := signer.InitializeEphemeral("test-identity"); err != nil {
+	if h != nil {
+		keyPath := filepath.Join(h.stateManager.SessionDir(sessionID), "signer-key.pem")
+		keyPEM, err := os.ReadFile(keyPath)
+		if err != nil {
+			t.Fatalf("read pinned signer key: %v", err)
+		}
+		if err := signer.InitializeFromPersistedKey(keyPEM, "test-identity"); err != nil {
+			t.Fatalf("InitializeFromPersistedKey: %v", err)
+		}
+	} else if err := signer.InitializeEphemeral("test-identity"); err != nil {
 		t.Fatalf("InitializeEphemeral: %v", err)
 	}
 	t.Cleanup(func() { _ = signer.Close() })
@@ -130,8 +142,9 @@ func TestHandleStop_RejectsStructurallyValidButCryptoInvalid(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	// Build a real envelope, then corrupt the signature so crypto check fails.
-	env := newSignedAttestation(t, "session-forged-crypto", "Bash", "tu-crypto-1", "allow")
+	// Build a real envelope (signed by the session's pinned key), then corrupt
+	// the signature so the crypto check fails after the SPKI pin matches.
+	env := newSignedAttestationForSession(t, h, "session-forged-crypto", "Bash", "tu-crypto-1", "allow")
 	// Replace sig bytes with junk (still base64-valid, different length).
 	env.Signatures[0].Sig = base64.StdEncoding.EncodeToString([]byte("wrong-signature-bytes"))
 
@@ -178,8 +191,9 @@ func TestHandleStop_RejectsCrossSessionReplay(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	// Produce a valid attestation signed under session A and drop it in B's dir.
-	envA := newSignedAttestation(t, "session-A-different", "Bash", "tu-A", "allow")
+	// Produce a valid attestation signed under session A (different key, not
+	// B's pin) and drop it in B's dir.
+	envA := newSignedAttestationForSession(t, nil, "session-A-different", "Bash", "tu-A", "allow")
 	attestDirB := h.stateManager.AttestationsDir("session-B")
 	writeEnvelope(t, filepath.Join(attestDirB, "Bash.intoto.json"), envA)
 
@@ -216,7 +230,7 @@ func TestHandleStop_AcceptsLegitimateAttestation(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	env := newSignedAttestation(t, "session-legit", "Bash", "tu-legit", "allow")
+	env := newSignedAttestationForSession(t, h, "session-legit", "Bash", "tu-legit", "allow")
 	attestDir := h.stateManager.AttestationsDir("session-legit")
 	writeEnvelope(t, filepath.Join(attestDir, "Bash.intoto.json"), env)
 
@@ -233,6 +247,138 @@ func TestHandleStop_AcceptsLegitimateAttestation(t *testing.T) {
 	}
 	if out.Decision == "block" {
 		t.Errorf("legitimate attestation must satisfy Stop gate, got block: %s", out.Reason)
+	}
+}
+
+// TestHandleStop_RejectsForeignKeyForgery reproduces the issue #68 attack:
+// an attacker who can only write into the attestations dir generates their
+// own keypair + self-signed cert, signs a DSSE envelope binding to the
+// session's recorded toolUseID, embeds the self-signed cert, and drops the
+// file. The Stop gate must reject because the cert's SPKI does not match
+// the pin established at SessionStart.
+func TestHandleStop_RejectsForeignKeyForgery(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name:                 "issue-68",
+		Tools:                &aflock.ToolsPolicy{Allow: []string{"Bash"}},
+		RequiredAttestations: []string{"Bash"},
+	}
+	ss := seedSession(t, h, "session-issue-68", pol)
+	ss.Actions = append(ss.Actions, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Bash", ToolUseID: "tu-victim", Decision: "allow",
+	})
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Attacker mints their own signer and produces a fully-valid envelope
+	// bound to the victim session/tool/toolUseID. Same shape as the
+	// reproduction sketch in the issue.
+	forgedEnv := newSignedAttestationForSession(t, nil, "session-issue-68", "Bash", "tu-victim", "allow")
+	attestDir := h.stateManager.AttestationsDir("session-issue-68")
+	writeEnvelope(t, filepath.Join(attestDir, "Bash.intoto.json"), forgedEnv)
+
+	input := &aflock.HookInput{SessionID: "session-issue-68"}
+	got := captureStdout(t, func() {
+		if err := h.handleStop(input); err != nil {
+			t.Fatalf("handleStop: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.Decision != "block" {
+		t.Errorf("foreign-key forgery must NOT satisfy Stop gate, got decision=%q reason=%q", out.Decision, out.Reason)
+	}
+}
+
+// TestHandleStop_FailsClosedOnMissingPin guards the "delete the pin and
+// drop a forgery" extension of the issue #68 attack: if signer-pubkey.pem or
+// the recorded fingerprint is missing, the gate must deny rather than fall
+// back to today's "trust whatever cert ships in the envelope" behavior.
+func TestHandleStop_FailsClosedOnMissingPin(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name:                 "pin-missing",
+		Tools:                &aflock.ToolsPolicy{Allow: []string{"Bash"}},
+		RequiredAttestations: []string{"Bash"},
+	}
+	ss := seedSession(t, h, "session-no-pin", pol)
+	ss.Actions = append(ss.Actions, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Bash", ToolUseID: "tu-x", Decision: "allow",
+	})
+	// Wipe the pin: simulate a session created before pinning or a
+	// state.json deliberately stripped of its fingerprint.
+	ss.SignerPubKeyFingerprint = ""
+	ss.SigningMode = ""
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := os.Remove(filepath.Join(h.stateManager.SessionDir("session-no-pin"), "signer-pubkey.pem")); err != nil {
+		t.Fatalf("remove pubkey: %v", err)
+	}
+
+	// Even a "valid" envelope (signed by a fresh ephemeral key) must NOT
+	// satisfy the gate when the pin is gone.
+	env := newSignedAttestationForSession(t, nil, "session-no-pin", "Bash", "tu-x", "allow")
+	writeEnvelope(t, filepath.Join(h.stateManager.AttestationsDir("session-no-pin"), "Bash.intoto.json"), env)
+
+	input := &aflock.HookInput{SessionID: "session-no-pin"}
+	got := captureStdout(t, func() {
+		if err := h.handleStop(input); err != nil {
+			t.Fatalf("handleStop: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.Decision != "block" {
+		t.Errorf("missing pin must fail closed, got decision=%q", out.Decision)
+	}
+}
+
+// TestHandleStop_FailsClosedOnTamperedFingerprint guards against an attacker
+// who can modify state.json: changing the recorded fingerprint to something
+// they control must be detected (the on-disk pubkey's actual SPKI hash
+// won't match the tampered field).
+func TestHandleStop_FailsClosedOnTamperedFingerprint(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name:                 "pin-tampered",
+		Tools:                &aflock.ToolsPolicy{Allow: []string{"Bash"}},
+		RequiredAttestations: []string{"Bash"},
+	}
+	ss := seedSession(t, h, "session-tampered", pol)
+	ss.Actions = append(ss.Actions, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Bash", ToolUseID: "tu-y", Decision: "allow",
+	})
+	// Overwrite the recorded fingerprint with a value that does not match
+	// the persisted signer-pubkey.pem.
+	ss.SignerPubKeyFingerprint = strings.Repeat("0", 64)
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	env := newSignedAttestationForSession(t, h, "session-tampered", "Bash", "tu-y", "allow")
+	writeEnvelope(t, filepath.Join(h.stateManager.AttestationsDir("session-tampered"), "Bash.intoto.json"), env)
+
+	input := &aflock.HookInput{SessionID: "session-tampered"}
+	got := captureStdout(t, func() {
+		if err := h.handleStop(input); err != nil {
+			t.Fatalf("handleStop: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.Decision != "block" {
+		t.Errorf("tampered fingerprint must fail closed, got decision=%q", out.Decision)
 	}
 }
 

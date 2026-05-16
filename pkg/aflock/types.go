@@ -481,6 +481,16 @@ type SessionState struct {
 	// AuthToken is the JWT issued at SessionStart for request-level authorization.
 	// Scoped to the session, agent identity, and policy grants.
 	AuthToken string `json:"auth_token,omitempty"`
+	// SignerPubKeyFingerprint is the hex-encoded SHA-256 of the SPKI for the
+	// per-session attestation signing pubkey persisted at SessionStart. The
+	// Stop gate uses this to reject attestations signed by any key other than
+	// the pinned one (issue #68). Empty for legacy sessions established
+	// before pinning was introduced.
+	SignerPubKeyFingerprint string `json:"signer_pubkey_fingerprint,omitempty"`
+	// SigningMode records how the session's signing key was established:
+	// "ephemeral", "spire", "fulcio". Determines how the Stop gate verifies
+	// attestations.
+	SigningMode string `json:"signing_mode,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.
