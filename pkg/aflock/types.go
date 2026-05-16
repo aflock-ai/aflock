@@ -479,6 +479,11 @@ type SessionState struct {
 	Materials []MaterialClassification `json:"materials,omitempty"`
 	// ParentSessionID is set when this session was spawned by a parent agent
 	ParentSessionID string `json:"parent_session_id,omitempty"`
+	// ParentSublayoutName is the name of the parent's declared sublayout this
+	// child was bound to at spawn time. Empty when the parent had no
+	// sublayout declarations. Used by verification to confirm a child stayed
+	// within the sublayout's promised scope (issue #26).
+	ParentSublayoutName string `json:"parent_sublayout_name,omitempty"`
 	// ChildSessionIDs tracks subagent sessions spawned from this session
 	ChildSessionIDs []string `json:"child_session_ids,omitempty"`
 	// AgentIdentityMeta stores identity discovered at SessionStart for reuse in PostToolUse
@@ -525,6 +530,12 @@ type PropagationRecord struct {
 	ParentMetrics   *SessionMetrics          `json:"parent_metrics"`
 	ParentLimits    *LimitsPolicy            `json:"parent_limits,omitempty"`
 	CreatedAt       time.Time                `json:"created_at"`
+	// SublayoutName is the name of the declared parent sublayout this spawn
+	// was matched against at PreToolUse time. Empty when the parent declared
+	// no sublayouts (legacy / unconstrained delegation). When set, the child
+	// session is bound to this sublayout for verification (issue #26 gaps
+	// 4 and 5).
+	SublayoutName string `json:"sublayout_name,omitempty"`
 }
 
 // IsExpiredPropagation checks if the propagation record has exceeded the given TTL.

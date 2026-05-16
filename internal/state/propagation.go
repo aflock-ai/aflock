@@ -60,10 +60,23 @@ func propagationFilename(policyPath string) (string, error) {
 }
 
 // WritePropagation writes a propagation file so that a child session can
-// inherit the parent's materials, metrics, and attenuated limits. Each call
-// produces a distinct file (issue #26 gap 6) — concurrent spawns of the
-// same policy no longer overwrite each other.
+// inherit the parent's materials, metrics, and attenuated limits. Used when
+// the parent declares no sublayouts (legacy / unconstrained delegation).
+// Each call produces a distinct file (issue #26 gap 6) — concurrent spawns
+// of the same policy no longer overwrite each other.
 func (m *Manager) WritePropagation(parentState *aflock.SessionState) error {
+	return m.writePropagationRecord(parentState, nil)
+}
+
+// WritePropagationForSublayout writes a propagation file scoped to the
+// matched sublayout (issue #26). The propagated ParentLimits are the
+// sublayout's promised ceiling, not the parent's full limits — so the child
+// is bound to the slice of authority the policy explicitly delegated.
+func (m *Manager) WritePropagationForSublayout(parentState *aflock.SessionState, sub *aflock.Sublayout) error {
+	return m.writePropagationRecord(parentState, sub)
+}
+
+func (m *Manager) writePropagationRecord(parentState *aflock.SessionState, sub *aflock.Sublayout) error {
 	dir := propagationBaseDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create propagation dir: %w", err)
@@ -76,7 +89,11 @@ func (m *Manager) WritePropagation(parentState *aflock.SessionState) error {
 		ParentMetrics:   parentState.Metrics,
 		CreatedAt:       time.Now(),
 	}
-	if parentState.Policy != nil {
+	switch {
+	case sub != nil:
+		rec.ParentLimits = sub.Limits
+		rec.SublayoutName = sub.Name
+	case parentState.Policy != nil:
 		rec.ParentLimits = parentState.Policy.Limits
 	}
 
