@@ -257,6 +257,12 @@ func (s *Server) Serve(policyPath string) error {
 		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
 	}
 
+	// On transport close, fold any trailing assistant turns from the JSONL
+	// into session metrics. Per-tool-call applyUsageDelta stops firing
+	// after the LAST tool call, so claude's wrap-up message would
+	// otherwise be missing from state.json in MCP-only deployments.
+	defer s.settleFinalUsageOnExit()
+
 	// Serve on stdio
 	return server.ServeStdio(s.mcpServer)
 }
@@ -401,6 +407,10 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	fmt.Fprintf(os.Stderr, "[aflock] MCP server listening on http://%s/sse\n", addr)
 	fmt.Fprintf(os.Stderr, "[aflock] Session ID: %s (state will persist across calls)\n", s.sessionID)
 	fmt.Fprintf(os.Stderr, "[aflock] HTTP bootstrap secret: %s (0600 — pass via _bootstrap arg on get_token)\n", s.httpBootstrapSecretPath)
+
+	// On transport close, fold any trailing assistant turns from the JSONL
+	// into session metrics. See settleFinalUsageOnExit for the reasoning.
+	defer s.settleFinalUsageOnExit()
 
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
 }
@@ -611,6 +621,10 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
 	}
+
+	// On transport close, fold any trailing assistant turns from the JSONL
+	// into session metrics. See settleFinalUsageOnExit for the reasoning.
+	defer s.settleFinalUsageOnExit()
 
 	// Serve a single MCP session as JSON-RPC over the UDS connection. The
 	// connection is both Reader and Writer — same framing the stdio transport
@@ -1731,6 +1745,30 @@ func (s *Server) applyUsageDelta(sessionState *aflock.SessionState) {
 	s.stateManager.UpdateMetrics(sessionState, delta.InputTokens, delta.OutputTokens, cost)
 	for i := 0; i < delta.AssistantTurns; i++ {
 		s.stateManager.IncrementTurns(sessionState)
+	}
+}
+
+// settleFinalUsageOnExit reads any trailing assistant turns from the JSONL
+// at transport-close time. applyUsageDelta on the MCP path fires inside
+// recordAction (per tool call), so the FINAL assistant message after the
+// last tool call goes unread — claude wrote it but no tool call followed
+// to trigger another delta. In MCP-only deployments (no hooks) that gap
+// stays open. Calling this from a defer in Serve/ServeUnix/ServeHTTP
+// closes it. Hooks-configured deployments still get a second pass via
+// handler.settleFinalUsage at SessionEnd; running both is idempotent
+// because ReadDelta's byte-offset memoization makes the second read a
+// no-op.
+func (s *Server) settleFinalUsageOnExit() {
+	if s.policy == nil {
+		return
+	}
+	sessionState, err := s.stateManager.Load(s.sessionID)
+	if err != nil || sessionState == nil {
+		return
+	}
+	s.applyUsageDelta(sessionState)
+	if err := s.stateManager.Save(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session on exit: %v\n", err)
 	}
 }
 
