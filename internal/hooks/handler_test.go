@@ -14,13 +14,34 @@ import (
 )
 
 // newTestHandler creates a Handler with state rooted in a temp directory.
+//
+// Note: propagation files live at ~/.aflock/propagation/ regardless of the
+// test's tmp state dir (pre-existing — see internal/state/propagation.go).
+// Multiple tests share that directory. Under PR #114's accumulate-per-write
+// semantics, a leftover from a prior test will be picked up by a later
+// test's FIFO ReadPropagation. Scrub at start and end of every test using
+// this helper so tests are deterministic.
 func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
+	scrubSharedPropagation()
+	t.Cleanup(scrubSharedPropagation)
 	tmpDir := t.TempDir()
 	h := &Handler{
 		stateManager: state.NewManager(tmpDir),
 	}
 	return h
+}
+
+// scrubSharedPropagation removes every file under ~/.aflock/propagation/ so
+// the next test starts with an empty pool. Safe because handler tests are
+// not parallel and the propagation dir holds no production state during a
+// test run.
+func scrubSharedPropagation() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(home, ".aflock", "propagation"))
 }
 
 // seedSession initializes a session with the given policy and returns the
