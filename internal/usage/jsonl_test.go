@@ -390,12 +390,15 @@ func TestTracker_CacheTiersFallback(t *testing.T) {
 	}
 }
 
-// TestTracker_SyntheticModelFilteredFromCumulative verifies that the
-// "<synthetic>" sentinel claude-code injects for self-emitted messages
-// (compaction summaries, system prompts) does NOT leak into
-// Cumulative.Model. The field feeds pricing lookup, so surfacing
-// "<synthetic>" would break cost estimation.
-func TestTracker_SyntheticModelFilteredFromCumulative(t *testing.T) {
+// TestTracker_SyntheticRowsSkipped verifies that claude-code's
+// "<synthetic>" injections (e.g. the "No response requested." row that
+// can land in the JSONL after /exit, compaction-summary placeholders) do
+// NOT contribute to Cumulative — neither as turns nor tokens. They're
+// internal markers for a no-API-call event, so counting them would
+// inflate maxTurns enforcement on noise and let a race where the
+// post-/exit injection arrives after the MCP transport closes show up
+// as a phantom turn.
+func TestTracker_SyntheticRowsSkipped(t *testing.T) {
 	tmp := t.TempDir()
 	jsonl := filepath.Join(tmp, "s.jsonl")
 	real := `{"type":"assistant","requestId":"req_R","message":{"id":"msg_R","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":5,"output_tokens":7}}}` + "\n"
@@ -405,12 +408,14 @@ func TestTracker_SyntheticModelFilteredFromCumulative(t *testing.T) {
 	}
 	tr := NewTracker(jsonl, tmp)
 	d, _ := tr.ReadDelta()
-	if d.Model != "claude-opus-4-7" {
-		t.Errorf("expected real model on Cumulative, got %q", d.Model)
+	if d.AssistantTurns != 1 {
+		t.Errorf("expected 1 real turn (synthetic dropped), got %d", d.AssistantTurns)
 	}
-	// Tokens from both rows still count — only the model name is filtered.
-	if d.AssistantTurns != 2 || d.InputTokens != 6 || d.OutputTokens != 8 {
-		t.Errorf("expected both rows to contribute usage, got %+v", d)
+	if d.InputTokens != 5 || d.OutputTokens != 7 {
+		t.Errorf("expected only real-row tokens, got input=%d output=%d", d.InputTokens, d.OutputTokens)
+	}
+	if d.Model != "claude-opus-4-7" {
+		t.Errorf("expected real model, got %q", d.Model)
 	}
 }
 

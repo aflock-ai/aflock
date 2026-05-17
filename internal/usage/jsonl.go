@@ -324,6 +324,15 @@ func parseRows(b []byte) []assistantRow {
 		if entry.Message == nil || entry.Message.Usage == nil {
 			continue
 		}
+		// Skip claude-code's "<synthetic>" injections entirely. These rows
+		// (e.g. "No response requested." after /exit, compaction-summary
+		// placeholders) carry zero usage and represent no real LLM call,
+		// so counting them inflates the turn count and trips maxTurns on
+		// noise. Also avoids a race: claude-code can write the synthetic
+		// row AFTER the MCP transport closes, past aflock's exit-defer.
+		if entry.Message.Model == "<synthetic>" {
+			continue
+		}
 		row := assistantRow{
 			messageID:    entry.Message.ID,
 			requestID:    entry.RequestID,
@@ -332,7 +341,7 @@ func parseRows(b []byte) []assistantRow {
 			outputTokens: entry.Message.Usage.OutputTokens,
 			cacheRead:    entry.Message.Usage.CacheReadInputTokens,
 			cacheTotal:   entry.Message.Usage.CacheCreationInputTokens,
-			model:        normalizeModel(entry.Message.Model),
+			model:        entry.Message.Model,
 		}
 		// Anthropic prompt caching has two write tiers with different
 		// pricing. The top-level cache_creation_input_tokens equals
@@ -383,15 +392,3 @@ type jsonlCacheCreation struct {
 	Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
 }
 
-// normalizeModel filters out claude-code's "<synthetic>" sentinel, which
-// marks self-injected messages (compaction summaries, system prompts)
-// rather than real inference. Cumulative.Model feeds pricing lookup, so
-// surfacing the sentinel would either fail the lookup or produce a
-// nonsensical cost. Returns "" for synthetic rows; callers fall back to
-// any other non-empty model seen in the session.
-func normalizeModel(model string) string {
-	if model == "<synthetic>" {
-		return ""
-	}
-	return model
-}
