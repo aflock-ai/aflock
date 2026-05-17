@@ -177,13 +177,14 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to read propagation: %v\n", propErr)
 	} else if prop != nil {
 		sessionState.ParentSessionID = prop.ParentSessionID
+		sessionState.ParentSublayoutName = prop.SublayoutName
 		sessionState.Materials = prop.Materials
 		if prop.ParentLimits != nil && prop.ParentMetrics != nil {
 			sessionState.Policy.Limits = attenuateLimits(
 				sessionState.Policy.Limits, prop.ParentLimits, prop.ParentMetrics)
 		}
-		fmt.Fprintf(os.Stderr, "[aflock] Inherited %d materials from parent session %s\n",
-			len(prop.Materials), prop.ParentSessionID)
+		fmt.Fprintf(os.Stderr, "[aflock] Inherited %d materials from parent session %s (sublayout=%q)\n",
+			len(prop.Materials), prop.ParentSessionID, prop.SublayoutName)
 	}
 
 	// Issue JWT for this session — binds agent identity, policy, and grants
@@ -541,11 +542,32 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
 	}
 
-	// If this is a subagent spawn, write propagation file so the child
-	// session inherits materials and attenuated limits (Section 5: sublayout delegation).
-	if isSubagentSpawn(input.ToolName) && sessionState.PolicyPath != "" {
-		if err := h.stateManager.WritePropagation(sessionState); err != nil {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+	// If this is a subagent spawn, match it against declared sublayouts and
+	// either refuse or bind propagation accordingly (issue #26 gaps 4 + 5).
+	if isSubagentSpawn(input.ToolName) && sessionState.PolicyPath != "" && sessionState.Policy != nil {
+		matched, hasDecl := matchSublayoutForSpawn(input.ToolName, input.ToolInput, sessionState.Policy.Sublayouts)
+		switch {
+		case hasDecl && matched == nil:
+			// Sublayouts declared but spawn does not match any of them — R3-291.
+			return output.Write(output.PreToolUseDeny(fmt.Sprintf(
+				"[aflock] BLOCKED: subagent spawn does not match any declared sublayout (tool=%s)",
+				input.ToolName)))
+		case hasDecl && matched != nil:
+			// Sublayout limits must already attenuate vs parent's limits;
+			// refusing at spawn time means a bad policy can't slip through.
+			if violations := attenuationViolations(sessionState.Policy.Limits, matched.Limits); len(violations) > 0 {
+				return output.Write(output.PreToolUseDeny(fmt.Sprintf(
+					"[aflock] BLOCKED: sublayout %q violates parent attenuation: %s",
+					matched.Name, strings.Join(violations, "; "))))
+			}
+			if err := h.stateManager.WritePropagationForSublayout(sessionState, matched); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+			}
+		default:
+			// No sublayout declarations — keep legacy unconstrained behavior.
+			if err := h.stateManager.WritePropagation(sessionState); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+			}
 		}
 	}
 
@@ -1441,6 +1463,67 @@ func attestationMatchesName(path, name string) bool {
 // isSubagentSpawn returns true if the tool triggers a subagent spawn.
 func isSubagentSpawn(toolName string) bool {
 	return toolName == "Agent" || toolName == "Task"
+}
+
+// matchSublayoutForSpawn finds the declared sublayout this spawn should bind
+// to (issue #26 gap 5). Match key is the Task tool's subagent_type field
+// against Sublayout.Name; Agent spawns without a typed sub_agent_type don't
+// carry a binding signal today and match nothing.
+//
+// Returns (matched, hasDeclarations):
+//   - hasDeclarations=false when the parent policy declared no sublayouts —
+//     keeps the pre-issue-#26 behavior (unconstrained delegation, propagation
+//     written with parent's own limits).
+//   - hasDeclarations=true, matched=nil when sublayouts exist but the spawn
+//     didn't match any of them — PreToolUse refuses the spawn (R3-291).
+//   - hasDeclarations=true, matched!=nil when a sublayout name matches —
+//     propagation uses the sublayout's promised limits.
+func matchSublayoutForSpawn(toolName string, toolInput json.RawMessage, sublayouts []aflock.Sublayout) (matched *aflock.Sublayout, hasDeclarations bool) {
+	if len(sublayouts) == 0 {
+		return nil, false
+	}
+	subagentType := ""
+	if (toolName == "Task" || toolName == "Agent") && len(toolInput) > 0 {
+		var t aflock.TaskToolInput
+		if err := json.Unmarshal(toolInput, &t); err == nil {
+			subagentType = t.SubagentType
+		}
+	}
+	if subagentType == "" {
+		return nil, true
+	}
+	for i := range sublayouts {
+		if sublayouts[i].Name == subagentType {
+			return &sublayouts[i], true
+		}
+	}
+	return nil, true
+}
+
+// attenuationViolations checks that sublayout limits are <= parent limits.
+// Mirrors verify.verifyAttenuation but lives here so spawn-time enforcement
+// (issue #26 gap 4) doesn't pull in the verify package's dependencies.
+// Empty result means the sublayout is validly attenuated.
+func attenuationViolations(parent, sub *aflock.LimitsPolicy) []string {
+	if sub == nil || parent == nil {
+		return nil
+	}
+	var violations []string
+	check := func(name string, p, s *aflock.Limit) {
+		if p == nil || s == nil {
+			return
+		}
+		if s.Value > p.Value {
+			violations = append(violations, fmt.Sprintf("%s: sublayout %.2f > parent %.2f", name, s.Value, p.Value))
+		}
+	}
+	check("maxSpendUSD", parent.MaxSpendUSD, sub.MaxSpendUSD)
+	check("maxTokensIn", parent.MaxTokensIn, sub.MaxTokensIn)
+	check("maxTokensOut", parent.MaxTokensOut, sub.MaxTokensOut)
+	check("maxTurns", parent.MaxTurns, sub.MaxTurns)
+	check("maxWallTimeSeconds", parent.MaxWallTimeSeconds, sub.MaxWallTimeSeconds)
+	check("maxToolCalls", parent.MaxToolCalls, sub.MaxToolCalls)
+	return violations
 }
 
 // attenuateLimits computes effective limits for a child session.
