@@ -390,6 +390,30 @@ func TestTracker_CacheTiersFallback(t *testing.T) {
 	}
 }
 
+// TestTracker_SyntheticModelFilteredFromCumulative verifies that the
+// "<synthetic>" sentinel claude-code injects for self-emitted messages
+// (compaction summaries, system prompts) does NOT leak into
+// Cumulative.Model. The field feeds pricing lookup, so surfacing
+// "<synthetic>" would break cost estimation.
+func TestTracker_SyntheticModelFilteredFromCumulative(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	real := `{"type":"assistant","requestId":"req_R","message":{"id":"msg_R","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":5,"output_tokens":7}}}` + "\n"
+	synthetic := `{"type":"assistant","requestId":"req_S","message":{"id":"msg_S","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(real+synthetic), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.Model != "claude-opus-4-7" {
+		t.Errorf("expected real model on Cumulative, got %q", d.Model)
+	}
+	// Tokens from both rows still count — only the model name is filtered.
+	if d.AssistantTurns != 2 || d.InputTokens != 6 || d.OutputTokens != 8 {
+		t.Errorf("expected both rows to contribute usage, got %+v", d)
+	}
+}
+
 // TestTracker_NonAssistantTypesIgnored verifies that user/system/etc.
 // lines do not contribute to the cumulative.
 func TestTracker_NonAssistantTypesIgnored(t *testing.T) {

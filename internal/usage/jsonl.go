@@ -332,7 +332,7 @@ func parseRows(b []byte) []assistantRow {
 			outputTokens: entry.Message.Usage.OutputTokens,
 			cacheRead:    entry.Message.Usage.CacheReadInputTokens,
 			cacheTotal:   entry.Message.Usage.CacheCreationInputTokens,
-			model:        entry.Message.Model,
+			model:        normalizeModel(entry.Message.Model),
 		}
 		// Anthropic prompt caching has two write tiers with different
 		// pricing. The top-level cache_creation_input_tokens equals
@@ -381,4 +381,17 @@ type jsonlUsage struct {
 type jsonlCacheCreation struct {
 	Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
 	Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
+}
+
+// normalizeModel filters out claude-code's "<synthetic>" sentinel, which
+// marks self-injected messages (compaction summaries, system prompts)
+// rather than real inference. Cumulative.Model feeds pricing lookup, so
+// surfacing the sentinel would either fail the lookup or produce a
+// nonsensical cost. Returns "" for synthetic rows; callers fall back to
+// any other non-empty model seen in the session.
+func normalizeModel(model string) string {
+	if model == "<synthetic>" {
+		return ""
+	}
+	return model
 }
