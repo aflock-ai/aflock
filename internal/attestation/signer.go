@@ -267,18 +267,36 @@ type Subject struct {
 
 // ActionPredicate is the predicate for aflock action attestations.
 type ActionPredicate struct {
-	Action        string                 `json:"action"`
-	SessionID     string                 `json:"sessionId"`
-	ToolName      string                 `json:"toolName"`
-	ToolUseID     string                 `json:"toolUseId"`
-	ToolInput     map[string]interface{} `json:"toolInput,omitempty"`
-	Decision      string                 `json:"decision"`
-	Reason        string                 `json:"reason,omitempty"`
-	Timestamp     time.Time              `json:"timestamp"`
-	AgentID       string                 `json:"agentId,omitempty"`
-	AgentIdentity *TransitiveIdentity    `json:"agentIdentity,omitempty"`
-	Metrics       *MetricsPredicate      `json:"metrics,omitempty"`
-	JWTBinding    *JWTBinding            `json:"jwtBinding,omitempty"`
+	Action           string                 `json:"action"`
+	SessionID        string                 `json:"sessionId"`
+	ToolName         string                 `json:"toolName"`
+	ToolUseID        string                 `json:"toolUseId"`
+	ToolInput        map[string]interface{} `json:"toolInput,omitempty"`
+	Decision         string                 `json:"decision"`
+	Reason           string                 `json:"reason,omitempty"`
+	Timestamp        time.Time              `json:"timestamp"`
+	AgentID          string                 `json:"agentId,omitempty"`
+	AgentIdentity    *TransitiveIdentity    `json:"agentIdentity,omitempty"`
+	Metrics          *MetricsPredicate      `json:"metrics,omitempty"`
+	JWTBinding       *JWTBinding            `json:"jwtBinding,omitempty"`
+	SublayoutBinding *SublayoutBinding      `json:"sublayoutBinding,omitempty"`
+}
+
+// SublayoutBinding records the parent-declared sublayout this child session
+// was matched to at spawn time (issue #26 gap 1). Verifiers can use the
+// prefix to group child attestations under the right sublayout slot when
+// reporting and to confirm a child stayed within the delegated scope.
+type SublayoutBinding struct {
+	// Name is the matched Sublayout.Name from the parent policy.
+	Name string `json:"name"`
+	// Prefix is the parent's Sublayout.AttestationPrefix — the namespace
+	// label by which audit tools group these attestations. Empty when the
+	// parent's sublayout declaration did not set a prefix; consumers should
+	// fall back to Name in that case.
+	Prefix string `json:"prefix,omitempty"`
+	// ParentSessionID closes the loop back to the parent session whose
+	// PreToolUse decided the binding.
+	ParentSessionID string `json:"parentSessionId,omitempty"`
 }
 
 // JWTBinding records the authorization context that permitted this action,
@@ -330,28 +348,35 @@ type Signature struct {
 	Certificate string `json:"certificate,omitempty"` // PEM-encoded signing certificate
 }
 
+// AttestationContext bundles the optional per-action bindings that get
+// embedded in the predicate. Nil-safe — callers may pass nil for either
+// field or for the whole struct. Introduced when SublayoutBinding was added
+// alongside JWTBinding (issue #26 gap 1); replaces the prior single-purpose
+// variadic JWTBinding argument.
+type AttestationContext struct {
+	JWT       *JWTBinding
+	Sublayout *SublayoutBinding
+}
+
 // CreateActionAttestation creates an attestation for an action.
 //
-// jwtBindings is a 0-or-1 variadic so legacy callers (replay, tests, hook
-// paths that did not present a token) compile unchanged. When a binding is
-// supplied, it is embedded in the predicate so verifiers can confirm the
-// action was signed only because a JWT with the listed scope was
-// presented (issue #40). Passing more than one binding is a programming
-// error and panics.
+// actx is optional (nil-safe). When set, its JWT/Sublayout bindings are
+// embedded in the predicate so verifiers can confirm the action was signed
+// under the listed token scope (issue #40) and bound to the declared
+// sublayout (issue #26).
 func (s *Signer) CreateActionAttestation(
 	ctx context.Context,
 	record aflock.ActionRecord,
 	sessionID string,
 	metrics *aflock.SessionMetrics,
 	agentIdentity *identity.AgentIdentity,
-	jwtBindings ...*JWTBinding,
+	actx *AttestationContext,
 ) (*Envelope, error) {
-	if len(jwtBindings) > 1 {
-		panic("CreateActionAttestation: at most one JWTBinding allowed")
-	}
 	var jwtBinding *JWTBinding
-	if len(jwtBindings) == 1 {
-		jwtBinding = jwtBindings[0]
+	var sublayoutBinding *SublayoutBinding
+	if actx != nil {
+		jwtBinding = actx.JWT
+		sublayoutBinding = actx.Sublayout
 	}
 
 	// Parse tool input (best-effort, ignore errors)
@@ -362,15 +387,16 @@ func (s *Signer) CreateActionAttestation(
 
 	// Build predicate
 	predicate := ActionPredicate{
-		Action:     "tool_call",
-		SessionID:  sessionID,
-		ToolName:   record.ToolName,
-		ToolUseID:  record.ToolUseID,
-		ToolInput:  toolInput,
-		Decision:   record.Decision,
-		Reason:     record.Reason,
-		Timestamp:  record.Timestamp,
-		JWTBinding: jwtBinding,
+		Action:           "tool_call",
+		SessionID:        sessionID,
+		ToolName:         record.ToolName,
+		ToolUseID:        record.ToolUseID,
+		ToolInput:        toolInput,
+		Decision:         record.Decision,
+		Reason:           record.Reason,
+		Timestamp:        record.Timestamp,
+		JWTBinding:       jwtBinding,
+		SublayoutBinding: sublayoutBinding,
 	}
 
 	if s.identity != nil {

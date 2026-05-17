@@ -216,6 +216,7 @@ func createReplayAttestation(
 		sessionState.SessionID,
 		sessionState.Metrics,
 		agentIdentity,
+		nil,
 	)
 	if err != nil {
 		return "", fmt.Errorf("create attestation: %w", err)

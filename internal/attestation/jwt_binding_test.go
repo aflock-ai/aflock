@@ -26,7 +26,7 @@ func TestActionAttestation_NoJWTBinding(t *testing.T) {
 		ToolUseID: "tu-1",
 		Decision:  "allow",
 	}
-	env, err := signer.CreateActionAttestation(context.Background(), rec, "session-no-jwt", nil, nil)
+	env, err := signer.CreateActionAttestation(context.Background(), rec, "session-no-jwt", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestActionAttestation_WithJWTBinding(t *testing.T) {
 		ToolUseID: "tu-2",
 		Decision:  "allow",
 	}
-	env, err := signer.CreateActionAttestation(context.Background(), rec, "session-abc", nil, nil, binding)
+	env, err := signer.CreateActionAttestation(context.Background(), rec, "session-abc", nil, nil, &AttestationContext{JWT: binding})
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
 	}
@@ -87,33 +87,6 @@ func TestActionAttestation_WithJWTBinding(t *testing.T) {
 	if len(pred.JWTBinding.DeniedTools) != 1 || pred.JWTBinding.DeniedTools[0] != "WebFetch" {
 		t.Errorf("deniedTools mismatch: %v", pred.JWTBinding.DeniedTools)
 	}
-}
-
-// TestCreateActionAttestation_TooManyBindingsPanics guards the variadic
-// abuse case. The "0 or 1" semantics is enforced via panic so a future
-// caller doesn't silently get the first binding while ignoring others.
-func TestCreateActionAttestation_TooManyBindingsPanics(t *testing.T) {
-	signer := NewSigner("")
-	if err := signer.InitializeEphemeral("hash-3"); err != nil {
-		t.Fatalf("init signer: %v", err)
-	}
-	defer signer.Close() //nolint:errcheck
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic when supplying multiple bindings")
-		}
-	}()
-	a := &JWTBinding{SessionID: "a"}
-	b := &JWTBinding{SessionID: "b"}
-	_, _ = signer.CreateActionAttestation(
-		context.Background(),
-		aflock.ActionRecord{ToolName: "X"},
-		"s",
-		nil,
-		nil,
-		a, b,
-	)
 }
 
 // decodePredicate base64-decodes the DSSE payload and parses it as an

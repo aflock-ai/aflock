@@ -93,6 +93,7 @@ func (m *Manager) writePropagationRecord(parentState *aflock.SessionState, sub *
 	case sub != nil:
 		rec.ParentLimits = sub.Limits
 		rec.SublayoutName = sub.Name
+		rec.AttestationPrefix = sub.AttestationPrefix
 	case parentState.Policy != nil:
 		rec.ParentLimits = parentState.Policy.Limits
 	}

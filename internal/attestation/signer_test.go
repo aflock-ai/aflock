@@ -722,6 +722,7 @@ func TestCreateActionAttestation_BasicAction(t *testing.T) {
 		"session-xyz",
 		metrics,
 		agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -867,6 +868,7 @@ func TestCreateActionAttestation_NilToolInput(t *testing.T) {
 		"session-nil",
 		nil, // nil metrics
 		nil, // nil agent identity
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation with nil input: %v", err)
@@ -922,6 +924,7 @@ func TestCreateActionAttestation_InvalidToolInputJSON(t *testing.T) {
 		"session-bad-json",
 		nil,
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation with bad JSON: %v", err)
@@ -948,6 +951,7 @@ func TestCreateActionAttestation_NoIdentity(t *testing.T) {
 		context.Background(),
 		record,
 		"session-no-id",
+		nil,
 		nil,
 		nil,
 	)
@@ -991,6 +995,7 @@ func TestCreateActionAttestation_BinaryWithEmptyVersion(t *testing.T) {
 		"session-kernel",
 		nil,
 		agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -1046,6 +1051,7 @@ func TestCreateActionAttestation_BinaryWithEmptyName(t *testing.T) {
 
 	env, err := signer.CreateActionAttestation(
 		context.Background(), record, "session-empty-name", nil, agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -1095,6 +1101,7 @@ func TestCreateActionAttestation_AgentIdentityWithoutBinary(t *testing.T) {
 		"session-no-binary",
 		nil,
 		agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -1509,6 +1516,7 @@ func TestEndToEnd_SignAndVerify(t *testing.T) {
 		record,
 		"session-e2e-test",
 		metrics,
+		nil,
 		nil,
 	)
 	if err != nil {

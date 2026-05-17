@@ -178,6 +178,7 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	} else if prop != nil {
 		sessionState.ParentSessionID = prop.ParentSessionID
 		sessionState.ParentSublayoutName = prop.SublayoutName
+		sessionState.AttestationPrefix = prop.AttestationPrefix
 		sessionState.Materials = prop.Materials
 		if prop.ParentLimits != nil && prop.ParentMetrics != nil {
 			sessionState.Policy.Limits = attenuateLimits(
@@ -763,6 +764,19 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		return
 	}
 
+	// Issue #26 gap 1: when this session was spawned under a parent's
+	// declared sublayout, stamp every attestation with the sublayout name +
+	// AttestationPrefix so audit/verify tools can group child attestations
+	// under their delegated slot.
+	var sublayoutBinding *attestation.SublayoutBinding
+	if sessionState.ParentSublayoutName != "" {
+		sublayoutBinding = &attestation.SublayoutBinding{
+			Name:            sessionState.ParentSublayoutName,
+			Prefix:          sessionState.AttestationPrefix,
+			ParentSessionID: sessionState.ParentSessionID,
+		}
+	}
+
 	// Create signed attestation
 	envelope, err := signer.CreateActionAttestation(
 		context.Background(),
@@ -770,7 +784,7 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		sessionState.SessionID,
 		sessionState.Metrics,
 		agentIdentity,
-		jwtBinding,
+		&attestation.AttestationContext{JWT: jwtBinding, Sublayout: sublayoutBinding},
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation creation failed: %v\n", err)
