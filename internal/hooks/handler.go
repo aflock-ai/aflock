@@ -1483,7 +1483,7 @@ func matchSublayoutForSpawn(toolName string, toolInput json.RawMessage, sublayou
 		return nil, false
 	}
 	subagentType := ""
-	if toolName == "Task" && len(toolInput) > 0 {
+	if (toolName == "Task" || toolName == "Agent") && len(toolInput) > 0 {
 		var t aflock.TaskToolInput
 		if err := json.Unmarshal(toolInput, &t); err == nil {
 			subagentType = t.SubagentType
