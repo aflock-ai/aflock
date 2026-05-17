@@ -67,6 +67,23 @@ type MetricsSummary struct {
 type Verifier struct {
 	stateManager *state.Manager
 	SkipAI       bool // Skip Phase 5 (AI Evaluation)
+	// pendingInherit is set by verifySublayouts right before recursing
+	// into a child verify when the sublayout declares Inherit fields.
+	// The next verifySessionWithDepth call that loads the matching child
+	// sessionID consumes it (set-and-clear) and overlays the parent's
+	// sections onto the loaded child policy in memory. Single-shot per
+	// recursion. The Verifier is not goroutine-safe by design (state
+	// manager is shared); this overlay piggybacks on that contract.
+	pendingInherit *inheritOverlay
+}
+
+// inheritOverlay captures the parent → child section transfer requested
+// by a Sublayout's Inherit list. Lives only for the duration of one
+// recursive verifySessionWithDepth call. See verifier.pendingInherit.
+type inheritOverlay struct {
+	childSessionID string
+	parentPolicy   *aflock.Policy
+	inheritFields  []string
 }
 
 // NewVerifier creates a new verifier.
@@ -105,6 +122,16 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 	}
 	if sessionState == nil {
 		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	// If verifySublayouts staged an Inherit overlay for this child
+	// session, apply it to the in-memory loaded policy before any check
+	// runs. The on-disk policy file is untouched — child digest stays
+	// valid; this is a verifier-side resolution of parent → child
+	// section transfer (§6 invariant). Consumed on first match.
+	if v.pendingInherit != nil && v.pendingInherit.childSessionID == sessionID {
+		sessionState.Policy = applyInherit(v.pendingInherit.parentPolicy, sessionState.Policy, v.pendingInherit.inheritFields)
+		v.pendingInherit = nil
 	}
 
 	result.PolicyName = sessionState.Policy.Name
@@ -1536,8 +1563,22 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int)
 
 			childFound = true
 
+			// Stage an Inherit overlay for the recursive verify if the
+			// sublayout declares any. verifySessionWithDepth consumes it
+			// on the matching child load. Defer-clear guarantees no
+			// stale overlay leaks past this iteration even on error.
+			if len(sub.Inherit) > 0 {
+				v.pendingInherit = &inheritOverlay{
+					childSessionID: childID,
+					parentPolicy:   parentState.Policy,
+					inheritFields:  sub.Inherit,
+				}
+			}
+
 			// 3. Recursively verify the child session
 			childResult, err := v.verifySessionWithDepth(childID, depth+1)
+			v.pendingInherit = nil
+
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("sublayout %q: verify child %s: %v", sub.Name, childID, err))
 				continue
