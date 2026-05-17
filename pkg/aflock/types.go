@@ -510,6 +510,14 @@ type SessionState struct {
 	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
 	// behavior without a state-shape migration.
 	SigningMode string `json:"signing_mode,omitempty"`
+	// AuthMode records how claude-code authenticated for this session:
+	// "api_key" (pay-per-token, public-rate billing matches local math),
+	// "subscription" (Pro/Max OAuth, Anthropic uses internal accounting
+	// that local math cannot reproduce), or "unknown" when detection was
+	// inconclusive. Cost-based limits (maxSpendUSD, maxTokensIn,
+	// maxTokensOut) only enforce when AuthMode == "api_key"; under the
+	// other modes they become advisory. Closes #111.
+	AuthMode string `json:"auth_mode,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.

@@ -1035,3 +1035,30 @@ func (e *Evaluator) CheckLimits(metrics *aflock.SessionMetrics, enforcementMode 
 
 	return false, "", ""
 }
+
+// IsAdvisoryLimit returns true when a CheckLimits violation on limitName
+// should be treated as advisory (logged, not enforced) given the session's
+// claude-code auth mode. The cost-based limits (maxSpendUSD, maxTokensIn,
+// maxTokensOut) drop to advisory under non-api_key modes because local
+// token-count × public-rate math cannot reproduce Anthropic's subscription
+// billing. maxTurns and maxToolCalls stay enforced — those metrics aren't
+// $-dependent.
+//
+// authMode comes from SessionState.AuthMode, populated at session init by
+// claudeauth.Detect(). An unknown mode is treated like subscription so we
+// err on the side of advising rather than falsely denying when the auth
+// signal is ambiguous. Closes #111.
+func (e *Evaluator) IsAdvisoryLimit(limitName, authMode string) bool {
+	if authMode == authModeAPIKey {
+		return false
+	}
+	switch limitName {
+	case "maxSpendUSD", "maxTokensIn", "maxTokensOut":
+		return true
+	}
+	return false
+}
+
+// authModeAPIKey mirrors claudeauth.ModeAPIKey without importing the
+// package — keeps policy free of darwin-specific keychain probe deps.
+const authModeAPIKey = "api_key"

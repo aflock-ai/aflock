@@ -20,6 +20,7 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
+	"github.com/aflock-ai/aflock/internal/auth/claudeauth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
@@ -151,6 +152,7 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 
 	// Initialize session state
 	sessionState := h.stateManager.Initialize(input.SessionID, pol, policyPath)
+	sessionState.AuthMode = string(claudeauth.Detect())
 
 	// Save agent identity metadata for reuse in PostToolUse attestations
 	sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
@@ -443,6 +445,7 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 		// Create ephemeral session state
 		sessionState = h.stateManager.Initialize(input.SessionID, pol, policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 	}
 
 	pol := sessionState.Policy
@@ -627,8 +630,13 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "fail-fast")
 		if exceeded {
-			return output.Write(output.PostToolUseBlock(
-				fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+				fmt.Fprintf(os.Stderr, "[aflock] Limit advisory (auth: %s, not enforced): %s - %s\n",
+					sessionState.AuthMode, limitName, msg)
+			} else {
+				return output.Write(output.PostToolUseBlock(
+					fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 	}
 
@@ -1097,8 +1105,13 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(childState.Policy, filepath.Dir(childState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(childState.Metrics, "post-hoc")
 		if exceeded {
-			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, childState.AuthMode) {
+				fmt.Fprintf(os.Stderr, "[aflock] Subagent limit advisory (auth: %s, not enforced): %s - %s\n",
+					childState.AuthMode, limitName, msg)
+			} else {
+				return output.Write(output.StopBlock(
+					fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 	}
 
@@ -1127,13 +1140,27 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
 		if exceeded {
-			fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
-			// Record the violation in session state for audit trail
+			advisory := evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode)
+			if advisory {
+				fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit advisory (auth: %s, not enforced): %s - %s\n",
+					sessionState.AuthMode, limitName, msg)
+			} else {
+				fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
+			}
+			// Record either way for the audit trail — advisory crossings
+			// still inform auditors a threshold was passed under a mode
+			// where enforcement was suppressed.
+			decision := aflock.DecisionDeny
+			reason := fmt.Sprintf("post-hoc limit exceeded: %s - %s", limitName, msg)
+			if advisory {
+				decision = aflock.DecisionAllow
+				reason = fmt.Sprintf("post-hoc limit advisory (%s auth): %s - %s", sessionState.AuthMode, limitName, msg)
+			}
 			h.stateManager.RecordAction(sessionState, aflock.ActionRecord{
 				Timestamp: time.Now(),
 				ToolName:  "SessionEnd",
-				Decision:  string(aflock.DecisionDeny),
-				Reason:    fmt.Sprintf("post-hoc limit exceeded: %s - %s", limitName, msg),
+				Decision:  string(decision),
+				Reason:    reason,
 			})
 			if err := h.stateManager.Save(sessionState); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)

@@ -28,6 +28,7 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
+	"github.com/aflock-ai/aflock/internal/auth/claudeauth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/identity/peercred"
 	"github.com/aflock-ai/aflock/internal/policy"
@@ -239,10 +240,11 @@ func (s *Server) Serve(policyPath string) error {
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s\n", s.policy.Name)
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s (auth: %s)\n", s.policy.Name, sessionState.AuthMode)
 	} else {
 		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
 	}
@@ -311,10 +313,11 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "[aflock] HTTP MCP server starting with policy: %s\n", s.policy.Name)
+		fmt.Fprintf(os.Stderr, "[aflock] HTTP MCP server starting with policy: %s (auth: %s)\n", s.policy.Name, sessionState.AuthMode)
 	} else {
 		fmt.Fprintf(os.Stderr, "[aflock] HTTP MCP server starting (no policy loaded)\n")
 	}
@@ -538,10 +541,11 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s\n", s.policy.Name)
+		fmt.Fprintf(os.Stderr, "[aflock] MCP server started with policy: %s (auth: %s)\n", s.policy.Name, sessionState.AuthMode)
 	} else {
 		fmt.Fprintf(os.Stderr, "[aflock] MCP server started (no policy loaded)\n")
 	}
