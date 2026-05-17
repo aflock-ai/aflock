@@ -8,10 +8,19 @@
 // underlying Anthropic API response. This package provides:
 //
 //   - Tracker: incremental reader with byte-offset memoization, so each
-//     ReadDelta call only sees new lines since the previous call. The offset
+//     ReadDelta call only sees new bytes since the previous call. The offset
 //     is persisted to a sidecar so aflock restarts don't double-count.
 //
 //   - Cumulative: the per-session running totals.
+//
+// Dedup follows CodexBar's approach (steipete/CodexBar — Sources/CodexBarCore/
+// Vendored/CostUsage/CostUsageScanner+Claude.swift): assistant rows are keyed
+// by (message.id, requestId) and stored as a map with overwrite semantics, so
+// the final cumulative chunk of a streamed turn wins. Rows missing either ID
+// are kept as separate entries to avoid dropping usage. This is more robust
+// than the original skip-first-on-message.id-only dedup, which under-counts
+// when Claude Code emits the SAME (message.id, requestId) pair with growing
+// cumulative usage across a tool-use chain.
 //
 // Pricing/cost calculation lives in pricing.go.
 package usage
@@ -59,23 +68,85 @@ func (c *Cumulative) Add(other Cumulative) {
 	}
 }
 
+// sub returns the per-field difference (c - other). Negative results are
+// clamped to zero — cumulative usage from Anthropic is monotonic per
+// (message.id, requestId) chunk in practice, but we never want to hand a
+// negative delta to UpdateMetrics if a row gets overwritten with a smaller
+// snapshot due to Claude Code internals or test fixtures.
+func (c Cumulative) sub(other Cumulative) Cumulative {
+	clamp := func(a, b int64) int64 {
+		if a < b {
+			return 0
+		}
+		return a - b
+	}
+	clampInt := func(a, b int) int {
+		if a < b {
+			return 0
+		}
+		return a - b
+	}
+	return Cumulative{
+		InputTokens:              clamp(c.InputTokens, other.InputTokens),
+		OutputTokens:             clamp(c.OutputTokens, other.OutputTokens),
+		CacheReadInputTokens:     clamp(c.CacheReadInputTokens, other.CacheReadInputTokens),
+		CacheCreationInputTokens: clamp(c.CacheCreationInputTokens, other.CacheCreationInputTokens),
+		CacheCreation5mTokens:    clamp(c.CacheCreation5mTokens, other.CacheCreation5mTokens),
+		CacheCreation1hTokens:    clamp(c.CacheCreation1hTokens, other.CacheCreation1hTokens),
+		AssistantTurns:           clampInt(c.AssistantTurns, other.AssistantTurns),
+		Model:                    c.Model,
+	}
+}
+
+// assistantRow is a deduplicated record of one assistant turn. Multiple
+// JSONL lines can share (messageID, requestID) — the row stores the LAST
+// occurrence's usage values so cumulative-chunk streaming converges to the
+// final count.
+type assistantRow struct {
+	messageID    string
+	requestID    string
+	isSidechain  bool
+	inputTokens  int64
+	outputTokens int64
+	cacheRead    int64
+	cache5m      int64
+	cache1h      int64
+	cacheTotal   int64 // top-level cache_creation_input_tokens (5m + 1h)
+	model        string
+}
+
+func (r assistantRow) toCumulative() Cumulative {
+	return Cumulative{
+		InputTokens:              r.inputTokens,
+		OutputTokens:             r.outputTokens,
+		CacheReadInputTokens:     r.cacheRead,
+		CacheCreationInputTokens: r.cacheTotal,
+		CacheCreation5mTokens:    r.cache5m,
+		CacheCreation1hTokens:    r.cache1h,
+		AssistantTurns:           1,
+		Model:                    r.model,
+	}
+}
+
 // Tracker reads a Claude Code JSONL incrementally.
-// Each ReadDelta processes only new content since the previous call.
+// Each ReadDelta processes only new bytes since the previous call.
 // Safe for concurrent ReadDelta calls — internal mutex serializes them.
 type Tracker struct {
 	jsonlPath  string
 	offsetPath string // sidecar at <sessionDir>/usage.offset
 	mu         sync.Mutex
 	offset     int64
-	cumulative Cumulative
-	// seenIDs deduplicates assistant messages by message.id. Claude Code
-	// emits the same assistant turn as multiple JSONL lines (different
-	// parentUuid, identical message.id and identical usage block) when
-	// the message participates in a tool-use chain. Counting both copies
-	// double-counts tokens. Per-tracker in-memory only — duplicate IDs
-	// are always co-located in the JSONL so a single tracker instance
-	// catches them; we don't need cross-restart persistence.
-	seenIDs map[string]struct{}
+	// total is the running cumulative computed across all deduped rows.
+	// It's the source of truth for what ReadDelta returns: each call diffs
+	// the post-merge total against this snapshot and returns the difference.
+	total Cumulative
+	// rowsByKey holds assistant rows keyed by "messageID:requestID". Repeat
+	// occurrences of the same key overwrite the previous entry — the last
+	// cumulative chunk of a streamed turn wins (CodexBar parity).
+	rowsByKey map[string]assistantRow
+	// unkeyedRows holds rows missing either messageID or requestID. They
+	// cannot be safely deduplicated so each is kept as a separate entry.
+	unkeyedRows []assistantRow
 }
 
 // NewTracker constructs a Tracker for jsonlPath. If sessionDir is non-empty,
@@ -86,7 +157,10 @@ type Tracker struct {
 // If a sidecar offset exists, it is loaded; missing or corrupt sidecars
 // reset to offset 0 (safe — at worst we recompute cumulative from scratch).
 func NewTracker(jsonlPath, sessionDir string) *Tracker {
-	t := &Tracker{jsonlPath: jsonlPath, seenIDs: make(map[string]struct{})}
+	t := &Tracker{
+		jsonlPath: jsonlPath,
+		rowsByKey: make(map[string]assistantRow),
+	}
 	if sessionDir != "" {
 		t.offsetPath = filepath.Join(sessionDir, "usage.offset")
 		t.loadOffset()
@@ -119,8 +193,9 @@ func (t *Tracker) saveOffset() {
 }
 
 // ReadDelta opens the JSONL, seeks to the memoized offset, reads up to the
-// last newline, and returns a Cumulative covering only the new content.
-// Updates internal offset and cumulative, and persists the offset.
+// last newline, merges new assistant rows into the deduped collection, and
+// returns the cumulative-total delta covered by the merge. Updates the
+// internal offset and persists it.
 //
 // Bytes after the last newline are NOT consumed — they may be partial
 // writes from claude that have not finished flushing. They will be
@@ -130,6 +205,7 @@ func (t *Tracker) saveOffset() {
 //   - the JSONL doesn't exist (claude isn't active or hasn't started yet)
 //   - no new content since the last call
 //   - new bytes exist but contain no newline yet (whole partial line)
+//   - new bytes contain only overwrites of already-seen rows with no growth
 func (t *Tracker) ReadDelta() (Cumulative, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -145,10 +221,12 @@ func (t *Tracker) ReadDelta() (Cumulative, error) {
 
 	if t.offset > 0 {
 		// Validate offset is within file bounds — file may have been
-		// truncated/replaced. If so, reset and re-read from start.
+		// truncated/replaced. If so, reset state and re-read from start.
 		if fi, err := f.Stat(); err == nil && fi.Size() < t.offset {
 			t.offset = 0
-			t.cumulative = Cumulative{}
+			t.total = Cumulative{}
+			t.rowsByKey = make(map[string]assistantRow)
+			t.unkeyedRows = nil
 		}
 		if t.offset > 0 {
 			if _, err := f.Seek(t.offset, io.SeekStart); err != nil {
@@ -172,20 +250,49 @@ func (t *Tracker) ReadDelta() (Cumulative, error) {
 	}
 	consumed := data[:lastNL+1]
 
-	delta := parseLines(consumed, t.seenIDs)
-
+	before := t.total
+	newRows := parseRows(consumed)
+	t.mergeRows(newRows)
+	t.total = t.computeTotal()
 	t.offset += int64(len(consumed))
 	t.saveOffset()
-	t.cumulative.Add(delta)
 
-	return delta, nil
+	return t.total.sub(before), nil
+}
+
+// mergeRows folds parsed rows into the dedup collections. Keyed rows
+// (with both messageID and requestID) overwrite by composite key — the
+// last occurrence wins, matching CodexBar's streaming-chunk semantics.
+// Unkeyed rows are appended as distinct entries.
+func (t *Tracker) mergeRows(rows []assistantRow) {
+	for _, r := range rows {
+		if r.messageID != "" && r.requestID != "" {
+			t.rowsByKey[r.messageID+":"+r.requestID] = r
+		} else {
+			t.unkeyedRows = append(t.unkeyedRows, r)
+		}
+	}
+}
+
+// computeTotal recomputes the cumulative from scratch by summing all
+// deduped rows. Cheap relative to ReadDelta's I/O — the row count grows
+// linearly with assistant turns, not bytes.
+func (t *Tracker) computeTotal() Cumulative {
+	var c Cumulative
+	for _, r := range t.rowsByKey {
+		c.Add(r.toCumulative())
+	}
+	for _, r := range t.unkeyedRows {
+		c.Add(r.toCumulative())
+	}
+	return c
 }
 
 // Cumulative returns the current running totals (snapshot).
 func (t *Tracker) Cumulative() Cumulative {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.cumulative
+	return t.total
 }
 
 // JSONLPath returns the underlying JSONL path. Useful for diagnostics.
@@ -193,15 +300,11 @@ func (t *Tracker) JSONLPath() string {
 	return t.jsonlPath
 }
 
-// parseLines walks each newline-terminated line and accumulates usage from
-// assistant messages. Lines whose message.id is already in seen are
-// skipped — Claude Code emits the same assistant turn multiple times
-// when it participates in a tool-use chain, with identical usage blocks
-// (see issue #96). Corrupt or incomplete lines are skipped silently
-// (claude can write mid-flush, partial parses happen). Non-assistant
-// types are ignored.
-func parseLines(b []byte, seen map[string]struct{}) Cumulative {
-	var c Cumulative
+// parseRows walks each newline-terminated line and emits one assistantRow
+// per qualifying assistant message. Corrupt or incomplete lines are skipped
+// silently (claude can write mid-flush). Non-assistant types are ignored.
+func parseRows(b []byte) []assistantRow {
+	var rows []assistantRow
 	scanner := bufio.NewScanner(bytes.NewReader(b))
 	// Claude messages can be long (full prompts + responses) — give the
 	// scanner enough buffer to handle them.
@@ -221,44 +324,41 @@ func parseLines(b []byte, seen map[string]struct{}) Cumulative {
 		if entry.Message == nil || entry.Message.Usage == nil {
 			continue
 		}
-		// Dedupe by message.id. Empty IDs are treated as always-unique
-		// (defensive — every real Anthropic API response has an id).
-		if entry.Message.ID != "" {
-			if _, dup := seen[entry.Message.ID]; dup {
-				continue
-			}
-			seen[entry.Message.ID] = struct{}{}
+		row := assistantRow{
+			messageID:    entry.Message.ID,
+			requestID:    entry.RequestID,
+			isSidechain:  entry.IsSidechain,
+			inputTokens:  entry.Message.Usage.InputTokens,
+			outputTokens: entry.Message.Usage.OutputTokens,
+			cacheRead:    entry.Message.Usage.CacheReadInputTokens,
+			cacheTotal:   entry.Message.Usage.CacheCreationInputTokens,
+			model:        entry.Message.Model,
 		}
-		c.InputTokens += entry.Message.Usage.InputTokens
-		c.OutputTokens += entry.Message.Usage.OutputTokens
-		c.CacheReadInputTokens += entry.Message.Usage.CacheReadInputTokens
 		// Anthropic prompt caching has two write tiers with different
 		// pricing. The top-level cache_creation_input_tokens equals
 		// 5m + 1h combined; we read the breakdown so pricing can apply
 		// the correct multiplier (5m: 1.25x, 1h: 2.0x).
 		if entry.Message.Usage.CacheCreation != nil {
-			c.CacheCreation5mTokens += entry.Message.Usage.CacheCreation.Ephemeral5mInputTokens
-			c.CacheCreation1hTokens += entry.Message.Usage.CacheCreation.Ephemeral1hInputTokens
+			row.cache5m = entry.Message.Usage.CacheCreation.Ephemeral5mInputTokens
+			row.cache1h = entry.Message.Usage.CacheCreation.Ephemeral1hInputTokens
 		} else {
 			// Older sessions or single-tier responses fall back to the
 			// scalar field, treated as 5m (Anthropic's pre-1h-tier default).
-			c.CacheCreation5mTokens += entry.Message.Usage.CacheCreationInputTokens
+			row.cache5m = entry.Message.Usage.CacheCreationInputTokens
 		}
-		c.CacheCreationInputTokens += entry.Message.Usage.CacheCreationInputTokens
-		c.AssistantTurns++
-		if entry.Message.Model != "" {
-			c.Model = entry.Message.Model
-		}
+		rows = append(rows, row)
 	}
-	return c
+	return rows
 }
 
 // jsonlEntry models the subset of fields we read. Other fields in the
 // JSONL (subagent stops, attachments, etc.) are ignored by the standard
 // library JSON decoder.
 type jsonlEntry struct {
-	Type    string    `json:"type"`
-	Message *jsonlMsg `json:"message,omitempty"`
+	Type        string    `json:"type"`
+	IsSidechain bool      `json:"isSidechain"`
+	RequestID   string    `json:"requestId"`
+	Message     *jsonlMsg `json:"message,omitempty"`
 }
 
 type jsonlMsg struct {

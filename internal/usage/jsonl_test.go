@@ -207,14 +207,16 @@ func TestTracker_CorruptLine(t *testing.T) {
 	}
 }
 
-// TestTracker_DedupesByMessageID verifies that when claude-code writes
-// the same assistant message twice (tool-use chain re-emission), we
-// only count its usage once. Closes Bug 1 documented in #96.
-func TestTracker_DedupesByMessageID(t *testing.T) {
+// TestTracker_DedupesByMessageIDAndRequestID verifies that when claude-code
+// writes the same assistant message twice (tool-use chain re-emission), we
+// only count its usage once. Dedup key is (message.id, requestId) — both
+// required, mirroring CodexBar's CostUsageScanner+Claude.swift dedup.
+// Closes Bug 1 documented in #96.
+func TestTracker_DedupesByMessageIDAndRequestID(t *testing.T) {
 	tmp := t.TempDir()
 	jsonl := filepath.Join(tmp, "s.jsonl")
-	// Same message.id, identical usage — should count exactly once.
-	dup := `{"type":"assistant","message":{"id":"msg_dupe1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n"
+	// Same (message.id, requestId), identical usage — should count exactly once.
+	dup := `{"type":"assistant","requestId":"req_X","message":{"id":"msg_dupe1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n"
 	if err := os.WriteFile(jsonl, []byte(dup+dup+dup), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -228,23 +230,120 @@ func TestTracker_DedupesByMessageID(t *testing.T) {
 	}
 }
 
+// TestTracker_LastChunkWins is the central regression for the bug that
+// caused PR #97 to be reverted: when streaming assistant chunks share
+// (message.id, requestId) and each chunk's usage is CUMULATIVE (not
+// incremental), summing them double/triple-counts. CodexBar handles this
+// by overwriting the row with each new chunk so the final cumulative
+// snapshot wins. We assert the same here.
+func TestTracker_LastChunkWins(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	// Three streamed chunks of the same turn — usage grows monotonically.
+	chunk1 := `{"type":"assistant","requestId":"req_S","message":{"id":"msg_stream","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":50,"cache_creation_input_tokens":200}}}` + "\n"
+	chunk2 := `{"type":"assistant","requestId":"req_S","message":{"id":"msg_stream","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":50,"cache_creation_input_tokens":200}}}` + "\n"
+	chunk3 := `{"type":"assistant","requestId":"req_S","message":{"id":"msg_stream","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":120,"cache_read_input_tokens":50,"cache_creation_input_tokens":200}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(chunk1+chunk2+chunk3), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.AssistantTurns != 1 {
+		t.Errorf("three chunks of one turn should resolve to 1 turn, got %d", d.AssistantTurns)
+	}
+	if d.OutputTokens != 120 {
+		t.Errorf("last-chunk output should win (120), got %d", d.OutputTokens)
+	}
+	if d.InputTokens != 100 {
+		t.Errorf("input should stay at the cumulative 100, got %d", d.InputTokens)
+	}
+}
+
 // TestTracker_DistinctIDsCounted ensures we don't accidentally
-// over-aggressively dedupe — distinct message.ids must each count.
+// over-aggressively dedupe — distinct (message.id, requestId) pairs
+// must each count.
 func TestTracker_DistinctIDsCounted(t *testing.T) {
 	tmp := t.TempDir()
 	jsonl := filepath.Join(tmp, "s.jsonl")
-	a := `{"type":"assistant","message":{"id":"msg_A","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
-	b := `{"type":"assistant","message":{"id":"msg_B","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":4}}}` + "\n"
+	a := `{"type":"assistant","requestId":"req_A","message":{"id":"msg_A","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	b := `{"type":"assistant","requestId":"req_B","message":{"id":"msg_B","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":3,"output_tokens":4}}}` + "\n"
 	if err := os.WriteFile(jsonl, []byte(a+b+a), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tr := NewTracker(jsonl, tmp)
 	d, _ := tr.ReadDelta()
 	if d.AssistantTurns != 2 {
-		t.Errorf("expected 2 turns (A and B, A's dup skipped), got %d", d.AssistantTurns)
+		t.Errorf("expected 2 turns (A and B, A's dup overwritten), got %d", d.AssistantTurns)
 	}
 	if d.InputTokens != 4 || d.OutputTokens != 6 {
 		t.Errorf("expected sums of A+B only, got input=%d output=%d", d.InputTokens, d.OutputTokens)
+	}
+}
+
+// TestTracker_SameMessageIDDifferentRequestID guards against an over-
+// aggressive dedup that keys only on message.id. Two requests producing
+// rows that happen to share a message.id must both be counted — the
+// compound key (message.id, requestId) prevents the collision.
+func TestTracker_SameMessageIDDifferentRequestID(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+	r1 := `{"type":"assistant","requestId":"req_one","message":{"id":"msg_shared","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":5,"output_tokens":7}}}` + "\n"
+	r2 := `{"type":"assistant","requestId":"req_two","message":{"id":"msg_shared","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":11,"output_tokens":13}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(r1+r2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d, _ := tr.ReadDelta()
+	if d.AssistantTurns != 2 {
+		t.Errorf("expected 2 turns (different requestId), got %d", d.AssistantTurns)
+	}
+	if d.InputTokens != 16 || d.OutputTokens != 20 {
+		t.Errorf("expected sum of both rows, got input=%d output=%d", d.InputTokens, d.OutputTokens)
+	}
+}
+
+// TestTracker_StreamingChunksAcrossReadDelta exercises the case where
+// streamed cumulative chunks land across two ReadDelta calls. The delta
+// returned by the second call must reflect the GROWTH of the row's
+// cumulative usage, not a fresh additive contribution. Without this,
+// callers folding deltas into session metrics would double-count.
+func TestTracker_StreamingChunksAcrossReadDelta(t *testing.T) {
+	tmp := t.TempDir()
+	jsonl := filepath.Join(tmp, "s.jsonl")
+
+	chunk1 := `{"type":"assistant","requestId":"req_R","message":{"id":"msg_R","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":50,"output_tokens":10}}}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(chunk1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTracker(jsonl, tmp)
+	d1, _ := tr.ReadDelta()
+	if d1.OutputTokens != 10 || d1.AssistantTurns != 1 {
+		t.Fatalf("first read: expected 10 output / 1 turn, got %+v", d1)
+	}
+
+	chunk2 := `{"type":"assistant","requestId":"req_R","message":{"id":"msg_R","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":50,"output_tokens":80}}}` + "\n"
+	f, err := os.OpenFile(jsonl, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(chunk2); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	d2, _ := tr.ReadDelta()
+	// Delta must reflect just the growth (80 - 10 = 70 output tokens).
+	if d2.OutputTokens != 70 {
+		t.Errorf("second read should report growth only (70), got %d", d2.OutputTokens)
+	}
+	// Turn count is unchanged — same row, just an updated snapshot.
+	if d2.AssistantTurns != 0 {
+		t.Errorf("second read should not add a turn (same row), got %d", d2.AssistantTurns)
+	}
+	// Cumulative reflects the final state.
+	cum := tr.Cumulative()
+	if cum.OutputTokens != 80 || cum.AssistantTurns != 1 {
+		t.Errorf("cumulative after streaming: expected 80/1, got %+v", cum)
 	}
 }
 
