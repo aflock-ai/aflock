@@ -184,3 +184,45 @@ func TestSpawn_NoSublayoutsDeclared_LegacyBehaviorPreserved(t *testing.T) {
 		t.Errorf("legacy path must leave SublayoutName empty, got %q", rec.SublayoutName)
 	}
 }
+
+// TestSpawn_AgentToolName_MatchesSubagentType pins the regression caught
+// during real-Claude integration testing: Claude Code's subagent spawn
+// tool is named "Agent" (not "Task" — Task is a different family). An
+// earlier version of matchSublayoutForSpawn only parsed subagent_type when
+// toolName == "Task", causing every Agent spawn to be reported as
+// "no match" and refused, even when the requested sublayout was declared.
+func TestSpawn_AgentToolName_MatchesSubagentType(t *testing.T) {
+	h := newTestHandler(t)
+	pol := policyWithSublayouts(aflock.Sublayout{
+		Name:   "general-purpose",
+		Policy: "./gp.aflock",
+		Limits: &aflock.LimitsPolicy{
+			MaxSpendUSD: &aflock.Limit{Value: 1.0},
+		},
+	})
+	ss := seedSession(t, h, "parent-agent-tool", pol)
+	_ = ss
+
+	for _, toolName := range []string{"Agent", "Task"} {
+		t.Run("toolName="+toolName, func(t *testing.T) {
+			input := &aflock.HookInput{
+				SessionID: "parent-agent-tool",
+				ToolName:  toolName,
+				ToolInput: json.RawMessage(`{"prompt":"x","subagent_type":"general-purpose"}`),
+			}
+			got := captureStdout(t, func() {
+				if err := h.handlePreToolUse(input); err != nil {
+					t.Fatalf("handlePreToolUse: %v", err)
+				}
+			})
+			var out aflock.HookOutput
+			if err := json.Unmarshal([]byte(got), &out); err != nil {
+				t.Fatalf("unmarshal: %v (raw: %s)", err, got)
+			}
+			if out.HookSpecificOutput == nil || out.HookSpecificOutput.PermissionDecision != aflock.DecisionAllow {
+				t.Errorf("matching sublayout via tool=%q must be allowed, got %+v",
+					toolName, out.HookSpecificOutput)
+			}
+		})
+	}
+}
