@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -242,6 +243,35 @@ func TestPolicyDigestBinding(t *testing.T) {
 	assert.NotEqual(t, claims1.PolicyDigest, claims2.PolicyDigest)
 	assert.NotEmpty(t, claims1.PolicyDigest)
 	assert.NotEmpty(t, claims2.PolicyDigest)
+}
+
+// TestPolicyDigest_SurvivesStateJSONRoundTrip pins the fix for the hooks
+// JWT-validation bug: a Policy with RawDigest set must round-trip through
+// JSON without losing the digest, so subprocess hooks that load
+// SessionState from disk compute the same digest the JWT was bound to at
+// SessionStart. Before the fix, RawDigest had `json:"-"` and was stripped
+// from state.json — re-marshaling the parsed struct then produced a
+// different digest and every PreToolUse call was rejected as "token bound
+// to a different policy version".
+func TestPolicyDigest_SurvivesStateJSONRoundTrip(t *testing.T) {
+	pol := &aflock.Policy{
+		Name:      "round-trip",
+		Version:   "1.0",
+		RawDigest: "deadbeefcafef00d1234567890abcdef",
+	}
+	before := ComputePolicyDigest(pol)
+	require.Equal(t, "deadbeefcafef00d1234567890abcdef", before)
+
+	data, err := json.Marshal(pol)
+	require.NoError(t, err)
+
+	var restored aflock.Policy
+	require.NoError(t, json.Unmarshal(data, &restored))
+
+	after := ComputePolicyDigest(&restored)
+	assert.Equal(t, before, after,
+		"RawDigest must survive JSON round-trip — otherwise hook subprocesses reject the parent's JWT")
+	assert.Equal(t, "deadbeefcafef00d1234567890abcdef", restored.RawDigest)
 }
 
 func TestNilPolicy(t *testing.T) {

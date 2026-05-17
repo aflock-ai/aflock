@@ -161,11 +161,16 @@ type Policy struct {
 	Functionaries        []Functionary     `json:"functionaries,omitempty"` // Legacy, use Steps.Functionaries instead
 
 	// RawDigest is the SHA-256 hex digest of the raw policy file bytes captured
-	// at load time. Stored here (json:"-") so callers can bind tokens and
-	// attestations to the exact file the user reviewed/signed, rather than
-	// re-marshaling the parsed struct (which can normalize formatting and
-	// produce a different digest for byte-identical input — issue #61 / L5).
-	RawDigest string `json:"-"`
+	// at load time. Persisted into state.json so subprocess hooks (PreToolUse,
+	// PostToolUse, Stop) recover the same digest the JWT was bound to at
+	// SessionStart — without this, the parent process's parsed Policy struct
+	// would re-marshal to different bytes (key order, whitespace) and JWT
+	// validation would reject every tool call as "token bound to a different
+	// policy version". The original justification for binding to raw bytes
+	// (rather than re-marshal) is issue #61 / L5; this field's value is the
+	// frozen digest captured at SessionStart, intentionally not recomputed
+	// from the on-disk file mid-session.
+	RawDigest string `json:"rawDigest,omitempty"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.
