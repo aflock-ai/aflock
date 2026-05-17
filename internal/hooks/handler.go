@@ -1142,10 +1142,17 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 				Decision:  string(aflock.DecisionDeny),
 				Reason:    fmt.Sprintf("post-hoc limit exceeded: %s - %s", limitName, msg),
 			})
-			if err := h.stateManager.Save(sessionState); err != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
-			}
 		}
+	}
+
+	// Persist any in-memory mutations made above — both the usage delta
+	// folded in by settleFinalUsage and any post-hoc limit violation
+	// record. Previously the save only fired when a limit was exceeded,
+	// so the happy path dropped final-turn token/cost/turn counts on the
+	// floor (state.json kept the pre-SessionEnd snapshot). Always saving
+	// here makes the JSONL-derived metrics reach disk.
+	if err := h.stateManager.Save(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
 	}
 
 	// Log final metrics
@@ -1165,6 +1172,13 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 func (h *Handler) settleFinalUsage(input *aflock.HookInput, sessionState *aflock.SessionState) {
 	if input == nil || input.TranscriptPath == "" || sessionState == nil {
 		return
+	}
+	// Persist the transcript path for verify-time fallback. MCP mode sets
+	// this in server.go; hooks mode previously left it empty, so a Ctrl-C
+	// before SessionEnd left verify unable to repair stale metrics. Always
+	// record the latest path we observe.
+	if sessionState.TranscriptPath != input.TranscriptPath {
+		sessionState.TranscriptPath = input.TranscriptPath
 	}
 	sessionDir := h.stateManager.SessionDir(input.SessionID)
 	tracker := usage.NewTracker(input.TranscriptPath, sessionDir)
