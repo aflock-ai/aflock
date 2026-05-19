@@ -1305,6 +1305,36 @@ func TestHandleSessionEnd_PrintsMetrics(t *testing.T) {
 	}
 }
 
+// Issue #119: SessionEnd must auto-compute and persist the session Merkle root
+// over recorded actions so verify-time Phase 3 has something to bind to.
+func TestHandleSessionEnd_PopulatesSessionMerkleRoot(t *testing.T) {
+	h := newTestHandler(t)
+	ss := seedSession(t, h, "session-merkle-end", &aflock.Policy{Name: "test"})
+	h.stateManager.RecordAction(ss, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Read", ToolUseID: "a1", Decision: "allow",
+	})
+	h.stateManager.RecordAction(ss, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Edit", ToolUseID: "a2", Decision: "allow",
+	})
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	captureStdout(t, func() {
+		if err := h.handleSessionEnd(&aflock.HookInput{SessionID: "session-merkle-end"}); err != nil {
+			t.Fatalf("handleSessionEnd: %v", err)
+		}
+	})
+
+	reloaded, err := h.stateManager.Load("session-merkle-end")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if reloaded.SessionMerkleRoot == "" {
+		t.Fatal("expected non-empty SessionMerkleRoot after SessionEnd, got empty")
+	}
+}
+
 // ----- Notification: returns empty -----
 
 func TestHandleNotification_ReturnsEmpty(t *testing.T) {

@@ -1141,6 +1141,17 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		}
 	}
 
+	// Auto-populate the session Merkle root so Phase 3 verification fires on
+	// real sessions without the policy author having to set
+	// materialsFrom.session.merkleRoot ahead of time (issue #119).
+	if err := h.stateManager.ComputeSessionMerkleRoot(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: compute session merkle root: %v\n", err)
+	} else if sessionState.SessionMerkleRoot != "" {
+		if err := h.stateManager.Save(sessionState); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: save session merkle root: %v\n", err)
+		}
+	}
+
 	// Log final metrics
 	fmt.Fprintf(os.Stderr, "[aflock] Session ended. Metrics: turns=%d, toolCalls=%d\n",
 		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls)
