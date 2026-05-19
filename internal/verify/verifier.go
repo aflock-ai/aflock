@@ -216,7 +216,7 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 
 	// Check 0.7: Rego constraint evaluation (Phase 4)
 	if sessionState.Policy.Evaluators != nil && len(sessionState.Policy.Evaluators.Rego) > 0 {
-		regoErrors := evaluateSessionRego(sessionState)
+		regoErrors := evaluateSessionRego(sessionState, v.stateManager.AttestationsDir(sessionID))
 		if len(regoErrors) > 0 {
 			result.Success = false
 			for _, msg := range regoErrors {
@@ -245,7 +245,7 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 			})
 			result.Warnings = append(result.Warnings, "Phase 5 (AI Evaluation) skipped: --skip-ai flag set")
 		} else {
-			aiErrors := evaluateSessionAI(sessionState)
+			aiErrors := evaluateSessionAI(sessionState, v.stateManager.AttestationsDir(sessionID))
 			if len(aiErrors) > 0 {
 				result.Success = false
 				for _, msg := range aiErrors {
@@ -1620,18 +1620,69 @@ func verifyAttenuation(parent, child *aflock.LimitsPolicy) []string {
 	return violations
 }
 
+// loadAttestationStatements reads the session's *.intoto.json envelopes,
+// decodes each base64 payload into an in-toto Statement, and returns both the
+// parsed Statements and the raw envelope objects for use as Rego/AI input
+// (paper §4.5.1, issue #118). Malformed files are silently skipped — these
+// inputs are evidence, not enforcement; signature verification still happens
+// in verifySessionAttestationSignatures.
+func loadAttestationStatements(attestDir string) (statements []any, envelopes []any) {
+	entries, err := os.ReadDir(attestDir)
+	if err != nil {
+		return nil, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fname := entry.Name()
+		if !strings.HasSuffix(fname, ".intoto.json") && !strings.HasSuffix(fname, ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(attestDir, fname)) //nolint:gosec // G304: path from validated state dir
+		if err != nil {
+			continue
+		}
+		var env map[string]any
+		if err := json.Unmarshal(data, &env); err != nil {
+			continue
+		}
+		envelopes = append(envelopes, env)
+		payloadB64, _ := env["payload"].(string)
+		if payloadB64 == "" {
+			continue
+		}
+		payload, err := base64.StdEncoding.DecodeString(payloadB64)
+		if err != nil {
+			continue
+		}
+		var stmt map[string]any
+		if err := json.Unmarshal(payload, &stmt); err != nil {
+			continue
+		}
+		statements = append(statements, stmt)
+	}
+	return statements, envelopes
+}
+
 // evaluateSessionAI runs AI evaluators against session data (Phase 5).
-// The materials passed to the AI include session actions, metrics, and policy context.
-func evaluateSessionAI(sessionState *aflock.SessionState) []string {
+// The materials passed to the AI include session actions, metrics, policy
+// context, plus parsed attestations and raw envelopes — same shape the Rego
+// evaluator receives, per paper §4.5.1 / issue #118.
+func evaluateSessionAI(sessionState *aflock.SessionState, attestDir string) []string {
 	if sessionState.Policy.Evaluators == nil || len(sessionState.Policy.Evaluators.AI) == 0 {
 		return nil
 	}
 
+	statements, envelopes := loadAttestationStatements(attestDir)
+
 	// Build materials context for the AI evaluator
 	materials := map[string]any{
-		"policy":  sessionState.Policy,
-		"actions": sessionState.Actions,
-		"metrics": sessionState.Metrics,
+		"policy":       sessionState.Policy,
+		"actions":      sessionState.Actions,
+		"metrics":      sessionState.Metrics,
+		"attestations": statements,
+		"envelopes":    envelopes,
 	}
 
 	materialsJSON, err := json.Marshal(materials)
@@ -1670,22 +1721,32 @@ func evaluateSessionAI(sessionState *aflock.SessionState) []string {
 // The input to each Rego policy is:
 //
 //	{
-//	  "policy": { ... policy fields ... },
-//	  "actions": [ ... session actions ... ],
-//	  "metrics": { ... session metrics ... }
+//	  "policy":       { ... policy fields ... },
+//	  "actions":      [ ... session actions ... ],
+//	  "metrics":      { ... session metrics ... },
+//	  "attestations": [ ... parsed in-toto Statements ... ],
+//	  "envelopes":    [ ... raw DSSE envelopes ... ]
 //	}
 //
+// `attestations` and `envelopes` close the gap from paper §4.5.1 / issue #118:
+// Rego evaluators couldn't see attestations, so the paper's sample cross-step
+// `[t | some t in input.attestations]` always returned empty.
+//
 // Each Rego module must define a `deny` rule returning denial reason strings.
-func evaluateSessionRego(sessionState *aflock.SessionState) []string {
+func evaluateSessionRego(sessionState *aflock.SessionState, attestDir string) []string {
 	if sessionState.Policy.Evaluators == nil || len(sessionState.Policy.Evaluators.Rego) == 0 {
 		return nil
 	}
 
+	statements, envelopes := loadAttestationStatements(attestDir)
+
 	// Build the input for Rego evaluation
 	input := map[string]any{
-		"policy":  sessionState.Policy,
-		"actions": sessionState.Actions,
-		"metrics": sessionState.Metrics,
+		"policy":       sessionState.Policy,
+		"actions":      sessionState.Actions,
+		"metrics":      sessionState.Metrics,
+		"attestations": statements,
+		"envelopes":    envelopes,
 	}
 
 	inputJSON, err := json.Marshal(input)
