@@ -1468,20 +1468,30 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 	}
 
 	metrics := map[string]any{
-		"turns":        0,
-		"toolCalls":    0,
-		"tokensIn":     0,
-		"tokensOut":    0,
-		"costUSD":      0.0,
-		"filesRead":    0,
-		"filesWritten": 0,
+		"turns":              0,
+		"toolCalls":          0,
+		"tokensIn":           0,
+		"tokensOut":          0,
+		"cacheReadTokens":    0,
+		"cacheWrite5mTokens": 0,
+		"cacheWrite1hTokens": 0,
+		"costUSD":            0.0,
+		"costMeasured":       false,
+		"usageSource":        "",
+		"filesRead":          0,
+		"filesWritten":       0,
 	}
 	if sessionState.Metrics != nil {
 		metrics["turns"] = sessionState.Metrics.Turns
 		metrics["toolCalls"] = sessionState.Metrics.ToolCalls
 		metrics["tokensIn"] = sessionState.Metrics.TokensIn
 		metrics["tokensOut"] = sessionState.Metrics.TokensOut
+		metrics["cacheReadTokens"] = sessionState.Metrics.CacheReadTokens
+		metrics["cacheWrite5mTokens"] = sessionState.Metrics.CacheWrite5mTokens
+		metrics["cacheWrite1hTokens"] = sessionState.Metrics.CacheWrite1hTokens
 		metrics["costUSD"] = sessionState.Metrics.CostUSD
+		metrics["costMeasured"] = sessionState.Metrics.CostMeasured
+		metrics["usageSource"] = sessionState.Metrics.UsageSource
 		metrics["filesRead"] = len(sessionState.Metrics.FilesRead)
 		metrics["filesWritten"] = len(sessionState.Metrics.FilesWritten)
 	}
@@ -1490,6 +1500,7 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 		"sessionId":    s.sessionID,
 		"policyName":   policyName,
 		"startedAt":    sessionState.StartedAt,
+		"authMode":     sessionState.AuthMode,
 		"metrics":      metrics,
 		"actionsCount": len(sessionState.Actions),
 	}

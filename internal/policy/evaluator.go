@@ -997,6 +997,28 @@ func matchGrantPattern(value string, patterns []string) (bool, string) {
 	return false, ""
 }
 
+// IsAdvisoryLimit reports whether a named limit must be downgraded
+// from enforce to advisory under the given auth mode. Cost-derived
+// limits (maxSpendUSD) are advisory under non-api_key modes because
+// the JSONL-derived dollar number doesn't include claude-code's
+// internal helper calls (title-gen haiku, compaction) and so cannot
+// match a subscription bill. Token limits (maxTokensIn/Out) stay
+// enforced under both modes because the transcript's token counts
+// match Anthropic's accounting for visible turns regardless of how
+// the session is billed.
+//
+// Returns false when authMode is empty or api_key — i.e., enforce.
+func (e *Evaluator) IsAdvisoryLimit(limitName, authMode string) bool {
+	if authMode == "" || authMode == "api_key" {
+		return false
+	}
+	switch limitName {
+	case "maxSpendUSD":
+		return true
+	}
+	return false
+}
+
 // CheckLimits checks if cumulative metrics exceed policy limits.
 // Returns (exceeded, limitName, message).
 // CheckWallTime reports whether the session has exceeded maxWallTimeSeconds

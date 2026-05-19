@@ -515,6 +515,14 @@ type SessionState struct {
 	// fire on real sessions without needing the policy author to manually set
 	// materialsFrom.session.merkleRoot up front (issue #119).
 	SessionMerkleRoot string `json:"session_merkle_root,omitempty"`
+	// AuthMode records which claude-code authentication path was active
+	// at SessionStart (api_key | subscription | unknown). Cost-based
+	// limits like maxSpendUSD enforce only under api_key; under
+	// subscription the JSONL-derived dollar number is systematically
+	// wrong (claude-code's internal helper calls don't land in the
+	// transcript) so the limit is downgraded to advisory by
+	// policy.Evaluator.IsAdvisoryLimit.
+	AuthMode string `json:"auth_mode,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.
@@ -559,15 +567,27 @@ func (p *PropagationRecord) IsExpiredPropagation(ttl time.Duration) bool {
 }
 
 // SessionMetrics tracks cumulative metrics.
+//
+// Token and cache breakdowns are derived from the Claude Code session
+// JSONL transcript by internal/usage. CostUSD is the published
+// per-token math against that transcript; it converges with Anthropic's
+// invoice only under api_key auth mode. UsageSource records which
+// pipeline produced the numbers ("transcript" today; future
+// "admin-api" reconciliation will overwrite it).
 type SessionMetrics struct {
-	TokensIn     int64          `json:"tokensIn"`
-	TokensOut    int64          `json:"tokensOut"`
-	CostUSD      float64        `json:"costUSD"`
-	Turns        int            `json:"turns"`
-	ToolCalls    int            `json:"toolCalls"`
-	Tools        map[string]int `json:"tools"`
-	FilesRead    []string       `json:"filesRead,omitempty"`
-	FilesWritten []string       `json:"filesWritten,omitempty"`
+	TokensIn          int64          `json:"tokensIn"`
+	TokensOut         int64          `json:"tokensOut"`
+	CacheReadTokens   int64          `json:"cacheReadTokens,omitempty"`
+	CacheWrite5mTokens int64         `json:"cacheWrite5mTokens,omitempty"`
+	CacheWrite1hTokens int64         `json:"cacheWrite1hTokens,omitempty"`
+	CostUSD           float64        `json:"costUSD"`
+	CostMeasured      bool           `json:"costMeasured,omitempty"`
+	UsageSource       string         `json:"usageSource,omitempty"`
+	Turns             int            `json:"turns"`
+	ToolCalls         int            `json:"toolCalls"`
+	Tools             map[string]int `json:"tools"`
+	FilesRead         []string       `json:"filesRead,omitempty"`
+	FilesWritten      []string       `json:"filesWritten,omitempty"`
 }
 
 // ActionRecord represents a recorded action.

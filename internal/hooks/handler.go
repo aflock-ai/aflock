@@ -20,6 +20,7 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
+	"github.com/aflock-ai/aflock/internal/auth/claudeauth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
@@ -158,6 +159,11 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 
 	// Initialize session state
 	sessionState := h.stateManager.Initialize(input.SessionID, pol, policyPath)
+
+	// Capture which claude-code auth path is active. Cost-based limits
+	// downgrade to advisory unless this is api_key — see
+	// internal/auth/claudeauth/detect.go for the why.
+	sessionState.AuthMode = string(claudeauth.Detect())
 
 	// Save agent identity metadata for reuse in PostToolUse attestations
 	sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
@@ -639,6 +645,12 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// Refresh token/cost metrics from the claude-code transcript JSONL
+	// before evaluating limits. The in-process counters (Turns, Tokens,
+	// CostUSD) are only populated by this scan — without it, every
+	// cost-based limit would silently evaluate as 0.
+	refreshUsageFromTranscript(sessionState, input.TranscriptPath, sessionState.AuthMode)
+
 	// Save updated state
 	if err := h.stateManager.Save(sessionState); err != nil {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
@@ -649,8 +661,14 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "fail-fast")
 		if exceeded {
-			return output.Write(output.PostToolUseBlock(
-				fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced — JSONL-derived cost is approximate under non-api_key sessions): %s\n",
+					limitName, sessionState.AuthMode, msg)
+			} else {
+				return output.Write(output.PostToolUseBlock(
+					fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 		// maxWallTimeSeconds isn't represented in SessionMetrics, so check it
 		// against StartedAt separately (issue #120).
@@ -1123,13 +1141,21 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 			fmt.Sprintf("[aflock] Subagent cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
-	// Check post-hoc limits on the child session
+	// Check post-hoc limits on the child session. Cost-based limits are
+	// downgraded to advisory unless this is an api_key session — same
+	// rationale as the top-level SessionEnd path.
 	if childState.Policy != nil && childState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(childState.Policy, filepath.Dir(childState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(childState.Metrics, "post-hoc")
 		if exceeded {
-			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, childState.AuthMode) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: subagent %s exceeded under auth_mode=%s (not enforced): %s\n",
+					limitName, childState.AuthMode, msg)
+			} else {
+				return output.Write(output.StopBlock(
+					fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 		if !childState.StartedAt.IsZero() {
 			elapsed := time.Since(childState.StartedAt)
@@ -1160,6 +1186,14 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		return output.WriteEmpty()
 	}
 
+	// Settle the trailing turn into metrics: PostToolUse runs before the
+	// model's final assistant turn lands in the JSONL, so without this
+	// the last turn's tokens never make it into post-hoc enforcement.
+	refreshUsageFromTranscript(sessionState, input.TranscriptPath, sessionState.AuthMode)
+	if err := h.stateManager.Save(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
+	}
+
 	// Check post-hoc limits
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
@@ -1176,7 +1210,13 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 			}
 		}
 		if exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc"); exceeded {
-			recordPostHoc(limitName, msg)
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced): %s\n",
+					limitName, sessionState.AuthMode, msg)
+			} else {
+				recordPostHoc(limitName, msg)
+			}
 		}
 		if !sessionState.StartedAt.IsZero() {
 			elapsed := time.Since(sessionState.StartedAt)
@@ -1198,8 +1238,10 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 	}
 
 	// Log final metrics
-	fmt.Fprintf(os.Stderr, "[aflock] Session ended. Metrics: turns=%d, toolCalls=%d\n",
-		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls)
+	fmt.Fprintf(os.Stderr, "[aflock] Session ended. Metrics: turns=%d, toolCalls=%d, tokensIn=%d, tokensOut=%d, costUSD=%.4f (auth_mode=%s)\n",
+		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls,
+		sessionState.Metrics.TokensIn, sessionState.Metrics.TokensOut,
+		sessionState.Metrics.CostUSD, sessionState.AuthMode)
 
 	return output.WriteEmpty()
 }
