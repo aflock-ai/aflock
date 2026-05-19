@@ -2308,6 +2308,50 @@ func TestHandlePreToolUse_IdentityConstraints_NoSessionStart_Denies(t *testing.T
 	}
 }
 
+// Issue #121: PreToolUse must re-check identity policy against the persisted
+// AgentIdentityMeta as defense-in-depth, not only at post-hoc verify time.
+func TestHandlePreToolUse_IdentityConstraints_EnvironmentMismatch_Denies(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name: "identity-env",
+		Identity: &aflock.IdentityPolicy{
+			AllowedModels:       []string{"claude-*"},
+			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
+		},
+		Tools: &aflock.ToolsPolicy{Allow: []string{"*"}},
+	}
+	ss := seedSession(t, h, "sess-id-env", pol)
+	ss.AgentIdentityMeta = &aflock.AgentIdentityMeta{
+		Model:       "claude-opus-4-5-20251101",
+		Environment: "container:docker.io/evil/image",
+	}
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(&aflock.HookInput{
+			SessionID: "sess-id-env", ToolName: "Read",
+			ToolInput: json.RawMessage(`{"file_path":"/tmp/x"}`),
+		}); err != nil {
+			t.Fatalf("handlePreToolUse: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Fatalf("expected deny on environment mismatch, got %s (reason=%s)",
+			out.HookSpecificOutput.PermissionDecision, out.HookSpecificOutput.PermissionDecisionReason)
+	}
+	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "identity policy violation") {
+		t.Errorf("expected identity-policy-violation reason, got: %s",
+			out.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
 func TestHandlePreToolUse_NoIdentityConstraints_NoSessionStart_Allows(t *testing.T) {
 	h := newTestHandler(t)
 

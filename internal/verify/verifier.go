@@ -174,7 +174,7 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 			}
 			sort.Strings(id.Tools)
 		}
-		identityErrors := verifyIdentityConstraints(id, sessionState.Policy.Identity)
+		identityErrors := VerifyIdentityConstraints(id, sessionState.Policy.Identity)
 		if len(identityErrors) > 0 {
 			result.Success = false
 			for _, msg := range identityErrors {
@@ -972,7 +972,7 @@ func (v *Verifier) VerifySteps(pol *aflock.Policy, attestDir, treeHash string) (
 				stepResult.Errors = append(stepResult.Errors, fmt.Sprintf("Identity extraction failed: %v", err))
 				result.Success = false
 			} else if id != nil {
-				identityErrors := verifyIdentityConstraints(*id, pol.Identity)
+				identityErrors := VerifyIdentityConstraints(*id, pol.Identity)
 				for _, msg := range identityErrors {
 					stepResult.Errors = append(stepResult.Errors, msg)
 					result.Success = false
@@ -1761,10 +1761,13 @@ type IdentityFields struct {
 	Tools       []string // may be nil if not available (e.g., step-based verification)
 }
 
-// verifyIdentityConstraints checks identity fields against policy identity constraints.
+// VerifyIdentityConstraints checks identity fields against policy identity constraints.
 // Returns a list of errors for each constraint that fails. Returns nil if all pass
 // or if no identity policy is defined (no constraints = all identities allowed).
-func verifyIdentityConstraints(id IdentityFields, identityPolicy *aflock.IdentityPolicy) []string {
+//
+// Exported so runtime hooks (SessionStart/PreToolUse) can enforce identity
+// constraints up front, not only at post-hoc verify time (issue #121).
+func VerifyIdentityConstraints(id IdentityFields, identityPolicy *aflock.IdentityPolicy) []string {
 	if identityPolicy == nil {
 		return nil
 	}
