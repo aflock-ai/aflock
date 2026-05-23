@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -1666,6 +1667,11 @@ func evaluateSessionAI(sessionState *aflock.SessionState) []string {
 	return errors
 }
 
+// costFloatLexicalFix matches JSON cost fields whose values lack a decimal point
+// (json.Marshal of float64(5.0) emits "5"). OPA reads such numbers as ints and
+// rejects them in Rego "%f" sprintf calls. See issue #122.
+var costFloatLexicalFix = regexp.MustCompile(`("costUSD")\s*:\s*(-?\d+)([,}\]])`)
+
 // evaluateSessionRego runs top-level Rego evaluators against session data (Phase 4).
 // The input to each Rego policy is:
 //
@@ -1692,6 +1698,10 @@ func evaluateSessionRego(sessionState *aflock.SessionState) []string {
 	if err != nil {
 		return []string{fmt.Sprintf("Rego evaluation failed: marshal input: %v", err)}
 	}
+	// json.Marshal drops trailing zeros from whole floats (5.0 → "5"), which OPA
+	// then treats as int — breaking "%.2f" in Rego sprintf. Restore float form
+	// on known float-typed fields. See issue #122.
+	inputJSON = costFloatLexicalFix.ReplaceAll(inputJSON, []byte(`$1:$2.0$3`))
 
 	// Convert aflock evaluators to rego.Policy
 	policies := make([]aflockRego.Policy, len(sessionState.Policy.Evaluators.Rego))

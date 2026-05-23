@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -687,6 +688,52 @@ deny[msg] {
 	}
 	if !foundRego {
 		t.Error("Expected failing rego check")
+	}
+}
+
+// Regression for issue #122: a whole-number CostUSD (e.g. 5.00) gets marshaled
+// as "5" and OPA reads it as an int, breaking "%.2f" in Rego sprintf with the
+// "%!f(int=N)" debug marker. The verifier patches the JSON before handing it
+// to OPA, so the deny reason must come back cleanly formatted.
+func TestVerifySession_RegoDeny_WholeNumberCost(t *testing.T) {
+	tmpDir := t.TempDir()
+	ss := &aflock.SessionState{
+		SessionID: "sess-rego-whole-cost",
+		StartedAt: time.Now().Add(-5 * time.Minute),
+		Policy: &aflock.Policy{
+			Name:    "rego-test",
+			Version: "1.0",
+			Evaluators: &aflock.EvaluatorsPolicy{
+				Rego: []aflock.RegoEvaluator{{
+					Name: "spend-limit",
+					Policy: `package aflock
+deny[msg] {
+  input.metrics.costUSD > 2.0
+  msg := sprintf("Child spend $%.2f exceeds $2.00 budget", [input.metrics.costUSD])
+}`,
+				}},
+			},
+		},
+		Actions: []aflock.ActionRecord{
+			{Timestamp: time.Now(), ToolName: "Read", ToolUseID: "tu_1", Decision: "allow"},
+		},
+		Metrics: &aflock.SessionMetrics{CostUSD: 5.00},
+	}
+	writeSessionState(t, tmpDir, "sess-rego-whole-cost", ss)
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-rego-whole-cost")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if result.Success {
+		t.Fatal("Expected rego deny")
+	}
+	joined := strings.Join(result.Errors, " | ")
+	if strings.Contains(joined, "%!f") {
+		t.Errorf("deny reason has sprintf format bug: %s", joined)
+	}
+	if !strings.Contains(joined, "$5.00") {
+		t.Errorf("expected formatted $5.00 in deny reason, got: %s", joined)
 	}
 }
 
