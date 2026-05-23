@@ -652,6 +652,15 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 			return output.Write(output.PostToolUseBlock(
 				fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
 		}
+		// maxWallTimeSeconds isn't represented in SessionMetrics, so check it
+		// against StartedAt separately (issue #120).
+		if !sessionState.StartedAt.IsZero() {
+			elapsed := time.Since(sessionState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "fail-fast"); exceeded {
+				return output.Write(output.PostToolUseBlock(
+					fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			}
+		}
 	}
 
 	// Create and store attestation for this tool call
@@ -1122,6 +1131,13 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 			return output.Write(output.StopBlock(
 				fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
 		}
+		if !childState.StartedAt.IsZero() {
+			elapsed := time.Since(childState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "post-hoc"); exceeded {
+				return output.Write(output.StopBlock(
+					fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			}
+		}
 	}
 
 	return output.Write(output.StopAllow())
@@ -1147,10 +1163,8 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 	// Check post-hoc limits
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
-		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
-		if exceeded {
+		recordPostHoc := func(limitName, msg string) {
 			fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
-			// Record the violation in session state for audit trail
 			h.stateManager.RecordAction(sessionState, aflock.ActionRecord{
 				Timestamp: time.Now(),
 				ToolName:  "SessionEnd",
@@ -1159,6 +1173,15 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 			})
 			if err := h.stateManager.Save(sessionState); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
+			}
+		}
+		if exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc"); exceeded {
+			recordPostHoc(limitName, msg)
+		}
+		if !sessionState.StartedAt.IsZero() {
+			elapsed := time.Since(sessionState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "post-hoc"); exceeded {
+				recordPostHoc(limitName, msg)
 			}
 		}
 	}

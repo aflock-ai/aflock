@@ -483,6 +483,44 @@ func TestHandlePostToolUse_NoSession(t *testing.T) {
 	}
 }
 
+// Issue #120: maxWallTimeSeconds must block at PostToolUse when fail-fast and
+// the session has run longer than the limit — previously the field only set
+// the JWT TTL and never gated tool execution.
+func TestHandlePostToolUse_MaxWallTime_FailFast_Blocks(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name: "walltime",
+		Limits: &aflock.LimitsPolicy{
+			MaxWallTimeSeconds: &aflock.Limit{Value: 1, Enforcement: "fail-fast"},
+		},
+	}
+	ss := seedSession(t, h, "session-walltime", pol)
+	ss.StartedAt = time.Now().Add(-2 * time.Minute)
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePostToolUse(&aflock.HookInput{
+			SessionID: "session-walltime", ToolName: "Read",
+			ToolInput: json.RawMessage(`{"file_path": "/tmp/x"}`),
+		}); err != nil {
+			t.Fatalf("handlePostToolUse: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.Decision != "block" {
+		t.Fatalf("expected block decision, got %q (raw=%s)", out.Decision, got)
+	}
+	if !strings.Contains(out.Reason, "maxWallTimeSeconds") {
+		t.Errorf("expected maxWallTimeSeconds in reason, got: %s", out.Reason)
+	}
+}
+
 // ----- PostToolUse: file tracking - Read -----
 
 func TestHandlePostToolUse_TracksFileRead(t *testing.T) {

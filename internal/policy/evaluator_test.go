@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -1216,6 +1217,59 @@ func TestCheckLimits(t *testing.T) {
 			}
 			if !tt.wantExceed && msg != "" {
 				t.Errorf("expected empty message when limit not exceeded, got %q", msg)
+			}
+		})
+	}
+}
+
+// Issue #120: maxWallTimeSeconds is parsed but was never enforced beyond the
+// JWT TTL. CheckWallTime gives PostToolUse / Stop a way to actually block.
+func TestCheckWallTime(t *testing.T) {
+	tests := []struct {
+		name        string
+		policy      *aflock.Policy
+		elapsed     time.Duration
+		enforcement string
+		wantExceed  bool
+	}{
+		{
+			name: "under limit",
+			policy: &aflock.Policy{Limits: &aflock.LimitsPolicy{
+				MaxWallTimeSeconds: &aflock.Limit{Value: 60, Enforcement: "fail-fast"},
+			}},
+			elapsed: 30 * time.Second, enforcement: "fail-fast", wantExceed: false,
+		},
+		{
+			name: "over limit fail-fast",
+			policy: &aflock.Policy{Limits: &aflock.LimitsPolicy{
+				MaxWallTimeSeconds: &aflock.Limit{Value: 60, Enforcement: "fail-fast"},
+			}},
+			elapsed: 90 * time.Second, enforcement: "fail-fast", wantExceed: true,
+		},
+		{
+			name: "fail-fast policy skipped at post-hoc mode",
+			policy: &aflock.Policy{Limits: &aflock.LimitsPolicy{
+				MaxWallTimeSeconds: &aflock.Limit{Value: 60, Enforcement: "fail-fast"},
+			}},
+			elapsed: 90 * time.Second, enforcement: "post-hoc", wantExceed: false,
+		},
+		{
+			name: "no limit defined",
+			policy: &aflock.Policy{Limits: &aflock.LimitsPolicy{
+				MaxSpendUSD: &aflock.Limit{Value: 5, Enforcement: "fail-fast"},
+			}},
+			elapsed: 1 * time.Hour, enforcement: "fail-fast", wantExceed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := NewEvaluator(tt.policy, "")
+			exceeded, name, msg := e.CheckWallTime(tt.elapsed, tt.enforcement)
+			if exceeded != tt.wantExceed {
+				t.Fatalf("exceeded=%v want %v (name=%q msg=%q)", exceeded, tt.wantExceed, name, msg)
+			}
+			if tt.wantExceed && name != "maxWallTimeSeconds" {
+				t.Errorf("limit name=%q want maxWallTimeSeconds", name)
 			}
 		})
 	}

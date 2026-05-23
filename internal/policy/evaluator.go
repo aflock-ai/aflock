@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -998,6 +999,25 @@ func matchGrantPattern(value string, patterns []string) (bool, string) {
 
 // CheckLimits checks if cumulative metrics exceed policy limits.
 // Returns (exceeded, limitName, message).
+// CheckWallTime reports whether the session has exceeded maxWallTimeSeconds
+// at the given enforcement mode. CheckLimits doesn't see elapsed time so wall-
+// time gating lives in its own helper (issue #120).
+func (e *Evaluator) CheckWallTime(elapsed time.Duration, enforcementMode string) (bool, string, string) {
+	if e.policy.Limits == nil || e.policy.Limits.MaxWallTimeSeconds == nil {
+		return false, "", ""
+	}
+	limit := e.policy.Limits.MaxWallTimeSeconds
+	if limit.Enforcement != enforcementMode {
+		return false, "", ""
+	}
+	current := elapsed.Seconds()
+	if current >= limit.Value {
+		return true, "maxWallTimeSeconds",
+			fmt.Sprintf("maxWallTimeSeconds exceeded: %.0fs >= %.0fs", current, limit.Value)
+	}
+	return false, "", ""
+}
+
 func (e *Evaluator) CheckLimits(metrics *aflock.SessionMetrics, enforcementMode string) (bool, string, string) {
 	if e.policy.Limits == nil {
 		return false, "", ""
