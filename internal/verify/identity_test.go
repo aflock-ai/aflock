@@ -870,6 +870,46 @@ func TestVerifySession_MerklePass(t *testing.T) {
 	}
 }
 
+// Issue #119: when SessionEnd auto-populated sessionState.SessionMerkleRoot
+// the verifier must run Phase 3 against that root, even without policy
+// declaring materialsFrom — closing the "Phase 3 never fires on real sessions"
+// gap. Tampering with state.json afterwards must surface here.
+func TestVerifySession_MerklePass_AutoPopulatedRoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	actions := []aflock.ActionRecord{
+		{Timestamp: time.Now(), ToolName: "Read", ToolUseID: "tu_1", Decision: "allow"},
+		{Timestamp: time.Now(), ToolName: "Edit", ToolUseID: "tu_2", Decision: "allow"},
+	}
+	root := buildMerkleRootFromActions(t, actions)
+
+	ss := &aflock.SessionState{
+		SessionID:         "sess-merkle-auto",
+		StartedAt:         time.Now().Add(-5 * time.Minute),
+		Policy:            &aflock.Policy{Name: "no-materialsFrom", Version: "1.0"},
+		Actions:           actions,
+		Metrics:           &aflock.SessionMetrics{},
+		SessionMerkleRoot: root, // simulates SessionEnd auto-populate
+	}
+	writeSessionState(t, tmpDir, "sess-merkle-auto", ss)
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-merkle-auto")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got errors: %v", result.Errors)
+	}
+	found := false
+	for _, c := range result.Checks {
+		if c.Name == "materials:merkle" && c.Passed {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected materials:merkle check to fire from auto-populated root")
+	}
+}
+
 func TestVerifySession_MerkleFail_TamperedAction(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalActions := []aflock.ActionRecord{

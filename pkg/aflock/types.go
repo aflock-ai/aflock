@@ -510,6 +510,11 @@ type SessionState struct {
 	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
 	// behavior without a state-shape migration.
 	SigningMode string `json:"signing_mode,omitempty"`
+	// SessionMerkleRoot is the RFC 6962 Merkle root computed over JCS-canonical
+	// session.Actions at SessionEnd. Auto-populated so Phase 3 materials checks
+	// fire on real sessions without needing the policy author to manually set
+	// materialsFrom.session.merkleRoot up front (issue #119).
+	SessionMerkleRoot string `json:"session_merkle_root,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.

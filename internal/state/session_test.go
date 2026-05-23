@@ -309,3 +309,42 @@ func TestLoadMetrics(t *testing.T) {
 		t.Error("Metrics should be nil for nonexistent session")
 	}
 }
+
+// Issue #119: ComputeSessionMerkleRoot must derive a non-empty root from a
+// session's recorded actions so verify-time Phase 3 has something to bind to
+// without the policy author setting materialsFrom.session.merkleRoot up front.
+func TestComputeSessionMerkleRoot(t *testing.T) {
+	m := NewManager(t.TempDir())
+	ts := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+
+	t.Run("empty actions leaves field empty", func(t *testing.T) {
+		s := &aflock.SessionState{SessionID: "s1", Actions: nil}
+		if err := m.ComputeSessionMerkleRoot(s); err != nil {
+			t.Fatalf("ComputeSessionMerkleRoot: %v", err)
+		}
+		if s.SessionMerkleRoot != "" {
+			t.Errorf("expected empty root for empty actions, got %q", s.SessionMerkleRoot)
+		}
+	})
+
+	t.Run("non-empty actions produce stable root", func(t *testing.T) {
+		actions := []aflock.ActionRecord{
+			{Timestamp: ts, ToolName: "Read", ToolUseID: "a1", Decision: "allow"},
+			{Timestamp: ts, ToolName: "Edit", ToolUseID: "a2", Decision: "allow"},
+		}
+		s1 := &aflock.SessionState{SessionID: "s1", Actions: actions}
+		s2 := &aflock.SessionState{SessionID: "s2", Actions: actions}
+		if err := m.ComputeSessionMerkleRoot(s1); err != nil {
+			t.Fatalf("compute s1: %v", err)
+		}
+		if err := m.ComputeSessionMerkleRoot(s2); err != nil {
+			t.Fatalf("compute s2: %v", err)
+		}
+		if s1.SessionMerkleRoot == "" {
+			t.Fatal("expected non-empty root")
+		}
+		if s1.SessionMerkleRoot != s2.SessionMerkleRoot {
+			t.Errorf("same actions produced different roots: %q vs %q", s1.SessionMerkleRoot, s2.SessionMerkleRoot)
+		}
+	})
+}

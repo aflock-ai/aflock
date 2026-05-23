@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	aflockMerkle "github.com/aflock-ai/aflock/internal/merkle"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -200,6 +201,31 @@ func (m *Manager) RecordAction(state *aflock.SessionState, record aflock.ActionR
 		state.Metrics.Tools = make(map[string]int)
 	}
 	state.Metrics.Tools[record.ToolName]++
+}
+
+// ComputeSessionMerkleRoot builds the RFC 6962 Merkle root over the session's
+// recorded actions and writes it to state.SessionMerkleRoot. Empty actions
+// list leaves the field untouched (no root to commit). Used at SessionEnd so
+// Phase 3 materials verification fires on real sessions without the policy
+// author having to set materialsFrom.session.merkleRoot up front (issue #119).
+func (m *Manager) ComputeSessionMerkleRoot(state *aflock.SessionState) error {
+	if state == nil || len(state.Actions) == 0 {
+		return nil
+	}
+	entries := make([][]byte, 0, len(state.Actions))
+	for i, action := range state.Actions {
+		data, err := json.Marshal(action)
+		if err != nil {
+			return fmt.Errorf("marshal action %d: %w", i, err)
+		}
+		entries = append(entries, data)
+	}
+	root, err := aflockMerkle.BuildRoot(entries)
+	if err != nil {
+		return fmt.Errorf("build merkle root: %w", err)
+	}
+	state.SessionMerkleRoot = root
+	return nil
 }
 
 // AttestationsDir returns the attestations directory for a session.

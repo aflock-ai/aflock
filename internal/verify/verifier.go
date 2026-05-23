@@ -194,8 +194,12 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 		}
 	}
 
-	// Check 0.5: Materials binding / Merkle tree (Phase 3)
-	if sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil {
+	// Check 0.5: Materials binding / Merkle tree (Phase 3). The check runs
+	// when the policy declares a session materials binding OR when SessionEnd
+	// auto-recorded a root in state — the latter catches post-hoc state
+	// tampering even when the policy didn't pre-commit a root (issue #119).
+	if (sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil) ||
+		sessionState.SessionMerkleRoot != "" {
 		merkleErrors := verifySessionMerkle(sessionState)
 		if len(merkleErrors) > 0 {
 			result.Success = false
@@ -1731,15 +1735,20 @@ func evaluateSessionRego(sessionState *aflock.SessionState) []string {
 // verifySessionMerkle checks the Merkle tree root over session actions (Phase 3).
 // It serializes each ActionRecord to JSON, builds a Merkle tree using RFC 6962 hashing
 // with JCS canonicalization, and compares the computed root against the expected root
-// stored in policy.MaterialsFrom.Session.MerkleRoot.
+// stored in policy.MaterialsFrom.Session.MerkleRoot. If the policy doesn't declare
+// an expected root, the auto-computed sessionState.SessionMerkleRoot (written at
+// SessionEnd) is used as the expected value, which catches post-hoc tampering of
+// state.json (issue #119).
 func verifySessionMerkle(sessionState *aflock.SessionState) []string {
-	if sessionState.Policy.MaterialsFrom == nil || sessionState.Policy.MaterialsFrom.Session == nil {
-		return nil
+	expectedRoot := ""
+	if sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil {
+		expectedRoot = sessionState.Policy.MaterialsFrom.Session.MerkleRoot
 	}
-
-	expectedRoot := sessionState.Policy.MaterialsFrom.Session.MerkleRoot
 	if expectedRoot == "" {
-		return nil // No expected root — nothing to verify
+		expectedRoot = sessionState.SessionMerkleRoot
+	}
+	if expectedRoot == "" {
+		return nil // No expected root and none auto-recorded — nothing to verify.
 	}
 
 	if len(sessionState.Actions) == 0 {
