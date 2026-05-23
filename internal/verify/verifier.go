@@ -68,6 +68,23 @@ type MetricsSummary struct {
 type Verifier struct {
 	stateManager *state.Manager
 	SkipAI       bool // Skip Phase 5 (AI Evaluation)
+	// pendingInherit is set by verifySublayouts right before recursing
+	// into a child verify when the sublayout declares Inherit fields.
+	// The next verifySessionWithDepth call that loads the matching child
+	// sessionID consumes it (set-and-clear) and overlays the parent's
+	// sections onto the loaded child policy in memory. Single-shot per
+	// recursion. The Verifier is not goroutine-safe by design (state
+	// manager is shared); this overlay piggybacks on that contract.
+	pendingInherit *inheritOverlay
+}
+
+// inheritOverlay captures the parent → child section transfer requested
+// by a Sublayout's Inherit list. Lives only for the duration of one
+// recursive verifySessionWithDepth call. See verifier.pendingInherit.
+type inheritOverlay struct {
+	childSessionID string
+	parentPolicy   *aflock.Policy
+	inheritFields  []string
 }
 
 // NewVerifier creates a new verifier.
@@ -106,6 +123,16 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 	}
 	if sessionState == nil {
 		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	// If verifySublayouts staged an Inherit overlay for this child
+	// session, apply it to the in-memory loaded policy before any check
+	// runs. The on-disk policy file is untouched — child digest stays
+	// valid; this is a verifier-side resolution of parent → child
+	// section transfer (§6 invariant). Consumed on first match.
+	if v.pendingInherit != nil && v.pendingInherit.childSessionID == sessionID {
+		sessionState.Policy = applyInherit(v.pendingInherit.parentPolicy, sessionState.Policy, v.pendingInherit.inheritFields)
+		v.pendingInherit = nil
 	}
 
 	result.PolicyName = sessionState.Policy.Name
@@ -1541,8 +1568,22 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int)
 
 			childFound = true
 
+			// Stage an Inherit overlay for the recursive verify if the
+			// sublayout declares any. verifySessionWithDepth consumes it
+			// on the matching child load. Defer-clear guarantees no
+			// stale overlay leaks past this iteration even on error.
+			if len(sub.Inherit) > 0 {
+				v.pendingInherit = &inheritOverlay{
+					childSessionID: childID,
+					parentPolicy:   parentState.Policy,
+					inheritFields:  sub.Inherit,
+				}
+			}
+
 			// 3. Recursively verify the child session
 			childResult, err := v.verifySessionWithDepth(childID, depth+1)
+			v.pendingInherit = nil
+
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("sublayout %q: verify child %s: %v", sub.Name, childID, err))
 				continue
@@ -1571,22 +1612,46 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int)
 }
 
 // matchesSublayout checks if a child session matches a sublayout definition.
-// Matches by policy name or attestation prefix.
+//
+// Precedence:
+//
+//  1. ParentSublayoutName — authoritative spawn-time binding set by
+//     matchSublayoutForSpawn (PR #112) at PreToolUse and stamped onto
+//     SessionState at SessionStart (handler.go). When present, this is
+//     the ONLY check that matters: the child belongs to exactly the
+//     sublayout slot it was bound to and to no other. Returning a
+//     definitive false here is what stops the wrong-slot misattribution
+//     that the previous "any orphan matches" fallback caused (#26).
+//
+//  2. Policy-name match — legacy/pre-#112 path where the child's policy
+//     happens to be named the same as the sublayout.
+//
+//  3. Attestation-prefix match — same legacy intent for sessions where
+//     the parent used AttestationPrefix instead of a name convention.
+//
+//  4. Loose parent-id fallback — kept ONLY for pre-#112 sessions that
+//     have no ParentSublayoutName recorded. New sessions take path (1)
+//     and never reach here.
 func matchesSublayout(child *aflock.SessionState, sub *aflock.Sublayout) bool {
 	if child.Policy == nil {
 		return false
 	}
-	// Match by policy name
+	// (1) Authoritative: precise spawn-time binding from PR #112.
+	if child.ParentSublayoutName != "" {
+		return child.ParentSublayoutName == sub.Name
+	}
+	// (2) Legacy: policy name matches sublayout name
 	if child.Policy.Name == sub.Name {
 		return true
 	}
-	// Match by attestation prefix (if set)
+	// (3) Legacy: attestation prefix
 	if sub.AttestationPrefix != "" && child.Policy.Name == sub.AttestationPrefix {
 		return true
 	}
-	// Match by parent session reference
+	// (4) Legacy: any child with a parent session reference. Pre-PR-#112
+	// sessions land here; modern sessions are caught by (1) first.
 	if child.ParentSessionID != "" {
-		return true // Child was spawned by this parent — assume it matches
+		return true
 	}
 	return false
 }
