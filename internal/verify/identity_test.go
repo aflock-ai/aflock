@@ -3,6 +3,7 @@ package verify
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -803,6 +804,58 @@ func TestVerifySession_RegoMultiplePolicies(t *testing.T) {
 	}
 	if len(result.Errors) < 2 {
 		t.Errorf("Expected at least 2 errors, got %d: %v", len(result.Errors), result.Errors)
+	}
+}
+
+// Issue #118 / paper §4.5.1: Rego evaluators must see attestations under
+// input.attestations and raw envelopes under input.envelopes. Before this PR
+// both keys were absent so the paper's sample cross-step Rego always saw an
+// empty list. Write two DSSE envelopes to the session's attestations dir and
+// run a Rego policy that counts them.
+func TestVerifySession_RegoSeesAttestations(t *testing.T) {
+	tmpDir := t.TempDir()
+	ss := &aflock.SessionState{
+		SessionID: "sess-rego-attest",
+		StartedAt: time.Now().Add(-5 * time.Minute),
+		Policy: &aflock.Policy{
+			Name: "rego-attest", Version: "1.0",
+			Evaluators: &aflock.EvaluatorsPolicy{
+				Rego: []aflock.RegoEvaluator{{
+					Name: "expect-attestations",
+					Policy: `package aflock
+deny[msg] {
+  count(input.attestations) < 2
+  msg := sprintf("expected >= 2 attestations, got %d", [count(input.attestations)])
+}
+deny[msg] {
+  count(input.envelopes) < 2
+  msg := sprintf("expected >= 2 envelopes, got %d", [count(input.envelopes)])
+}`,
+				}},
+			},
+		},
+		Metrics: &aflock.SessionMetrics{},
+	}
+	writeSessionState(t, tmpDir, "sess-rego-attest", ss)
+
+	attestDir := filepath.Join(tmpDir, "sess-rego-attest", "attestations")
+	if err := os.MkdirAll(attestDir, 0755); err != nil {
+		t.Fatalf("mkdir attestations: %v", err)
+	}
+	for i, tool := range []string{"Read", "Edit"} {
+		envBytes := makeDSSEEnvelope(t, tool, "sess-rego-attest")
+		fname := filepath.Join(attestDir, fmt.Sprintf("a%d.intoto.json", i))
+		if err := os.WriteFile(fname, envBytes, 0644); err != nil {
+			t.Fatalf("write %s: %v", fname, err)
+		}
+	}
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-rego-attest")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Rego saw fewer attestations than expected: errors=%v", result.Errors)
 	}
 }
 
