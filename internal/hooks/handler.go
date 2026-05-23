@@ -24,6 +24,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/verify"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -140,11 +141,17 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return nil
 	}
 
-	// Validate identity against policy constraints (skip if model is unknown in development)
-	if pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
-		if agentIdentity.Model != "unknown" && !agentIdentity.Matches(pol.Identity.AllowedModels, nil) {
-			output.ExitWithError(fmt.Sprintf("[aflock] Agent model '%s' not in allowed models: %v",
-				agentIdentity.Model, pol.Identity.AllowedModels))
+	// Enforce full identity policy (allowedModels + allowedEnvironments) at the
+	// runtime gate, not only at post-hoc verify time (issue #121).
+	// Skip if the model wasn't discovered ("unknown") so local dev keeps working.
+	if pol.Identity != nil && agentIdentity.Model != "unknown" {
+		id := verify.IdentityFields{Model: agentIdentity.Model}
+		if agentIdentity.Environment != nil {
+			id.Environment = agentIdentity.Environment.Type
+		}
+		// Tools usage isn't known yet — verifyIdentityConstraints skips requiredTools when Tools==nil.
+		if errs := verify.VerifyIdentityConstraints(id, pol.Identity); len(errs) > 0 {
+			output.ExitWithError(fmt.Sprintf("[aflock] Identity policy violation: %s", strings.Join(errs, "; ")))
 			return nil
 		}
 	}
@@ -448,6 +455,21 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 	pol := sessionState.Policy
 	if pol.IsExpired() {
 		return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
+	}
+
+	// Defense in depth: re-check identity constraints against the persisted
+	// AgentIdentityMeta. SessionStart already enforced this, but state could
+	// have been tampered with between hooks (issue #121).
+	if pol.Identity != nil && sessionState.AgentIdentityMeta != nil &&
+		sessionState.AgentIdentityMeta.Model != "" && sessionState.AgentIdentityMeta.Model != "unknown" {
+		id := verify.IdentityFields{
+			Model:       sessionState.AgentIdentityMeta.Model,
+			Environment: sessionState.AgentIdentityMeta.Environment,
+		}
+		if errs := verify.VerifyIdentityConstraints(id, pol.Identity); len(errs) > 0 {
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] BLOCKED: identity policy violation: %s", strings.Join(errs, "; "))))
+		}
 	}
 
 	// Validate the session JWT (#48). The signing key dies with the

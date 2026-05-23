@@ -13,11 +13,11 @@ import (
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
-// ---- Unit tests for verifyIdentityConstraints ----
+// ---- Unit tests for VerifyIdentityConstraints ----
 
 func TestVerifyIdentityConstraints_NilPolicy(t *testing.T) {
 	id := IdentityFields{Model: "claude-opus-4-5-20251101", Environment: "local"}
-	errors := verifyIdentityConstraints(id, nil)
+	errors := VerifyIdentityConstraints(id, nil)
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for nil policy, got %v", errors)
 	}
@@ -25,7 +25,7 @@ func TestVerifyIdentityConstraints_NilPolicy(t *testing.T) {
 
 func TestVerifyIdentityConstraints_EmptyPolicy(t *testing.T) {
 	id := IdentityFields{Model: "claude-opus-4-5-20251101", Environment: "local"}
-	errors := verifyIdentityConstraints(id, &aflock.IdentityPolicy{})
+	errors := VerifyIdentityConstraints(id, &aflock.IdentityPolicy{})
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for empty policy, got %v", errors)
 	}
@@ -86,7 +86,7 @@ func TestVerifyIdentityConstraints_ModelMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Model: tt.model}
 			pol := &aflock.IdentityPolicy{AllowedModels: tt.allowedModels}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -146,7 +146,7 @@ func TestVerifyIdentityConstraints_EnvironmentMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Environment: tt.environment}
 			pol := &aflock.IdentityPolicy{AllowedEnvironments: tt.allowed}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -216,7 +216,7 @@ func TestVerifyIdentityConstraints_RequiredTools(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Tools: tt.tools}
 			pol := &aflock.IdentityPolicy{RequiredTools: tt.requiredTools}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -244,7 +244,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
 			RequiredTools:       []string{"Read", "Edit"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		if len(errors) != 0 {
 			t.Errorf("Expected pass, got errors: %v", errors)
 		}
@@ -259,7 +259,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedModels:       []string{"claude-opus-*"},
 			AllowedEnvironments: []string{"local"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		if len(errors) != 1 {
 			t.Errorf("Expected 1 error (model mismatch), got %d: %v", len(errors), errors)
 		}
@@ -276,7 +276,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
 			RequiredTools:       []string{"Read", "Edit"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		// Should have: model mismatch + env mismatch + 2 missing tools = 4 errors
 		if len(errors) != 4 {
 			t.Errorf("Expected 4 errors, got %d: %v", len(errors), errors)
@@ -288,7 +288,7 @@ func TestVerifyIdentityConstraints_EmptyModel(t *testing.T) {
 	// Empty model with allowedModels should not error (graceful for missing data)
 	id := IdentityFields{Model: ""}
 	pol := &aflock.IdentityPolicy{AllowedModels: []string{"claude-opus-*"}}
-	errors := verifyIdentityConstraints(id, pol)
+	errors := VerifyIdentityConstraints(id, pol)
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for empty model, got %v", errors)
 	}
