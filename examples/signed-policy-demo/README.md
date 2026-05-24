@@ -67,10 +67,9 @@ directory, verifies the Fulcio cert chains to the Sigstore root and matches
 the trust config's issuer + subject pattern, then proceeds with the inner
 policy.
 
-## Caveat
+## Persistence
 
-This release does not yet wire TSA/Rekor SET into the envelope. Fulcio leaf
-certs are ~10 minutes valid, so a `.signed` file goes stale once the cert
-expires unless verification happens within that window. Re-sign close to
-verification. Tracking issue: add TSA/Rekor SET support for long-lived
-signed policies.
+The envelope bundles a Sigstore TSA timestamp, so verification uses the
+TSA-attested signing time rather than `time.Now()` when checking the Fulcio
+cert's validity. A `.signed` file committed today still verifies months from
+now. Re-sign only when the policy itself changes.

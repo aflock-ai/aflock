@@ -215,16 +215,18 @@ Any DSSE-envelope-shaped file is treated as "must verify or hard-fail." This
 closes the silent-degrade bug where passing an envelope to a pre-signing
 `policy.Load` returned an empty allow-most policy.
 
-### Caveat: cert validity window
+### TSA timestamping
 
-Fulcio leaf certs are ~10 minutes valid. This release does not yet wire
-TSA/Rekor SET into the envelope, so verifiers using `time.Now()` reject after
-expiry. The follow-up issue (linked from the PR introducing this work) tracks
-TSA support that lets a signature outlive the cert.
+Every signed envelope bundles an RFC 3161 timestamp from the Sigstore
+Public Good TSA (`https://timestamp.sigstore.dev/api/v1/timestamp`). Verifiers
+use the TSA-attested time when checking the Fulcio leaf cert's validity, so
+signatures stay verifiable past the cert's ~10-minute window. Sign once,
+verify forever.
 
-In practice: re-sign close to verification. The provided
-`.github/workflows/sign-policy.yml` does this automatically on every policy
-change.
+`$AFLOCK_TSA_URL` overrides the endpoint for self-hosted Sigstore.
+`$AFLOCK_TSA_DISABLE=1` skips timestamping at sign time (the resulting
+envelope only verifies inside the Fulcio cert window — only useful for
+air-gapped tests).
 
 ## Functionaries
 

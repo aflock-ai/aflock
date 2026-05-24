@@ -38,4 +38,8 @@ docs-website/build/
 docs-website/.docusaurus/
 
 *.crt
-*.key   
+*.key
+
+# Per-developer signed-policy envelopes (Fulcio cert binds the signer's
+# identity — never check in committed signatures from a single contributor).
+examples/**/.aflock.signed

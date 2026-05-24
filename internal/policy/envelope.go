@@ -12,6 +12,7 @@ import (
 
 	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/policysig"
+	"github.com/aflock-ai/rookery/attestation/timestamp"
 	"github.com/sigstore/fulcio/pkg/certificate"
 
 	"github.com/aflock-ai/aflock/pkg/aflock"
@@ -95,8 +96,15 @@ func verifyAndUnwrap(ctx context.Context, envelopeBytes []byte, trust *aflock.Tr
 			uris = []string{v.SubjectPattern}
 		}
 
+		tsaVerifiers, err := loadTSAVerifiers()
+		if err != nil {
+			lastErr = fmt.Errorf("verifier(issuer=%s): load tsa roots: %w", v.Issuer, err)
+			continue
+		}
+
 		opts := policysig.NewVerifyPolicySignatureOptions(
 			policysig.VerifyWithPolicyCARoots(roots),
+			policysig.VerifyWithPolicyTimestampAuthorities(tsaVerifiers),
 			policysig.VerifyWithPolicyCertConstraints(
 				"*",           // commonName
 				[]string{"*"}, // dnsNames
@@ -179,6 +187,44 @@ func signatureInfoFromCert(cert *x509.Certificate) *aflock.SignatureInfo {
 	}
 
 	return info
+}
+
+// loadTSAVerifiers returns timestamp verifiers built from the embedded
+// Sigstore TSA cert chain. A signed policy is expected to bundle an RFC 3161
+// timestamp; the verifier uses the TSA-attested time when checking the Fulcio
+// leaf cert's validity, so signatures stay verifiable past the cert's
+// ~10-minute window.
+func loadTSAVerifiers() ([]timestamp.TimestampVerifier, error) {
+	certs, err := parsePEMCerts([]byte(SigstoreProductionTSACerts))
+	if err != nil {
+		return nil, fmt.Errorf("parse embedded TSA chain: %w", err)
+	}
+	return []timestamp.TimestampVerifier{timestamp.NewVerifier(timestamp.VerifyWithCerts(certs))}, nil
+}
+
+// parsePEMCerts decodes concatenated PEM-encoded certificates.
+func parsePEMCerts(pemBytes []byte) ([]*x509.Certificate, error) {
+	out := make([]*x509.Certificate, 0)
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cert)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no certificates found in PEM bytes")
+	}
+	return out, nil
 }
 
 // isEmail returns true for subject patterns that should be matched against the

@@ -3,6 +3,7 @@ package policy
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/cryptoutil"
+	"github.com/aflock-ai/rookery/attestation/timestamp"
 	fulcioSigner "github.com/aflock-ai/rookery/plugins/signers/fulcio"
 )
 
@@ -18,19 +20,23 @@ import (
 const DefaultFulcioURL = "https://fulcio.sigstore.dev"
 
 // SignWithFulcio wraps policyBytes in a DSSE envelope signed by an ephemeral
-// Fulcio-issued keypair bound to the caller's OIDC identity. Returns the
-// envelope as JSON suitable for writing as a .signed file.
+// Fulcio-issued keypair bound to the caller's OIDC identity, and bundles an
+// RFC 3161 timestamp from the Sigstore TSA so verifiers using time.Now()
+// don't reject after the Fulcio cert's ~10-minute validity window.
 //
 // OIDC token source resolution:
 //   - GITHUB_ACTIONS=true: tokens fetched automatically (workflow needs id-token: write)
 //   - $FULCIO_TOKEN: literal token (for testing or out-of-band CI)
 //   - $FULCIO_TOKEN_PATH: token read from file
+//   - $FULCIO_OIDC_ISSUER: interactive browser OAuth (local dev)
 //
-// Caveats:
-//   - The Fulcio cert in the produced envelope is ~10 min valid. Without a TSA
-//     or Rekor SET (not yet wired — follow-up), verifiers using time.Now() will
-//     reject after expiry. Re-sign close to verification, or sign in CI on
-//     every policy change.
+// TSA configuration:
+//   - $AFLOCK_TSA_URL: override the Sigstore production TSA endpoint
+//   - $AFLOCK_TSA_DISABLE=1: skip timestamping (signature stops verifying
+//     after Fulcio cert expiry; only useful for air-gapped tests)
+//
+// Requires network reach to both Fulcio and the TSA at sign time. Verify time
+// is offline once the envelope is in hand.
 func SignWithFulcio(ctx context.Context, policyBytes []byte) ([]byte, error) {
 	provider, err := buildPolicyFulcioProvider()
 	if err != nil {
@@ -49,11 +55,20 @@ func SignWithFulcio(ctx context.Context, policyBytes []byte) ([]byte, error) {
 		return nil, fmt.Errorf("fulcio signer is not an X509Signer (got %T)", signer)
 	}
 
-	envelope, err := rdsse.Sign(
-		PolicyPayloadType,
-		bytes.NewReader(policyBytes),
-		rdsse.SignWithSigners(signer),
-	)
+	signOpts := []rdsse.SignOption{rdsse.SignWithSigners(signer)}
+	if os.Getenv("AFLOCK_TSA_DISABLE") != "1" {
+		tsaURL := os.Getenv("AFLOCK_TSA_URL")
+		if tsaURL == "" {
+			tsaURL = DefaultSigstoreTSAURL
+		}
+		tsa := timestamp.NewTimestamper(
+			timestamp.TimestampWithUrl(tsaURL),
+			timestamp.TimestampWithHash(crypto.SHA256),
+		)
+		signOpts = append(signOpts, rdsse.SignWithTimestampers(tsa))
+	}
+
+	envelope, err := rdsse.Sign(PolicyPayloadType, bytes.NewReader(policyBytes), signOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("dsse sign: %w", err)
 	}
