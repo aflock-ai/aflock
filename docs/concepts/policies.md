@@ -147,15 +147,84 @@ Explicit authorization for resource access:
 }
 ```
 
-## Signing and Immutability
+## Signing and trust
 
-Policies are signed using a DSSE (Dead Simple Signing Envelope):
+aflock signs `.aflock` policies as DSSE envelopes using a Sigstore Fulcio-issued
+short-lived certificate bound to the signer's OIDC identity. There's no
+long-lived signing key to lose. Verification at `policy.Load` time chains the
+embedded cert to the Sigstore root and matches it against an operator-controlled
+`aflock-trust.json`.
+
+### Sign
 
 ```bash
-aflock sign policy.aflock
+# In GitHub Actions (or any OIDC-aware CI), with id-token: write:
+GITHUB_ACTIONS=true aflock sign .aflock      # writes .aflock.signed
+
+# Locally, providing a token out-of-band:
+FULCIO_TOKEN=<oidc-jwt> aflock sign .aflock
 ```
 
-Once signed, the agent cannot modify the policy. The signature is verified during every attestation check.
+The produced `.aflock.signed` is a DSSE envelope
+(`payloadType: application/vnd.aflock.policy+json`) containing the policy bytes,
+the Fulcio leaf cert, and the signature.
+
+### Trust config
+
+Trust roots live in `aflock-trust.json`, resolved in this order (first hit wins):
+
+1. `$AFLOCK_TRUST_CONFIG` (explicit operator override)
+2. `<policy_dir>/aflock-trust.json` (per-policy, version-controlled)
+3. `~/.aflock/trust.json` (per-user default)
+
+```json
+{
+  "version": "1",
+  "verifiers": [
+    {
+      "type": "sigstore",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "subjectPattern": "https://github.com/org/repo/.github/workflows/sign-policy.yml@refs/heads/main"
+    }
+  ]
+}
+```
+
+`subjectPattern` supports glob via `github.com/gobwas/glob`. `FulcioRootPath` can
+override the embedded Sigstore production root for self-hosted Sigstore
+deployments.
+
+The trust config is **not** part of the policy — an attacker who can write the
+policy must not be able to declare their own trust root. Keep it in
+operator-controlled locations.
+
+### Verify
+
+```bash
+aflock policy verify .aflock.signed
+# exits 0 + prints SignatureInfo on success, 1 on failure
+```
+
+### Enforcement modes
+
+By default, `policy.Load` warns when loading an unsigned policy but still
+proceeds (so existing unsigned deployments keep working through migration).
+Set `AFLOCK_REQUIRE_SIGNED_POLICY=1` to refuse unsigned policies.
+
+Any DSSE-envelope-shaped file is treated as "must verify or hard-fail." This
+closes the silent-degrade bug where passing an envelope to a pre-signing
+`policy.Load` returned an empty allow-most policy.
+
+### Caveat: cert validity window
+
+Fulcio leaf certs are ~10 minutes valid. This release does not yet wire
+TSA/Rekor SET into the envelope, so verifiers using `time.Now()` reject after
+expiry. The follow-up issue (linked from the PR introducing this work) tracks
+TSA support that lets a signature outlive the cert.
+
+In practice: re-sign close to verification. The provided
+`.github/workflows/sign-policy.yml` does this automatically on every policy
+change.
 
 ## Functionaries
 

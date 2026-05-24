@@ -170,7 +170,53 @@ type Policy struct {
 	// (rather than re-marshal) is issue #61 / L5; this field's value is the
 	// frozen digest captured at SessionStart, intentionally not recomputed
 	// from the on-disk file mid-session.
+	//
+	// When the policy was loaded from a DSSE envelope (signed), RawDigest is the
+	// SHA-256 of the inner payload bytes — not the envelope — so JWT binding stays
+	// invariant under re-signing with a different ephemeral key.
 	RawDigest string `json:"rawDigest,omitempty"`
+
+	// SignatureInfo describes the cryptographic signature that gated this policy
+	// load. Populated only when Load went through the DSSE envelope path and
+	// signature verification passed. Nil for unsigned policies.
+	SignatureInfo *SignatureInfo `json:"signatureInfo,omitempty"`
+}
+
+// SignatureInfo captures the verified identity that signed a policy envelope.
+// Surfaced in attestations so audits can prove a signed policy gated the session.
+type SignatureInfo struct {
+	// Issuer is the OIDC issuer URL from the Fulcio certificate
+	// (e.g., "https://token.actions.githubusercontent.com").
+	Issuer string `json:"issuer"`
+	// Subject is the OIDC subject from the cert SAN (URI or email).
+	Subject string `json:"subject"`
+	// CertNotBefore / CertNotAfter are the Fulcio cert validity window.
+	CertNotBefore time.Time `json:"certNotBefore"`
+	CertNotAfter  time.Time `json:"certNotAfter"`
+	// PayloadType is the DSSE payload type (always
+	// "application/vnd.aflock.policy+json" for this release).
+	PayloadType string `json:"payloadType"`
+}
+
+// TrustConfig declares which signing identities aflock will accept for policy
+// envelopes. Loaded from aflock-trust.json — see internal/policy/trust.go.
+type TrustConfig struct {
+	Version   string           `json:"version"`
+	Verifiers []TrustedVerifier `json:"verifiers"`
+}
+
+// TrustedVerifier is a single accepted signing identity.
+type TrustedVerifier struct {
+	// Type must currently be "sigstore". Reserved for future verifier types.
+	Type string `json:"type"`
+	// Issuer is the exact OIDC issuer URL the Fulcio cert must declare.
+	Issuer string `json:"issuer"`
+	// SubjectPattern is matched against the cert SAN URI/email. Supports glob
+	// patterns via github.com/gobwas/glob.
+	SubjectPattern string `json:"subjectPattern"`
+	// FulcioRootPath optionally overrides the embedded Sigstore production root.
+	// When empty, the embedded root is used.
+	FulcioRootPath string `json:"fulcioRootPath,omitempty"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.

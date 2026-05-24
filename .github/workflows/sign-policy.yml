@@ -1,0 +1,55 @@
+name: Sign demo policy
+
+# Signs examples/signed-policy-demo/.aflock with a Sigstore Fulcio-issued
+# short-lived certificate bound to this workflow's OIDC identity, then opens a
+# PR with the produced .aflock.signed file. The trust config in
+# examples/signed-policy-demo/aflock-trust.json names this workflow's identity
+# as the only acceptable signer for the demo policy.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - examples/signed-policy-demo/.aflock
+  workflow_dispatch: {}
+
+permissions:
+  contents: write       # to commit and push the .signed file
+  id-token: write       # required for OIDC token used by Fulcio
+  pull-requests: write  # to open the PR
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build aflock
+        run: go build -o ./bin/aflock ./cmd/aflock
+
+      - name: Sign demo policy
+        env:
+          GITHUB_ACTIONS: "true"
+        run: |
+          ./bin/aflock sign examples/signed-policy-demo/.aflock \
+            --output examples/signed-policy-demo/.aflock.signed
+
+      - name: Open PR with signed policy
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(demo): re-sign signed-policy-demo/.aflock"
+          branch: bot/sign-demo-policy
+          delete-branch: true
+          title: "chore(demo): re-sign signed-policy-demo/.aflock"
+          body: |
+            Auto-signed by `.github/workflows/sign-policy.yml` after a change to
+            `examples/signed-policy-demo/.aflock`.
+
+            The signing identity is this workflow's OIDC subject; verifiers
+            chain the embedded Fulcio cert and match it against
+            `aflock-trust.json` in the same directory.
+          add-paths: examples/signed-policy-demo/.aflock.signed
