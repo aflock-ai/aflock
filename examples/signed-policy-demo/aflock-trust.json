@@ -3,8 +3,8 @@
   "verifiers": [
     {
       "type": "sigstore",
-      "issuer": "https://token.actions.githubusercontent.com",
-      "subjectPattern": "https://github.com/aflock-ai/aflock/.github/workflows/sign-policy.yml@refs/heads/*"
+      "issuer": "https://oauth2.sigstore.dev/auth",
+      "subjectPattern": "you@example.com"
     }
   ]
 }

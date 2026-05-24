@@ -1,48 +1,59 @@
 # signed-policy-demo
 
-End-to-end example showing how a `.aflock` policy is signed by a CI workflow
-identity (Sigstore keyless / Fulcio) and verified at load time against a
-`aflock-trust.json` trust root.
+End-to-end example showing how a `.aflock` policy is signed via Sigstore
+keyless (Fulcio) and verified at load time against an operator-controlled
+`aflock-trust.json`.
 
 ## Files
 
 - `.aflock` — the policy itself (rules: tool allowlist, file allowlist, limits).
-- `aflock-trust.json` — operator-controlled trust root. Declares the OIDC
-  issuer + subject pattern that signed policies must come from. In this demo
-  the trusted signer is `.github/workflows/sign-policy.yml@refs/heads/*`.
-- `.aflock.signed` — the DSSE envelope produced by the workflow. Contains the
-  policy bytes, a Fulcio leaf cert bound to the workflow's OIDC identity, and
-  the signature. Committed back to the repo by an automated PR.
+- `aflock-trust.json` — declares the OIDC issuer + subject pattern that signed
+  policies must come from. **Edit the placeholder before using.**
+- `.aflock.signed` — produced by `aflock sign`. The DSSE envelope containing
+  the policy bytes, the Fulcio leaf cert bound to your OIDC identity, and the
+  signature. Not checked into git in this template.
 
-## Sign locally (developer flow)
+## Sign locally
+
+The interactive browser flow uses Sigstore's Dex OIDC broker, which accepts
+Google, GitHub, and Microsoft logins.
 
 ```sh
-# Mint an OIDC token from your IdP (Google, GitHub, Microsoft, etc.) and
-# point Fulcio at it. The interactive flow opens a browser:
+export FULCIO_OIDC_ISSUER=https://oauth2.sigstore.dev/auth
+export FULCIO_OIDC_CLIENT_ID=sigstore
+
 aflock sign examples/signed-policy-demo/.aflock \
   --output examples/signed-policy-demo/.aflock.signed
+# → browser opens, you log in, Fulcio issues a ~10-min cert, signature written
 ```
 
-You'll need either `GITHUB_ACTIONS=true` (only true in CI), `FULCIO_TOKEN=<jwt>`,
-or `FULCIO_TOKEN_PATH=<file>` to be set.
+If you have an OIDC token out-of-band, use `FULCIO_TOKEN=<jwt>` or
+`FULCIO_TOKEN_PATH=<file>` instead.
 
-## Sign in CI (the supported flow)
+## Configure trust
 
-Edit `.aflock` and push to `main` or `dev`. The
-[`sign-policy.yml`](../../.github/workflows/sign-policy.yml) workflow re-signs
-the policy and opens a PR with the updated `.aflock.signed`.
+Edit `aflock-trust.json` so `subjectPattern` matches the identity you signed
+with. For a Google login via Sigstore Dex, that's your email address:
+
+```json
+{
+  "version": "1",
+  "verifiers": [{
+    "type": "sigstore",
+    "issuer": "https://oauth2.sigstore.dev/auth",
+    "subjectPattern": "you@gmail.com"
+  }]
+}
+```
+
+`subjectPattern` supports glob — `*@gmail.com` works too.
 
 ## Verify
 
 ```sh
 aflock policy verify examples/signed-policy-demo/.aflock.signed
-# → {
-#     "issuer":  "https://token.actions.githubusercontent.com",
-#     "subject": "https://github.com/aflock-ai/aflock/.github/workflows/sign-policy.yml@refs/heads/main",
-#     "certNotBefore": "...",
-#     "certNotAfter":  "...",
-#     "payloadType":   "application/vnd.aflock.policy+json"
-#   }
+# → prints {issuer, subject, certNotBefore, certNotAfter, payloadType}
+#   exits 0 on success, 1 on failure
 ```
 
 ## Run aflock against the signed policy
@@ -52,17 +63,14 @@ aflock serve --policy examples/signed-policy-demo/.aflock.signed
 ```
 
 `policy.Load` detects the envelope, locates `aflock-trust.json` in the same
-directory, verifies the Fulcio cert chains to the Sigstore root and that its
-issuer+subject match the trust config, then proceeds with the inner policy.
+directory, verifies the Fulcio cert chains to the Sigstore root and matches
+the trust config's issuer + subject pattern, then proceeds with the inner
+policy.
 
 ## Caveat
 
 This release does not yet wire TSA/Rekor SET into the envelope. Fulcio leaf
 certs are ~10 minutes valid, so a `.signed` file goes stale once the cert
-expires unless verification happens within the window. For long-lived signed
-policies, follow the tracking issue (linked in the PR that introduced this
-demo) — TSA support will let an envelope's signature outlive the cert.
-
-In practice this means: re-sign close to verification. The CI workflow does
-this automatically on every policy change; manual signing is only useful for
-quick local tests.
+expires unless verification happens within that window. Re-sign close to
+verification. Tracking issue: add TSA/Rekor SET support for long-lived
+signed policies.
