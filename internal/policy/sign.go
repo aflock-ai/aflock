@@ -80,6 +80,13 @@ func buildPolicyFulcioProvider() (fulcioSigner.FulcioSignerProvider, error) {
 		fulcioSigner.WithFulcioURL(fulcioURL),
 	}
 
+	if issuer := os.Getenv("FULCIO_OIDC_ISSUER"); issuer != "" {
+		opts = append(opts, fulcioSigner.WithOidcIssuer(issuer))
+	}
+	if clientID := os.Getenv("FULCIO_OIDC_CLIENT_ID"); clientID != "" {
+		opts = append(opts, fulcioSigner.WithOidcClientID(clientID))
+	}
+
 	switch {
 	case os.Getenv("GITHUB_ACTIONS") == "true":
 		// tokens fetched automatically by the rookery plugin
@@ -87,16 +94,14 @@ func buildPolicyFulcioProvider() (fulcioSigner.FulcioSignerProvider, error) {
 		opts = append(opts, fulcioSigner.WithToken(os.Getenv("FULCIO_TOKEN")))
 	case os.Getenv("FULCIO_TOKEN_PATH") != "":
 		opts = append(opts, fulcioSigner.WithTokenPath(os.Getenv("FULCIO_TOKEN_PATH")))
+	case os.Getenv("FULCIO_OIDC_ISSUER") != "":
+		// Interactive OAuth: rookery opens a browser and listens on localhost
+		// for the OIDC callback. Useful for local dev/testing. Set both
+		// FULCIO_OIDC_ISSUER (e.g. https://oauth2.sigstore.dev/auth) and
+		// FULCIO_OIDC_CLIENT_ID (e.g. sigstore).
 	default:
 		return fulcioSigner.FulcioSignerProvider{}, errors.New(
-			"no OIDC token source: set GITHUB_ACTIONS=true (in CI), FULCIO_TOKEN, or FULCIO_TOKEN_PATH")
-	}
-
-	if issuer := os.Getenv("FULCIO_OIDC_ISSUER"); issuer != "" {
-		opts = append(opts, fulcioSigner.WithOidcIssuer(issuer))
-	}
-	if clientID := os.Getenv("FULCIO_OIDC_CLIENT_ID"); clientID != "" {
-		opts = append(opts, fulcioSigner.WithOidcClientID(clientID))
+			"no OIDC token source: set GITHUB_ACTIONS=true (CI), FULCIO_TOKEN, FULCIO_TOKEN_PATH, or FULCIO_OIDC_ISSUER (interactive browser)")
 	}
 
 	return fulcioSigner.New(opts...), nil
