@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/policysig"
@@ -79,14 +80,29 @@ func verifyAndUnwrap(ctx context.Context, envelopeBytes []byte, trust *aflock.Tr
 			continue
 		}
 
+		// Route the configured subject into either Emails or URIs based on its
+		// shape. Fulcio puts human identities (Google/GitHub OIDC login) in the
+		// SAN email field, and CI workflow identities (GitHub Actions, GitLab
+		// CI) in the SAN URI field. We can't put the same string into both
+		// constraint slices because rookery's checkCertConstraint requires that
+		// constraints and values match 1:1 — a cert with only an email will
+		// fail a non-empty URI constraint and vice versa.
+		emails := []string{"*"}
+		uris := []string{"*"}
+		if isEmail(v.SubjectPattern) {
+			emails = []string{v.SubjectPattern}
+		} else {
+			uris = []string{v.SubjectPattern}
+		}
+
 		opts := policysig.NewVerifyPolicySignatureOptions(
 			policysig.VerifyWithPolicyCARoots(roots),
 			policysig.VerifyWithPolicyCertConstraints(
-				"*",                       // commonName
-				[]string{"*"},             // dnsNames
-				[]string{"*"},             // emails
-				[]string{"*"},             // organizations
-				[]string{v.SubjectPattern}, // uris — Fulcio puts workflow ref in SAN URI
+				"*",           // commonName
+				[]string{"*"}, // dnsNames
+				emails,
+				[]string{"*"}, // organizations
+				uris,
 			),
 			policysig.VerifyWithPolicyFulcioCertExtensions(certificate.Extensions{
 				Issuer: v.Issuer,
@@ -163,6 +179,19 @@ func signatureInfoFromCert(cert *x509.Certificate) *aflock.SignatureInfo {
 	}
 
 	return info
+}
+
+// isEmail returns true for subject patterns that should be matched against the
+// cert's SAN email field rather than its SAN URI field. We use a simple
+// heuristic: contains "@" and no URI scheme. Globs like "*@gmail.com" count as
+// emails too — though note that rookery's slice-constraint matcher does exact
+// match only on these fields, so glob support here only matters for forward
+// compat with a future hardened verifier.
+func isEmail(subject string) bool {
+	if strings.Contains(subject, "://") {
+		return false
+	}
+	return strings.Contains(subject, "@")
 }
 
 // loadFulcioRoots returns the Fulcio root cert(s) to chain against. When path

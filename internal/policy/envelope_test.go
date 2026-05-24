@@ -51,6 +51,22 @@ func TestIsEnvelope_RejectsMalformedJSON(t *testing.T) {
 	assert.False(t, isEnvelope([]byte("not json")))
 }
 
+func TestIsEmail(t *testing.T) {
+	cases := map[string]bool{
+		"rahul@gmail.com":                       true,
+		"*@gmail.com":                           true,
+		"https://github.com/org/repo/.github/*": false,
+		"spiffe://aflock.local/agent/xyz":       false,
+		"":                                      false,
+		"no-at-here":                            false,
+	}
+	for input, want := range cases {
+		t.Run(input, func(t *testing.T) {
+			assert.Equal(t, want, isEmail(input))
+		})
+	}
+}
+
 func TestLoadFulcioRoots_EmbeddedDefault(t *testing.T) {
 	roots, err := loadFulcioRoots("")
 	require.NoError(t, err)

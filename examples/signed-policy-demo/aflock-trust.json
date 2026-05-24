@@ -3,8 +3,8 @@
   "verifiers": [
     {
       "type": "sigstore",
-      "issuer": "https://oauth2.sigstore.dev/auth",
-      "subjectPattern": "you@example.com"
+      "issuer": "https://github.com/login/oauth",
+      "subjectPattern": "rahulvs2809@gmail.com"
     }
   ]
 }
