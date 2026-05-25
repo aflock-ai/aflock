@@ -44,6 +44,26 @@ func TestLoadTrustConfig_PolicyDirFallback(t *testing.T) {
 	assert.Equal(t, "https://d", cfg.Verifiers[0].Issuer)
 }
 
+func TestLoadTrustConfig_EnvVarMissingIsHardError(t *testing.T) {
+	// If the operator set AFLOCK_TRUST_CONFIG, we must NOT silently fall back
+	// to <policy_dir>/aflock-trust.json or ~/.aflock/trust.json — that could
+	// turn an intended override into trusting an attacker-controlled file.
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	// Put a valid trust config in the policy dir; the env-var-missing path
+	// must still fail rather than silently use it.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "aflock-trust.json"),
+		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"https://d","subjectPattern":"d"}]}`),
+		0600))
+
+	t.Setenv("AFLOCK_TRUST_CONFIG", filepath.Join(t.TempDir(), "does-not-exist.json"))
+
+	_, _, err := LoadTrustConfig(filepath.Join(dir, ".aflock"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read trust config")
+}
+
 func TestLoadTrustConfig_NoneFound(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("AFLOCK_TRUST_CONFIG", "")

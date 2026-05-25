@@ -4,7 +4,7 @@
     {
       "type": "sigstore",
       "issuer": "https://github.com/login/oauth",
-      "subjectPattern": "rahulvs2809@gmail.com"
+      "subjectPattern": "you@example.com"
     }
   ]
 }

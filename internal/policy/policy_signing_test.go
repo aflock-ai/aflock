@@ -83,13 +83,17 @@ func TestLoad_Envelope_FailsWithWrongPayloadType(t *testing.T) {
 		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"i","subjectPattern":"s"}]}`),
 		0600))
 
-	// isEnvelope() rejects non-aflock payloadType so this falls through to raw
-	// parsing path and fails at JSON unmarshal — proving aflock won't accept
-	// envelopes for other formats (in-toto attestations, etc.) as policies.
+	// isEnvelope() detects ANY DSSE envelope shape, so an in-toto envelope
+	// fed as a policy enters the verify-or-fail path and gets rejected at the
+	// payloadType check — proving aflock won't accept envelopes for other
+	// formats (in-toto attestations, etc.) as policies, and won't silently
+	// fall back to raw parsing.
 	envelope := []byte(`{"payloadType":"application/vnd.in-toto+json","payload":"eyJ2ZXJzaW9uIjoiMSJ9","signatures":[]}`)
 	path := filepath.Join(dir, "weird.json")
 	require.NoError(t, os.WriteFile(path, envelope, 0600))
 
 	_, _, err := Load(path)
 	require.Error(t, err, "non-aflock payloadType must not be accepted as a policy")
+	assert.Contains(t, err.Error(), "unexpected payload type",
+		"must fail at the envelope payloadType gate, not at raw JSON unmarshal")
 }

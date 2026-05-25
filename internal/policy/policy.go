@@ -82,7 +82,11 @@ func Load(path string) (*aflock.Policy, string, error) {
 	if isEnvelope(data) {
 		trust, trustPath, err := LoadTrustConfig(policyPath)
 		if err != nil {
-			return nil, "", fmt.Errorf("policy is signed but no trust config available: %w (see docs/concepts/policies.md#signing-and-trust)", err)
+			msg := "load trust config for signed policy"
+			if errors.Is(err, ErrNoTrustConfig) {
+				msg = "policy is signed but no trust config found"
+			}
+			return nil, "", fmt.Errorf("%s: %w (see docs/concepts/policies.md#signing-and-trust)", msg, err)
 		}
 		inner, info, err := verifyAndUnwrap(context.Background(), data, trust)
 		if err != nil {

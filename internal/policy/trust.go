@@ -26,43 +26,56 @@ var ErrNoTrustConfig = errors.New("no aflock-trust.json found")
 // must not be able to declare their own trust root, so callers should keep
 // these in operator-controlled locations.
 func LoadTrustConfig(policyPath string) (*aflock.TrustConfig, string, error) {
-	candidates := []string{}
-
+	// AFLOCK_TRUST_CONFIG is authoritative: if the operator set it, we don't
+	// silently fall through to a policy-dir/home file that might be
+	// attacker-controlled. Missing/invalid is a hard error.
 	if env := os.Getenv("AFLOCK_TRUST_CONFIG"); env != "" {
-		candidates = append(candidates, env)
+		cfg, err := readAndValidate(env)
+		if err != nil {
+			return nil, "", err
+		}
+		return cfg, env, nil
 	}
 
+	candidates := []string{}
 	if policyPath != "" {
 		dir := filepath.Dir(policyPath)
 		candidates = append(candidates, filepath.Join(dir, "aflock-trust.json"))
 	}
-
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates, filepath.Join(home, ".aflock", "trust.json"))
 	}
 
 	for _, path := range candidates {
-		data, err := os.ReadFile(path) //nolint:gosec // G304: path from env or known locations
+		cfg, err := readAndValidate(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, "", fmt.Errorf("read trust config %s: %w", path, err)
+			return nil, "", err
 		}
-
-		var cfg aflock.TrustConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, "", fmt.Errorf("parse trust config %s: %w", path, err)
-		}
-
-		if err := validateTrustConfig(&cfg); err != nil {
-			return nil, "", fmt.Errorf("invalid trust config %s: %w", path, err)
-		}
-
-		return &cfg, path, nil
+		return cfg, path, nil
 	}
 
 	return nil, "", ErrNoTrustConfig
+}
+
+func readAndValidate(path string) (*aflock.TrustConfig, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path from env or known locations
+	if err != nil {
+		return nil, fmt.Errorf("read trust config %s: %w", path, err)
+	}
+
+	var cfg aflock.TrustConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse trust config %s: %w", path, err)
+	}
+
+	if err := validateTrustConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("invalid trust config %s: %w", path, err)
+	}
+
+	return &cfg, nil
 }
 
 func validateTrustConfig(cfg *aflock.TrustConfig) error {

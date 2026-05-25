@@ -51,6 +51,21 @@ func TestIsEnvelope_RejectsMalformedJSON(t *testing.T) {
 	assert.False(t, isEnvelope([]byte("not json")))
 }
 
+func TestIsEnvelope_DetectsEmptyAndNullValues(t *testing.T) {
+	// Defense against bypass: a crafted envelope with empty strings or null
+	// values still has the envelope-shaped keys, so it must trigger the
+	// verify-or-fail path. Falling back to raw parsing on these would
+	// produce a zero-valued allow-most policy.
+	cases := [][]byte{
+		[]byte(`{"payloadType":"","payload":"","signatures":null}`),
+		[]byte(`{"payloadType":"","payload":"","signatures":[]}`),
+		[]byte(`{"payloadType":"x","payload":"","signatures":null}`),
+	}
+	for _, env := range cases {
+		assert.True(t, isEnvelope(env), "must detect envelope shape: %s", env)
+	}
+}
+
 func TestIsEmail(t *testing.T) {
 	cases := map[string]bool{
 		"rahul@gmail.com":                       true,

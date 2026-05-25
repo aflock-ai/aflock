@@ -27,23 +27,23 @@ const PolicyPayloadType = "application/vnd.aflock.policy+json"
 // but the policy on disk is not wrapped in a DSSE envelope.
 var ErrUnsignedRequired = errors.New("policy is unsigned but AFLOCK_REQUIRE_SIGNED_POLICY=1")
 
-// isEnvelope detects whether data has DSSE envelope shape — i.e. a non-empty
-// payloadType + payload + signatures key. ANY envelope-shaped JSON triggers
-// the verify-or-fail path. Restricting detection to PolicyPayloadType would
-// let an attacker feed e.g. an in-toto attestation envelope as a policy and
-// have its envelope fields (PayloadType, Payload, Signatures) parsed as
-// "unknown JSON fields" — leaving every aflock.Policy field zero-valued and
-// silently producing an empty allow-most policy.
+// isEnvelope detects whether data has DSSE envelope shape — i.e. the JSON
+// object declares payloadType / payload / signatures keys. ANY envelope-shaped
+// JSON triggers the verify-or-fail path. Restricting detection to
+// PolicyPayloadType (or to non-empty values) would let an attacker feed e.g.
+// an in-toto attestation envelope, or a crafted `{"payloadType":"",...}`,
+// and have its envelope fields parsed as "unknown JSON fields" — leaving
+// every aflock.Policy field zero-valued and silently producing an empty
+// allow-most policy. Key presence, not value population, is the gate.
 func isEnvelope(data []byte) bool {
-	var peek struct {
-		PayloadType string            `json:"payloadType"`
-		Payload     string            `json:"payload"`
-		Signatures  []json.RawMessage `json:"signatures"`
-	}
-	if err := json.Unmarshal(data, &peek); err != nil {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
 		return false
 	}
-	return peek.PayloadType != "" && peek.Payload != "" && peek.Signatures != nil
+	_, hasPayloadType := keys["payloadType"]
+	_, hasPayload := keys["payload"]
+	_, hasSignatures := keys["signatures"]
+	return hasPayloadType && hasPayload && hasSignatures
 }
 
 // verifyAndUnwrap validates a DSSE envelope against the trust config and
@@ -97,7 +97,18 @@ func verifyAndUnwrap(ctx context.Context, envelopeBytes []byte, trust *aflock.Tr
 // verifySigstore verifies an envelope against a Fulcio-issued leaf cert,
 // matching the cert's OIDC issuer + subject SAN against the trust config.
 // Returns the unwrapped payload + signature metadata on success.
+//
+// The sigstore path requires exactly one signature in the envelope. With
+// multiple signatures, the cert we extract for SignatureInfo might not be the
+// one that satisfied verification — which would misreport the signer identity
+// in audits/attestations. aflock sign always emits a single signature, so
+// rejecting multi-sig envelopes here costs us nothing and keeps the audit
+// record honest.
 func verifySigstore(ctx context.Context, env rdsse.Envelope, v aflock.TrustedVerifier) ([]byte, *aflock.SignatureInfo, error) {
+	if len(env.Signatures) != 1 {
+		return nil, nil, fmt.Errorf("sigstore path requires exactly one signature, got %d", len(env.Signatures))
+	}
+
 	leafCert, err := extractLeafCert(env)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extract leaf cert: %w", err)
