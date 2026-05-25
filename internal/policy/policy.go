@@ -84,11 +84,13 @@ func Load(path string) (*aflock.Policy, string, error) {
 	// (the original #133 fail-open). Once envelope shape is detected, the
 	// only safe outcomes are verified-success or error.
 	if isEnvelope(data) {
+		// policyPath is passed in but ignored as a trust-config candidate —
+		// see LoadTrustConfig's docstring for the threat model.
 		trust, trustPath, err := LoadTrustConfig(policyPath)
 		if err != nil {
 			msg := "load trust config for signed policy"
 			if errors.Is(err, ErrNoTrustConfig) {
-				msg = "policy is signed but no trust config found"
+				msg = "policy is signed but no trust config found (set $AFLOCK_TRUST_CONFIG or create ~/.aflock/trust.json)"
 			}
 			return nil, "", fmt.Errorf("%s: %w (see docs/concepts/policies.md#signing-and-trust)", msg, err)
 		}

@@ -186,8 +186,14 @@ the Fulcio leaf cert + TSA timestamp. For raw-key: just the signature + keyid.
 Trust roots live in `aflock-trust.json`, resolved in this order (first hit wins):
 
 1. `$AFLOCK_TRUST_CONFIG` (explicit operator override)
-2. `<policy_dir>/aflock-trust.json` (per-policy, version-controlled)
-3. `~/.aflock/trust.json` (per-user default)
+2. `~/.aflock/trust.json` (per-user default)
+
+There is intentionally NO `<policy_dir>/aflock-trust.json` fallback. If trust
+lived next to the policy, anyone with write access to the policy could also
+rewrite its trust root — which collapses the "signed by authorized
+principals" guarantee into ordinary repo-write access. Operators must point
+`$AFLOCK_TRUST_CONFIG` at a path the policy author can't reach, or rely on
+the per-user `~/.aflock/trust.json`.
 
 ```json
 {
@@ -255,6 +261,11 @@ verify forever.
 `$AFLOCK_TSA_DISABLE=1` skips timestamping at sign time (the resulting
 envelope only verifies inside the Fulcio cert window — only useful for
 air-gapped tests).
+
+Self-hosted TSA must also pin TSA roots at verify time. Set
+`tsaRootPath` on the trust-config verifier (or `$AFLOCK_TSA_ROOTS`) to a
+PEM chain that matches the signing TSA; otherwise verification falls back
+to the embedded Sigstore production chain and timestamp validation fails.
 
 ## Functionaries
 

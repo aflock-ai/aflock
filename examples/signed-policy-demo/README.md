@@ -59,14 +59,21 @@ aflock policy verify examples/signed-policy-demo/.aflock.signed
 
 ## Run aflock against the signed policy
 
+The trust config in this directory is committed alongside the demo for
+discoverability, but aflock does NOT pick it up automatically — that
+fallback was removed because anyone who can write the policy can also
+rewrite a policy-dir trust file. Point `$AFLOCK_TRUST_CONFIG` at it
+explicitly, or copy it to `~/.aflock/trust.json`:
+
 ```sh
+export AFLOCK_TRUST_CONFIG=$PWD/examples/signed-policy-demo/aflock-trust.json
 aflock serve --policy examples/signed-policy-demo/.aflock.signed
 ```
 
-`policy.Load` detects the envelope, locates `aflock-trust.json` in the same
-directory, verifies the Fulcio cert chains to the Sigstore root and matches
-the trust config's issuer + subject pattern, then proceeds with the inner
-policy.
+`policy.Load` detects the envelope, loads the trust config from the
+operator-pinned location, verifies the Fulcio cert chains to the Sigstore
+root and matches the trust config's issuer + subject pattern, then proceeds
+with the inner policy.
 
 ## Persistence
 

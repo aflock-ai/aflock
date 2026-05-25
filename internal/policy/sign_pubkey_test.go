@@ -39,10 +39,11 @@ func TestSignWithKey_RoundTrip(t *testing.T) {
 	require.NoError(t, os.WriteFile(signedPath, envelopeJSON, 0600))
 
 	// Trust config points at the matching public key.
-	trustPath := filepath.Join(dir, "aflock-trust.json")
+	trustPath := filepath.Join(dir, "trust.json")
 	require.NoError(t, os.WriteFile(trustPath,
 		[]byte(`{"version":"1","verifiers":[{"type":"pubkey","keyPath":"`+pubPath+`"}]}`),
 		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", trustPath)
 
 	pol, _, err := Load(signedPath)
 	require.NoError(t, err)
@@ -71,10 +72,11 @@ func TestSignWithKey_TamperRejected(t *testing.T) {
 	signedPath := filepath.Join(dir, ".aflock.signed")
 	require.NoError(t, os.WriteFile(signedPath, tampered, 0600))
 
-	trustPath := filepath.Join(dir, "aflock-trust.json")
+	trustPath := filepath.Join(dir, "trust.json")
 	require.NoError(t, os.WriteFile(trustPath,
 		[]byte(`{"version":"1","verifiers":[{"type":"pubkey","keyPath":"`+pubPath+`"}]}`),
 		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", trustPath)
 
 	_, _, err = Load(signedPath)
 	require.Error(t, err)
@@ -97,10 +99,11 @@ func TestSignWithKey_WrongKeyRejected(t *testing.T) {
 	signedPath := filepath.Join(dir, ".aflock.signed")
 	require.NoError(t, os.WriteFile(signedPath, envelopeJSON, 0600))
 
-	trustPath := filepath.Join(dir, "aflock-trust.json")
+	trustPath := filepath.Join(dir, "trust.json")
 	require.NoError(t, os.WriteFile(trustPath,
 		[]byte(`{"version":"1","verifiers":[{"type":"pubkey","keyPath":"`+wrongPubPath+`"}]}`),
 		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", trustPath)
 
 	_, _, err = Load(signedPath)
 	require.Error(t, err)

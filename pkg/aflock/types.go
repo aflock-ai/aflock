@@ -233,6 +233,11 @@ type TrustedVerifier struct {
 	// FulcioRootPath optionally overrides the embedded Sigstore production root.
 	// When empty, the embedded root is used.
 	FulcioRootPath string `json:"fulcioRootPath,omitempty"`
+	// TSARootPath optionally overrides the embedded Sigstore production TSA
+	// cert chain. Required when signing was done against a self-hosted TSA
+	// (AFLOCK_TSA_URL); otherwise timestamp verification will fail with chain
+	// errors at load time. When empty, the embedded production chain is used.
+	TSARootPath string `json:"tsaRootPath,omitempty"`
 
 	// --- Pubkey-only fields ---
 
@@ -240,9 +245,13 @@ type TrustedVerifier struct {
 	// are accepted (rookery cryptoutil dispatches on the parsed type).
 	KeyPath string `json:"keyPath,omitempty"`
 	// KeyID, when non-empty, must match the SHA-256 hex fingerprint of the
-	// envelope signature's keyid before verification is attempted. Optional —
-	// if omitted, any signature that verifies against the loaded key is
-	// accepted, matching witness's publickey functionary semantics.
+	// public key actually loaded from KeyPath (computed by rookery's
+	// cryptoutil.Verifier.KeyID). Use this to pin a specific key when KeyPath
+	// could resolve to alternates (symlinks, env-substituted paths). The
+	// envelope's own signatures[*].keyid metadata field is informational only;
+	// cryptographic verification against the loaded public key is what gates
+	// trust. Optional — if omitted, any signature that verifies against the
+	// loaded key is accepted, matching witness's publickey functionary semantics.
 	KeyID string `json:"keyid,omitempty"`
 }
 

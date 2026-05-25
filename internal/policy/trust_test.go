@@ -29,19 +29,40 @@ func TestLoadTrustConfig_EnvVarWins(t *testing.T) {
 	assert.Equal(t, "https://e", cfg.Verifiers[0].Issuer)
 }
 
-func TestLoadTrustConfig_PolicyDirFallback(t *testing.T) {
+func TestLoadTrustConfig_PolicyDirIsNeverConsulted(t *testing.T) {
+	// Regression test: an aflock-trust.json sitting next to the policy must
+	// never be picked up — that's the "policy author == trust author" case
+	// that collapses signed-policy guarantees into git-write ACL.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("AFLOCK_TRUST_CONFIG", "")
 
 	dir := t.TempDir()
-	dirCfg := filepath.Join(dir, "aflock-trust.json")
-	good := []byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"https://d","subjectPattern":"d"}]}`)
-	require.NoError(t, os.WriteFile(dirCfg, good, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "aflock-trust.json"),
+		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"https://d","subjectPattern":"d"}]}`),
+		0600))
 
-	cfg, path, err := LoadTrustConfig(filepath.Join(dir, ".aflock"))
+	_, _, err := LoadTrustConfig(filepath.Join(dir, ".aflock"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrNoTrustConfig),
+		"policy-dir trust config must not be consulted")
+}
+
+func TestLoadTrustConfig_HomeFallback(t *testing.T) {
+	t.Setenv("AFLOCK_TRUST_CONFIG", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := filepath.Join(home, ".aflock")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	homeCfg := filepath.Join(dir, "trust.json")
+	require.NoError(t, os.WriteFile(homeCfg,
+		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"https://h","subjectPattern":"h"}]}`),
+		0600))
+
+	cfg, path, err := LoadTrustConfig(filepath.Join(t.TempDir(), ".aflock"))
 	require.NoError(t, err)
-	assert.Equal(t, dirCfg, path)
-	assert.Equal(t, "https://d", cfg.Verifiers[0].Issuer)
+	assert.Equal(t, homeCfg, path)
+	assert.Equal(t, "https://h", cfg.Verifiers[0].Issuer)
 }
 
 func TestLoadTrustConfig_EnvVarMissingIsHardError(t *testing.T) {

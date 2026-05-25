@@ -19,16 +19,17 @@ var ErrNoTrustConfig = errors.New("no aflock-trust.json found")
 // LoadTrustConfig resolves a trust config for a given policy path. Resolution
 // order, first hit wins:
 //  1. $AFLOCK_TRUST_CONFIG (explicit operator override)
-//  2. <policy_dir>/aflock-trust.json (per-policy, version-controlled)
-//  3. ~/.aflock/trust.json (per-user default)
+//  2. ~/.aflock/trust.json (per-user default)
 //
-// Trust config files are not policy — an attacker who can write the policy
-// must not be able to declare their own trust root, so callers should keep
-// these in operator-controlled locations.
-func LoadTrustConfig(policyPath string) (*aflock.TrustConfig, string, error) {
+// policyPath is accepted for future use but intentionally NOT consulted as a
+// candidate location: a trust config that lives next to the policy can be
+// rewritten by anyone with write access to the policy itself, which collapses
+// the "signed by authorized principals" guarantee into ordinary repo-write
+// access. Trust roots must live somewhere the policy-writer can't reach.
+func LoadTrustConfig(_ string) (*aflock.TrustConfig, string, error) {
 	// AFLOCK_TRUST_CONFIG is authoritative: if the operator set it, we don't
-	// silently fall through to a policy-dir/home file that might be
-	// attacker-controlled. Missing/invalid is a hard error.
+	// silently fall through to a home file that might be attacker-controlled.
+	// Missing/invalid is a hard error.
 	if env := os.Getenv("AFLOCK_TRUST_CONFIG"); env != "" {
 		cfg, err := readAndValidate(env)
 		if err != nil {
@@ -37,24 +38,15 @@ func LoadTrustConfig(policyPath string) (*aflock.TrustConfig, string, error) {
 		return cfg, env, nil
 	}
 
-	candidates := []string{}
-	if policyPath != "" {
-		dir := filepath.Dir(policyPath)
-		candidates = append(candidates, filepath.Join(dir, "aflock-trust.json"))
-	}
 	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, ".aflock", "trust.json"))
-	}
-
-	for _, path := range candidates {
+		path := filepath.Join(home, ".aflock", "trust.json")
 		cfg, err := readAndValidate(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
+		if err == nil {
+			return cfg, path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
 			return nil, "", err
 		}
-		return cfg, path, nil
 	}
 
 	return nil, "", ErrNoTrustConfig

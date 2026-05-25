@@ -61,9 +61,11 @@ func TestLoad_Envelope_FailsWithEmptySignatures(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "aflock-trust.json"),
+	trustPath := filepath.Join(dir, "trust.json")
+	require.NoError(t, os.WriteFile(trustPath,
 		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"i","subjectPattern":"s"}]}`),
 		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", trustPath)
 
 	envelope := []byte(`{"payloadType":"application/vnd.aflock.policy+json","payload":"eyJ2ZXJzaW9uIjoiMSJ9","signatures":[]}`)
 	path := filepath.Join(dir, ".aflock.signed")
@@ -79,9 +81,11 @@ func TestLoad_Envelope_FailsWithWrongPayloadType(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "aflock-trust.json"),
+	trustPath := filepath.Join(dir, "trust.json")
+	require.NoError(t, os.WriteFile(trustPath,
 		[]byte(`{"version":"1","verifiers":[{"type":"sigstore","issuer":"i","subjectPattern":"s"}]}`),
 		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", trustPath)
 
 	// isEnvelope() detects ANY DSSE envelope shape, so an in-toto envelope
 	// fed as a policy enters the verify-or-fail path and gets rejected at the

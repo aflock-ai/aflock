@@ -133,7 +133,7 @@ func verifySigstore(ctx context.Context, env rdsse.Envelope, v aflock.TrustedVer
 		uris = []string{v.SubjectPattern}
 	}
 
-	tsaVerifiers, err := loadTSAVerifiers()
+	tsaVerifiers, err := loadTSAVerifiers(v.TSARootPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load tsa roots: %w", err)
 	}
@@ -256,15 +256,34 @@ func signatureInfoFromCert(cert *x509.Certificate) *aflock.SignatureInfo {
 	return info
 }
 
-// loadTSAVerifiers returns timestamp verifiers built from the embedded
-// Sigstore TSA cert chain. A signed policy is expected to bundle an RFC 3161
-// timestamp; the verifier uses the TSA-attested time when checking the Fulcio
-// leaf cert's validity, so signatures stay verifiable past the cert's
-// ~10-minute window.
-func loadTSAVerifiers() ([]timestamp.TimestampVerifier, error) {
-	certs, err := parsePEMCerts([]byte(SigstoreProductionTSACerts))
+// loadTSAVerifiers returns timestamp verifiers built from a TSA cert chain.
+// Resolution order: TrustedVerifier.TSARootPath → $AFLOCK_TSA_ROOTS → embedded
+// Sigstore production chain. Self-hosted Sigstore deployments must point at
+// their own TSA chain or timestamp validation will fail at load time even
+// though signing succeeded.
+func loadTSAVerifiers(tsaRootPath string) ([]timestamp.TimestampVerifier, error) {
+	var pemBytes []byte
+	switch {
+	case tsaRootPath != "":
+		data, err := os.ReadFile(tsaRootPath) //nolint:gosec // G304: operator-controlled trust config
+		if err != nil {
+			return nil, fmt.Errorf("read TSA roots %s: %w", tsaRootPath, err)
+		}
+		pemBytes = data
+	case os.Getenv("AFLOCK_TSA_ROOTS") != "":
+		path := os.Getenv("AFLOCK_TSA_ROOTS")
+		data, err := os.ReadFile(path) //nolint:gosec // G304: operator-controlled env var
+		if err != nil {
+			return nil, fmt.Errorf("read $AFLOCK_TSA_ROOTS %s: %w", path, err)
+		}
+		pemBytes = data
+	default:
+		pemBytes = []byte(SigstoreProductionTSACerts)
+	}
+
+	certs, err := parsePEMCerts(pemBytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse embedded TSA chain: %w", err)
+		return nil, fmt.Errorf("parse TSA chain: %w", err)
 	}
 	return []timestamp.TimestampVerifier{timestamp.NewVerifier(timestamp.VerifyWithCerts(certs))}, nil
 }
