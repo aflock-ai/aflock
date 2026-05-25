@@ -21,9 +21,13 @@ import (
 // intended enforcement but the file is broken (deny).
 var ErrPolicyNotFound = fmt.Errorf("no policy file found")
 
-// DefaultPolicyNames are the filenames to search for policies.
+// DefaultPolicyNames are the filenames to search for policies. Signed
+// variants are checked before their unsigned counterparts so that signed
+// policies take precedence when both exist on disk.
 var DefaultPolicyNames = []string{
 	".aflock.signed",
+	"policy.aflock.signed",
+	".aflock.json.signed",
 	".aflock",
 	"policy.aflock",
 	".aflock.json",

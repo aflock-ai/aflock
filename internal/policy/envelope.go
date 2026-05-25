@@ -89,7 +89,9 @@ func verifyAndUnwrap(ctx context.Context, envelopeBytes []byte, trust *aflock.Tr
 	}
 
 	if lastErr == nil {
-		return nil, nil, errors.New("no sigstore verifier in trust config matched the envelope")
+		// No verifier in the trust config recognized a supported type — the
+		// schema validator should normally catch this, but be explicit here too.
+		return nil, nil, errors.New("no verifier in trust config matched the envelope (no supported types found)")
 	}
 	return nil, nil, lastErr
 }

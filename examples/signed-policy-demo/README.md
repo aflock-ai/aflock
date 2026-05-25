@@ -46,7 +46,8 @@ with. For a Google login via Sigstore Dex, that's your email address:
 }
 ```
 
-`subjectPattern` supports glob — `*@gmail.com` works too.
+`subjectPattern` is exact-match on the cert SAN email (or URI for CI
+identities) — wildcards do not match, pin the exact address.
 
 ## Verify
 

@@ -207,9 +207,12 @@ Trust roots live in `aflock-trust.json`, resolved in this order (first hit wins)
 ```
 
 `sigstore` verifiers match Fulcio-issued certs against `{Issuer,
-SubjectPattern}`. `subjectPattern` supports glob via `github.com/gobwas/glob`;
-`FulcioRootPath` overrides the embedded production root for self-hosted
-Sigstore.
+SubjectPattern}`. `subjectPattern` is **exact-match** against the cert's
+SAN email (for human OIDC identities like Google/GitHub login) or SAN URI
+(for CI workflow identities) — rookery's underlying `CertConstraint` does
+not glob-match SAN fields. Wildcards like `*@gmail.com` will NOT match;
+pin the exact identity instead. `FulcioRootPath` overrides the embedded
+production root for self-hosted Sigstore.
 
 `pubkey` verifiers load a PEM-encoded public key from `KeyPath`. ECDSA, RSA,
 and Ed25519 are accepted. Optional `keyid` enforces an exact SHA-256

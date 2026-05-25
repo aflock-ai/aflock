@@ -309,7 +309,11 @@ stdout on success.`,
 			fmt.Fprintf(os.Stderr, "Policy loaded but no signature info — not a signed envelope?\n")
 			os.Exit(1)
 		}
-		out, _ := json.MarshalIndent(pol.SignatureInfo, "", "  ")
+		out, err := json.MarshalIndent(pol.SignatureInfo, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Marshal signature info: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println(string(out))
 	},
 }

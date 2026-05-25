@@ -223,8 +223,12 @@ type TrustedVerifier struct {
 
 	// Issuer is the exact OIDC issuer URL the Fulcio cert must declare.
 	Issuer string `json:"issuer,omitempty"`
-	// SubjectPattern is matched against the cert SAN URI/email. Supports glob
-	// patterns via github.com/gobwas/glob.
+	// SubjectPattern is exact-matched against the cert SAN email (for human
+	// OIDC identities like Google/GitHub login) or SAN URI (for CI workflow
+	// identities like GitHub Actions). The match is routed by shape: contains
+	// "@" and no "://" → email constraint; otherwise → URI constraint.
+	// Rookery's underlying CertConstraint does NOT glob-match SAN fields, so
+	// wildcards like "*@gmail.com" will not match — pin the exact identity.
 	SubjectPattern string `json:"subjectPattern,omitempty"`
 	// FulcioRootPath optionally overrides the embedded Sigstore production root.
 	// When empty, the embedded root is used.

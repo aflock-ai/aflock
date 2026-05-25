@@ -122,7 +122,7 @@ func mustWriteECDSAKeyPair(t *testing.T, dir string) (string, string) {
 	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
 
 	// Suffix paths so callers can request multiple keypairs in one dir.
-	base := filepath.Join(dir, randSuffix())
+	base := filepath.Join(dir, randSuffix(t))
 	privPath := base + ".priv.pem"
 	pubPath := base + ".pub.pem"
 	require.NoError(t, os.WriteFile(privPath, privPEM, 0600))
@@ -130,9 +130,11 @@ func mustWriteECDSAKeyPair(t *testing.T, dir string) (string, string) {
 	return privPath, pubPath
 }
 
-func randSuffix() string {
+func randSuffix(t *testing.T) string {
+	t.Helper()
 	var buf [4]byte
-	_, _ = rand.Read(buf[:])
+	_, err := rand.Read(buf[:])
+	require.NoError(t, err, "crypto/rand.Read must not fail")
 	const hex = "0123456789abcdef"
 	out := make([]byte, 8)
 	for i, b := range buf {
