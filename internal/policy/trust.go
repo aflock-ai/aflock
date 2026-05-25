@@ -73,14 +73,20 @@ func validateTrustConfig(cfg *aflock.TrustConfig) error {
 		return errors.New("verifiers list is empty")
 	}
 	for i, v := range cfg.Verifiers {
-		if v.Type != "sigstore" {
-			return fmt.Errorf("verifier[%d]: unsupported type %q (only \"sigstore\" is implemented)", i, v.Type)
-		}
-		if v.Issuer == "" {
-			return fmt.Errorf("verifier[%d]: issuer is required", i)
-		}
-		if v.SubjectPattern == "" {
-			return fmt.Errorf("verifier[%d]: subjectPattern is required (use \"*\" to accept any subject, but prefer a tighter pattern)", i)
+		switch v.Type {
+		case "sigstore":
+			if v.Issuer == "" {
+				return fmt.Errorf("verifier[%d]: issuer is required for type=sigstore", i)
+			}
+			if v.SubjectPattern == "" {
+				return fmt.Errorf("verifier[%d]: subjectPattern is required for type=sigstore (use \"*\" to accept any subject, but prefer a tighter pattern)", i)
+			}
+		case "pubkey":
+			if v.KeyPath == "" {
+				return fmt.Errorf("verifier[%d]: keyPath is required for type=pubkey", i)
+			}
+		default:
+			return fmt.Errorf("verifier[%d]: unsupported type %q (want \"sigstore\" or \"pubkey\")", i, v.Type)
 		}
 	}
 	return nil

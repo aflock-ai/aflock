@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/aflock-ai/rookery/attestation/cryptoutil"
 	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/policysig"
 	"github.com/aflock-ai/rookery/attestation/timestamp"
@@ -64,77 +65,128 @@ func verifyAndUnwrap(ctx context.Context, envelopeBytes []byte, trust *aflock.Tr
 		return nil, nil, errors.New("envelope has no signatures")
 	}
 
-	leafCert, err := extractLeafCert(env)
-	if err != nil {
-		return nil, nil, fmt.Errorf("extract leaf cert: %w", err)
-	}
-
 	var lastErr error
 	for _, v := range trust.Verifiers {
-		if v.Type != "sigstore" {
-			continue
+		switch v.Type {
+		case "sigstore":
+			payload, info, err := verifySigstore(ctx, env, v)
+			if err != nil {
+				lastErr = fmt.Errorf("verifier(type=sigstore, issuer=%s): %w", v.Issuer, err)
+				continue
+			}
+			info.PayloadType = env.PayloadType
+			return payload, info, nil
+
+		case "pubkey":
+			payload, info, err := verifyPubkey(ctx, env, v)
+			if err != nil {
+				lastErr = fmt.Errorf("verifier(type=pubkey, keyPath=%s): %w", v.KeyPath, err)
+				continue
+			}
+			info.PayloadType = env.PayloadType
+			return payload, info, nil
 		}
-
-		roots, err := loadFulcioRoots(v.FulcioRootPath)
-		if err != nil {
-			lastErr = fmt.Errorf("verifier(issuer=%s): load fulcio roots: %w", v.Issuer, err)
-			continue
-		}
-
-		// Route the configured subject into either Emails or URIs based on its
-		// shape. Fulcio puts human identities (Google/GitHub OIDC login) in the
-		// SAN email field, and CI workflow identities (GitHub Actions, GitLab
-		// CI) in the SAN URI field. We can't put the same string into both
-		// constraint slices because rookery's checkCertConstraint requires that
-		// constraints and values match 1:1 — a cert with only an email will
-		// fail a non-empty URI constraint and vice versa.
-		emails := []string{"*"}
-		uris := []string{"*"}
-		if isEmail(v.SubjectPattern) {
-			emails = []string{v.SubjectPattern}
-		} else {
-			uris = []string{v.SubjectPattern}
-		}
-
-		tsaVerifiers, err := loadTSAVerifiers()
-		if err != nil {
-			lastErr = fmt.Errorf("verifier(issuer=%s): load tsa roots: %w", v.Issuer, err)
-			continue
-		}
-
-		opts := policysig.NewVerifyPolicySignatureOptions(
-			policysig.VerifyWithPolicyCARoots(roots),
-			policysig.VerifyWithPolicyTimestampAuthorities(tsaVerifiers),
-			policysig.VerifyWithPolicyCertConstraints(
-				"*",           // commonName
-				[]string{"*"}, // dnsNames
-				emails,
-				[]string{"*"}, // organizations
-				uris,
-			),
-			policysig.VerifyWithPolicyFulcioCertExtensions(certificate.Extensions{
-				Issuer: v.Issuer,
-			}),
-		)
-
-		if err := policysig.VerifyPolicySignature(ctx, env, opts); err != nil {
-			lastErr = fmt.Errorf("verifier(issuer=%s): %w", v.Issuer, err)
-			continue
-		}
-
-		// Verification passed. Build SignatureInfo from the leaf cert we already
-		// parsed above (policysig.VerifyPolicySignature only returns error, not
-		// the cert it verified — but the cert is fixed by the envelope so this
-		// is sound).
-		info := signatureInfoFromCert(leafCert)
-		info.PayloadType = env.PayloadType
-		return env.Payload, info, nil
 	}
 
 	if lastErr == nil {
 		return nil, nil, errors.New("no sigstore verifier in trust config matched the envelope")
 	}
 	return nil, nil, lastErr
+}
+
+// verifySigstore verifies an envelope against a Fulcio-issued leaf cert,
+// matching the cert's OIDC issuer + subject SAN against the trust config.
+// Returns the unwrapped payload + signature metadata on success.
+func verifySigstore(ctx context.Context, env rdsse.Envelope, v aflock.TrustedVerifier) ([]byte, *aflock.SignatureInfo, error) {
+	leafCert, err := extractLeafCert(env)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extract leaf cert: %w", err)
+	}
+
+	roots, err := loadFulcioRoots(v.FulcioRootPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load fulcio roots: %w", err)
+	}
+
+	// Route the configured subject into either Emails or URIs based on its
+	// shape. Fulcio puts human identities (Google/GitHub OIDC login) in the
+	// SAN email field, and CI workflow identities (GitHub Actions, GitLab CI)
+	// in the SAN URI field.
+	emails := []string{"*"}
+	uris := []string{"*"}
+	if isEmail(v.SubjectPattern) {
+		emails = []string{v.SubjectPattern}
+	} else {
+		uris = []string{v.SubjectPattern}
+	}
+
+	tsaVerifiers, err := loadTSAVerifiers()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load tsa roots: %w", err)
+	}
+
+	opts := policysig.NewVerifyPolicySignatureOptions(
+		policysig.VerifyWithPolicyCARoots(roots),
+		policysig.VerifyWithPolicyTimestampAuthorities(tsaVerifiers),
+		policysig.VerifyWithPolicyCertConstraints(
+			"*",           // commonName
+			[]string{"*"}, // dnsNames
+			emails,
+			[]string{"*"}, // organizations
+			uris,
+		),
+		policysig.VerifyWithPolicyFulcioCertExtensions(certificate.Extensions{
+			Issuer: v.Issuer,
+		}),
+	)
+
+	if err := policysig.VerifyPolicySignature(ctx, env, opts); err != nil {
+		return nil, nil, err
+	}
+
+	return env.Payload, signatureInfoFromCert(leafCert), nil
+}
+
+// verifyPubkey verifies an envelope against a raw PEM-encoded public key on
+// disk. No Fulcio cert chain, no TSA timestamp dance — raw keys don't expire
+// the way Fulcio leaf certs do. The keyid in the envelope's signature is
+// optionally matched against TrustedVerifier.KeyID to prevent loading the
+// wrong key from disk.
+func verifyPubkey(ctx context.Context, env rdsse.Envelope, v aflock.TrustedVerifier) ([]byte, *aflock.SignatureInfo, error) {
+	f, err := os.Open(v.KeyPath) //nolint:gosec // G304: operator-controlled trust config path
+	if err != nil {
+		return nil, nil, fmt.Errorf("open public key: %w", err)
+	}
+	defer f.Close()
+
+	verifier, err := cryptoutil.NewVerifierFromReader(f)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse public key: %w", err)
+	}
+
+	loadedKeyID, err := verifier.KeyID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("compute keyid: %w", err)
+	}
+
+	if v.KeyID != "" && v.KeyID != loadedKeyID {
+		return nil, nil, fmt.Errorf("keyid mismatch: trust config expects %q, loaded key is %q", v.KeyID, loadedKeyID)
+	}
+
+	if err := policysig.VerifyPolicySignature(
+		ctx, env,
+		policysig.NewVerifyPolicySignatureOptions(
+			policysig.VerifyWithPolicyVerifiers([]cryptoutil.Verifier{verifier}),
+		),
+	); err != nil {
+		return nil, nil, err
+	}
+
+	info := &aflock.SignatureInfo{
+		Issuer:  "pubkey",
+		Subject: loadedKeyID,
+	}
+	return env.Payload, info, nil
 }
 
 // extractLeafCert pulls the first embedded leaf certificate out of a DSSE
@@ -163,9 +215,11 @@ func extractLeafCert(env rdsse.Envelope) (*x509.Certificate, error) {
 // 1.3.6.1.4.1.57264.1.1 (parsed by sigstore/fulcio/pkg/certificate) and the
 // signing identity in the SAN URI (or email for human identities).
 func signatureInfoFromCert(cert *x509.Certificate) *aflock.SignatureInfo {
+	notBefore := cert.NotBefore
+	notAfter := cert.NotAfter
 	info := &aflock.SignatureInfo{
-		CertNotBefore: cert.NotBefore,
-		CertNotAfter:  cert.NotAfter,
+		CertNotBefore: &notBefore,
+		CertNotAfter:  &notAfter,
 	}
 
 	if ext, err := certificate.ParseExtensions(cert.Extensions); err == nil {

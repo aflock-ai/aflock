@@ -208,27 +208,31 @@ var statusCmd = &cobra.Command{
 	},
 }
 
-var signOutputPath string
+var (
+	signOutputPath string
+	signKeyPath    string
+)
 
 var signCmd = &cobra.Command{
 	Use:   "sign <policy.aflock>",
-	Short: "Sign a policy file via Sigstore keyless (Fulcio)",
-	Long: `Sign a policy file with a Sigstore Fulcio-issued short-lived certificate
-bound to the caller's OIDC identity.
+	Short: "Sign a policy file (Sigstore keyless by default; --key for raw PEM)",
+	Long: `Sign a policy file as a DSSE envelope.
 
-OIDC token source:
-  - GitHub Actions: set GITHUB_ACTIONS=true (auto-fetched, workflow needs id-token: write)
-  - Direct token:   $FULCIO_TOKEN
-  - Token file:     $FULCIO_TOKEN_PATH
+Two signer paths, picked by flags / env:
 
-Output is a DSSE envelope (payloadType application/vnd.aflock.policy+json)
-with the Fulcio leaf certificate embedded. Verifiers chain that cert to the
-Fulcio root and match the cert's OIDC issuer/subject against aflock-trust.json.
+  Sigstore keyless (default):
+    Fulcio issues an ephemeral cert bound to the caller's OIDC identity, then
+    aflock bundles an RFC 3161 timestamp so the signature survives the
+    ~10-min cert validity window. Requires network at sign time.
+    OIDC sources: GITHUB_ACTIONS=true | $FULCIO_TOKEN | $FULCIO_TOKEN_PATH |
+                  $FULCIO_OIDC_ISSUER (interactive browser)
 
-Caveat: Fulcio certs are ~10 minutes valid. This release does not yet wire
-TSA/Rekor SET into the envelope, so verifiers using time.Now() reject after
-expiry. Re-sign close to verification (e.g., on policy change via CI). See
-the follow-up issue tracking long-lived signed-policy support.`,
+  Raw key (--key <pem> or $AFLOCK_SIGNING_KEY):
+    PEM-encoded ECDSA, RSA, or Ed25519 private key. Operator manages the key.
+    No TSA needed (raw keys don't expire), no network needed.
+
+The verifier picks which path to take by reading aflock-trust.json — see
+docs/concepts/policies.md#signing-and-trust.`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		policyPath := args[0]
@@ -245,7 +249,17 @@ the follow-up issue tracking long-lived signed-policy support.`,
 			os.Exit(1)
 		}
 
-		envelopeJSON, err := policy.SignWithFulcio(cmd.Context(), policyData)
+		keyPath := signKeyPath
+		if keyPath == "" {
+			keyPath = os.Getenv("AFLOCK_SIGNING_KEY")
+		}
+
+		var envelopeJSON []byte
+		if keyPath != "" {
+			envelopeJSON, err = policy.SignWithKey(cmd.Context(), keyPath, policyData)
+		} else {
+			envelopeJSON, err = policy.SignWithFulcio(cmd.Context(), policyData)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Sign failed: %v\n", err)
 			os.Exit(1)
@@ -615,6 +629,7 @@ func init() {
 
 	// Sign command flags
 	signCmd.Flags().StringVarP(&signOutputPath, "output", "o", "", "Output path for signed envelope (default: <input>.signed, use - for stdout)")
+	signCmd.Flags().StringVarP(&signKeyPath, "key", "k", "", "Path to PEM-encoded private key (ECDSA / RSA / Ed25519). Falls back to $AFLOCK_SIGNING_KEY. When unset, signs via Sigstore Fulcio.")
 
 	// Plan-to-policy command flags
 	planToPolicyCmd.Flags().StringVar(&planPath, "plan", "", "Path to Claude plan markdown file (required)")

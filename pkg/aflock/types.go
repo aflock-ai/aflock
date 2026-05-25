@@ -186,13 +186,17 @@ type Policy struct {
 // Surfaced in attestations so audits can prove a signed policy gated the session.
 type SignatureInfo struct {
 	// Issuer is the OIDC issuer URL from the Fulcio certificate
-	// (e.g., "https://token.actions.githubusercontent.com").
+	// (e.g., "https://token.actions.githubusercontent.com"). For raw-pubkey
+	// verifiers this is the literal string "pubkey".
 	Issuer string `json:"issuer"`
-	// Subject is the OIDC subject from the cert SAN (URI or email).
+	// Subject is the OIDC subject from the cert SAN (URI or email) for
+	// sigstore-typed verifiers, or the loaded key's SHA-256 fingerprint for
+	// raw-pubkey verifiers.
 	Subject string `json:"subject"`
 	// CertNotBefore / CertNotAfter are the Fulcio cert validity window.
-	CertNotBefore time.Time `json:"certNotBefore"`
-	CertNotAfter  time.Time `json:"certNotAfter"`
+	// Omitted in raw-pubkey output where they have no meaning.
+	CertNotBefore *time.Time `json:"certNotBefore,omitempty"`
+	CertNotAfter  *time.Time `json:"certNotAfter,omitempty"`
 	// PayloadType is the DSSE payload type (always
 	// "application/vnd.aflock.policy+json" for this release).
 	PayloadType string `json:"payloadType"`
@@ -205,18 +209,37 @@ type TrustConfig struct {
 	Verifiers []TrustedVerifier `json:"verifiers"`
 }
 
-// TrustedVerifier is a single accepted signing identity.
+// TrustedVerifier is a single accepted signing identity. The discriminator
+// "type" selects which fields are consulted at verify time.
 type TrustedVerifier struct {
-	// Type must currently be "sigstore". Reserved for future verifier types.
+	// Type is one of:
+	//   "sigstore" — match a Fulcio-issued leaf cert against {Issuer, SubjectPattern}
+	//   "pubkey"   — match against a raw PEM-encoded public key on disk
+	// Mirrors the StepFunctionary.Type taxonomy used for attestation verification
+	// so operators see the same trust-model vocabulary on both surfaces.
 	Type string `json:"type"`
+
+	// --- Sigstore-only fields ---
+
 	// Issuer is the exact OIDC issuer URL the Fulcio cert must declare.
-	Issuer string `json:"issuer"`
+	Issuer string `json:"issuer,omitempty"`
 	// SubjectPattern is matched against the cert SAN URI/email. Supports glob
 	// patterns via github.com/gobwas/glob.
-	SubjectPattern string `json:"subjectPattern"`
+	SubjectPattern string `json:"subjectPattern,omitempty"`
 	// FulcioRootPath optionally overrides the embedded Sigstore production root.
 	// When empty, the embedded root is used.
 	FulcioRootPath string `json:"fulcioRootPath,omitempty"`
+
+	// --- Pubkey-only fields ---
+
+	// KeyPath points to a PEM-encoded public key file. ECDSA, RSA, and Ed25519
+	// are accepted (rookery cryptoutil dispatches on the parsed type).
+	KeyPath string `json:"keyPath,omitempty"`
+	// KeyID, when non-empty, must match the SHA-256 hex fingerprint of the
+	// envelope signature's keyid before verification is attempted. Optional —
+	// if omitted, any signature that verifies against the loaded key is
+	// accepted, matching witness's publickey functionary semantics.
+	KeyID string `json:"keyid,omitempty"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.

@@ -157,17 +157,29 @@ embedded cert to the Sigstore root and matches it against an operator-controlled
 
 ### Sign
 
-```bash
-# In GitHub Actions (or any OIDC-aware CI), with id-token: write:
-GITHUB_ACTIONS=true aflock sign .aflock      # writes .aflock.signed
+Two signer paths; pick by flag/env:
 
-# Locally, providing a token out-of-band:
-FULCIO_TOKEN=<oidc-jwt> aflock sign .aflock
+**Sigstore keyless (default).** Fulcio issues an ephemeral cert bound to the
+caller's OIDC identity; aflock bundles an RFC 3161 timestamp from the
+Sigstore TSA so the signature outlives the cert's 10-minute window.
+
+```bash
+GITHUB_ACTIONS=true aflock sign .aflock         # in CI with id-token: write
+FULCIO_OIDC_ISSUER=https://oauth2.sigstore.dev/auth aflock sign .aflock  # local browser flow
+FULCIO_TOKEN=<jwt> aflock sign .aflock          # OIDC token provided out-of-band
+```
+
+**Raw key (`--key` / `$AFLOCK_SIGNING_KEY`).** Operator-managed PEM private
+key (ECDSA, RSA, or Ed25519). No network at sign time, no TSA needed (raw
+keys don't have a Fulcio-style validity window).
+
+```bash
+aflock sign .aflock --key ./team-signing.priv.pem
 ```
 
 The produced `.aflock.signed` is a DSSE envelope
-(`payloadType: application/vnd.aflock.policy+json`) containing the policy bytes,
-the Fulcio leaf cert, and the signature.
+(`payloadType: application/vnd.aflock.policy+json`). For Sigstore: contains
+the Fulcio leaf cert + TSA timestamp. For raw-key: just the signature + keyid.
 
 ### Trust config
 
@@ -185,14 +197,27 @@ Trust roots live in `aflock-trust.json`, resolved in this order (first hit wins)
       "type": "sigstore",
       "issuer": "https://token.actions.githubusercontent.com",
       "subjectPattern": "https://github.com/org/repo/.github/workflows/sign-policy.yml@refs/heads/main"
+    },
+    {
+      "type": "pubkey",
+      "keyPath": "/etc/aflock/team-signing.pub.pem"
     }
   ]
 }
 ```
 
-`subjectPattern` supports glob via `github.com/gobwas/glob`. `FulcioRootPath` can
-override the embedded Sigstore production root for self-hosted Sigstore
-deployments.
+`sigstore` verifiers match Fulcio-issued certs against `{Issuer,
+SubjectPattern}`. `subjectPattern` supports glob via `github.com/gobwas/glob`;
+`FulcioRootPath` overrides the embedded production root for self-hosted
+Sigstore.
+
+`pubkey` verifiers load a PEM-encoded public key from `KeyPath`. ECDSA, RSA,
+and Ed25519 are accepted. Optional `keyid` enforces an exact SHA-256
+fingerprint match — leave unset to accept any signature that verifies against
+the loaded key.
+
+Multiple verifiers can coexist; a signature passing any one of them is
+accepted.
 
 The trust config is **not** part of the policy — an attacker who can write the
 policy must not be able to declare their own trust root. Keep it in

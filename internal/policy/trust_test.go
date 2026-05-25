@@ -90,6 +90,33 @@ func TestLoadTrustConfig_UnsupportedType(t *testing.T) {
 	assert.Contains(t, err.Error(), `unsupported type "x509"`)
 }
 
+func TestLoadTrustConfig_PubkeyType(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "trust.json")
+	require.NoError(t, os.WriteFile(cfgPath,
+		[]byte(`{"version":"1","verifiers":[{"type":"pubkey","keyPath":"/tmp/key.pem"}]}`),
+		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", cfgPath)
+
+	cfg, _, err := LoadTrustConfig("")
+	require.NoError(t, err)
+	assert.Equal(t, "pubkey", cfg.Verifiers[0].Type)
+	assert.Equal(t, "/tmp/key.pem", cfg.Verifiers[0].KeyPath)
+}
+
+func TestLoadTrustConfig_PubkeyMissingKeyPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "trust.json")
+	require.NoError(t, os.WriteFile(cfgPath,
+		[]byte(`{"version":"1","verifiers":[{"type":"pubkey"}]}`),
+		0600))
+	t.Setenv("AFLOCK_TRUST_CONFIG", cfgPath)
+
+	_, _, err := LoadTrustConfig("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "keyPath is required for type=pubkey")
+}
+
 func TestLoadTrustConfig_MissingFields(t *testing.T) {
 	cases := map[string]string{
 		"missing issuer":         `{"version":"1","verifiers":[{"type":"sigstore","subjectPattern":"s"}]}`,

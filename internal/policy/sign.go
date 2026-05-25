@@ -19,6 +19,39 @@ import (
 // $FULCIO_URL for self-hosted Sigstore deployments.
 const DefaultFulcioURL = "https://fulcio.sigstore.dev"
 
+// SignWithKey wraps policyBytes in a DSSE envelope signed by a PEM-encoded
+// private key on disk. ECDSA, RSA, and Ed25519 are accepted (rookery dispatches
+// on the parsed type). Use this when Fulcio isn't an option — air-gapped CI,
+// no OIDC IdP, or self-hosted Sigstore without a Fulcio deployment. No TSA
+// timestamp is bundled because raw keys don't have the 10-minute validity
+// window Fulcio leaf certs have.
+//
+// Operators are responsible for key management (generation, distribution,
+// rotation, protection). If you can use Fulcio, prefer SignWithFulcio.
+func SignWithKey(_ context.Context, keyPath string, policyBytes []byte) ([]byte, error) {
+	f, err := os.Open(keyPath) //nolint:gosec // G304: operator-controlled CLI flag
+	if err != nil {
+		return nil, fmt.Errorf("open private key: %w", err)
+	}
+	defer f.Close()
+
+	signer, err := cryptoutil.NewSignerFromReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+
+	envelope, err := rdsse.Sign(PolicyPayloadType, bytes.NewReader(policyBytes), rdsse.SignWithSigners(signer))
+	if err != nil {
+		return nil, fmt.Errorf("dsse sign: %w", err)
+	}
+
+	out, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope: %w", err)
+	}
+	return out, nil
+}
+
 // SignWithFulcio wraps policyBytes in a DSSE envelope signed by an ephemeral
 // Fulcio-issued keypair bound to the caller's OIDC identity, and bundles an
 // RFC 3161 timestamp from the Sigstore TSA so verifiers using time.Now()
