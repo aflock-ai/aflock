@@ -659,7 +659,27 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 	// Check fail-fast limits after tool execution
 	if sessionState.Policy != nil && sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
-		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "fail-fast")
+
+		// Roll up in-flight subagent metrics into a transient effective view
+		// before the limit check (paper §5 invariant #2, issue #135). Without
+		// this, the parent's fail-fast sees only its own spend; a child
+		// running concurrently can push the combined total past the ceiling
+		// before SubagentStop ever fires and merges. The race window narrows
+		// to one child-tool-call delta, which the issue explicitly accepts.
+		metricsForLimits := sessionState.Metrics
+		if children, listErr := h.stateManager.ListChildSessions(sessionState.SessionID); listErr == nil {
+			rolled, included := rollupUnmergedChildren(sessionState, children)
+			if len(included) > 0 {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Subagent rollup: including %d in-flight child(ren) %v in fail-fast limit check\n",
+					len(included), included)
+				metricsForLimits = rolled
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: list child sessions for rollup: %v\n", listErr)
+		}
+
+		exceeded, limitName, msg := evaluator.CheckLimits(metricsForLimits, "fail-fast")
 		if exceeded {
 			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
 				fmt.Fprintf(os.Stderr,
@@ -1682,6 +1702,56 @@ func attenuateLimits(childLimits, parentLimits *aflock.LimitsPolicy, parentMetri
 	}
 
 	return result
+}
+
+// rollupUnmergedChildren returns effective metrics that include in-flight
+// children whose SubagentStop hasn't yet fired. Children already present in
+// parent.ChildSessionIDs are skipped — their metrics were merged into
+// parent.Metrics at SubagentStop and counting them again would double-count
+// (paper §5 invariant #2, issue #135).
+//
+// Mirrors the merge field set in mergeChildIntoParent: TokensIn, TokensOut,
+// CostUSD, ToolCalls. Turns are deliberately not composed across the
+// boundary (each session has its own conversation-turn counter; summing
+// them isn't meaningful and the existing merge also skips them).
+//
+// Returns a new SessionMetrics — does NOT mutate parent.Metrics, because
+// SubagentStop will perform the durable merge later.
+func rollupUnmergedChildren(parent *aflock.SessionState, children []*aflock.SessionState) (*aflock.SessionMetrics, []string) {
+	if parent == nil || parent.Metrics == nil {
+		return nil, nil
+	}
+	merged := make(map[string]bool, len(parent.ChildSessionIDs))
+	for _, cid := range parent.ChildSessionIDs {
+		merged[cid] = true
+	}
+
+	effective := *parent.Metrics
+	if effective.Tools != nil {
+		// Copy the Tools map so callers writing through the returned metrics
+		// can't accidentally mutate the parent's persisted state.
+		copied := make(map[string]int, len(effective.Tools))
+		for k, v := range effective.Tools {
+			copied[k] = v
+		}
+		effective.Tools = copied
+	}
+
+	var included []string
+	for _, child := range children {
+		if child == nil || child.Metrics == nil {
+			continue
+		}
+		if merged[child.SessionID] {
+			continue
+		}
+		effective.TokensIn += child.Metrics.TokensIn
+		effective.TokensOut += child.Metrics.TokensOut
+		effective.CostUSD += child.Metrics.CostUSD
+		effective.ToolCalls += child.Metrics.ToolCalls
+		included = append(included, child.SessionID)
+	}
+	return &effective, included
 }
 
 // mergeChildIntoParent merges the child session's actions, metrics, and
