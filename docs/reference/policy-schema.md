@@ -173,3 +173,19 @@ Each limit is an object: `{ "value": number, "enforcement": "fail-fast" | "post-
   "organizations": ["Example Corp"]
 }
 ```
+
+### Placeholders
+
+`materialsFrom.session.path` and `materialsFrom.git.treeHash` expand
+`${NAME}`-style references against the environment at policy-load time, so
+the same policy file works across runs without hand-editing. Strict by
+design: unknown names and unset env vars both fail Load — silent fallback
+to the literal `${...}` string was the original [#134](https://github.com/aflock-ai/aflock/issues/134) bug.
+
+| Placeholder | Resolves from env | Set by |
+|-------------|-------------------|--------|
+| `${CLAUDE_SESSION_PATH}` | `CLAUDE_SESSION_PATH` | Hooks / verify CLI before `policy.Load` (claude-code session JSONL path) |
+| `${GIT_TREE_HASH}` | `GIT_TREE_HASH` | Caller, typically `git rev-parse HEAD^{tree}` |
+
+Other fields (grants globs, artifact URIs) currently pass through unchanged
+and will join this list when their runtime enforcement lands.
