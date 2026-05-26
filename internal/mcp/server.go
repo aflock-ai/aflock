@@ -1774,12 +1774,18 @@ func (s *Server) handleCheckLimits(ctx context.Context, request mcp.CallToolRequ
 // internal/hooks/handler.go performs at PreToolUse when Claude Code's
 // Task/Agent tool is invoked.
 func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// aflock_delegate is sensitive (issues child JWTs + writes propagation),
+	// so we require a validated JWT unconditionally rather than honoring
+	// the graceful-adoption fallback used by less-privileged tools.
 	claims, err := s.validateJWT(request)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
 	}
-	if claims == nil && s.authActive.Load() {
-		return mcp.NewToolResultError("Authorization denied: aflock_delegate requires a valid JWT once auth is active"), nil
+	if claims == nil {
+		return mcp.NewToolResultError("Authorization denied: aflock_delegate requires a valid JWT"), nil
+	}
+	if s.tokenIssuer == nil {
+		return mcp.NewToolResultError("aflock_delegate: token issuer not initialized"), nil
 	}
 
 	if s.policy == nil {
@@ -1818,29 +1824,36 @@ func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest
 		return mcp.NewToolResultError("aflock_delegate: no parent session state; call get_token / start a session first"), nil
 	}
 
-	if err := s.stateManager.WritePropagationForSublayout(parentState, matched); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: write propagation: %v", err)), nil
-	}
-
+	// Caller-supplied child_session_id must be a safe identifier the
+	// state manager and downstream tooling can use as a filename
+	// component. We allow alphanumerics, hyphen, and underscore;
+	// anything else is rejected so a malformed id can't slip through
+	// to a JWT and then fail at state-load time.
 	childSessionID := request.GetString("child_session_id", "")
 	if childSessionID == "" {
 		childSessionID = fmt.Sprintf("delegate-%s", uuid.New().String())
+	} else if !validSessionID(childSessionID) {
+		return mcp.NewToolResultError(
+			"aflock_delegate: child_session_id must be 1-128 chars of [a-zA-Z0-9_-]"), nil
 	}
 
-	var childJWT string
-	if s.tokenIssuer != nil {
-		agentID := ""
-		identityHash := ""
-		if s.agentIdentity != nil {
-			if spiffeID, sErr := s.agentIdentity.ToSPIFFEID("aflock.ai"); sErr == nil {
-				agentID = spiffeID.String()
-			}
-			identityHash = s.agentIdentity.IdentityHash
+	// Mint the JWT first. If minting fails, no propagation record is
+	// written — failed delegations have no observable side effects.
+	agentID := ""
+	identityHash := ""
+	if s.agentIdentity != nil {
+		if spiffeID, sErr := s.agentIdentity.ToSPIFFEID("aflock.ai"); sErr == nil {
+			agentID = spiffeID.String()
 		}
-		childJWT, err = s.tokenIssuer.MintChildToken(s.policy, matched, childSessionID, agentID, identityHash, time.Hour)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: mint child JWT: %v", err)), nil
-		}
+		identityHash = s.agentIdentity.IdentityHash
+	}
+	childJWT, err := s.tokenIssuer.MintChildToken(s.policy, matched, childSessionID, agentID, identityHash, time.Hour)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: mint child JWT: %v", err)), nil
+	}
+
+	if err := s.stateManager.WritePropagationForSublayout(parentState, matched); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: write propagation: %v", err)), nil
 	}
 
 	result := map[string]any{
@@ -1853,6 +1866,28 @@ func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(data)), nil
+}
+
+// validSessionID enforces the safe-identifier rule for caller-supplied
+// child_session_id values: 1-128 chars, restricted to [a-zA-Z0-9_-].
+// Keeps malformed IDs from reaching the state manager (where they'd
+// become filename components) and from being baked into a JWT that
+// downstream tooling can't load.
+func validSessionID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // computePredicateDigest computes SHA256 of predicate data.

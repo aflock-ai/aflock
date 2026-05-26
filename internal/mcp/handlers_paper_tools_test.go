@@ -129,10 +129,51 @@ func policyWithSublayout() *aflock.Policy {
 	}
 }
 
+// authedDelegateServer wires up a server with the sublayout fixture and
+// pre-issues a parent JWT. Returns the server and the token string callers
+// pass back through `_token` so handleDelegate's JWT gate is satisfied.
+func authedDelegateServer(t *testing.T, pol *aflock.Policy) (*Server, string) {
+	t.Helper()
+	s := newTestServerWithPolicy(t, pol)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	s.tokenIssuer = auth.NewTokenIssuerFromSigner(key, "test-signer")
+	tok, err := s.tokenIssuer.IssueToken(s.sessionID, "test-agent", "test-hash", pol, time.Hour)
+	if err != nil {
+		t.Fatalf("issue parent token: %v", err)
+	}
+	return s, tok
+}
+
+// TestHandleDelegate_RequiresJWT — handler must refuse calls without a
+// JWT regardless of authActive state, since delegate mints child tokens.
+func TestHandleDelegate_RequiresJWT(t *testing.T) {
+	s := newTestServerWithPolicy(t, policyWithSublayout())
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	s.tokenIssuer = auth.NewTokenIssuerFromSigner(key, "test-signer")
+	// authActive deliberately left false — graceful adoption must NOT
+	// apply to aflock_delegate.
+
+	result, err := s.handleDelegate(context.Background(),
+		newTestRequest(map[string]any{"sublayout_name": "research-agent"}))
+	if err != nil {
+		t.Fatalf("handleDelegate: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "requires a valid JWT") {
+		t.Errorf("expected 'requires a valid JWT' error, got: %+v", result)
+	}
+}
+
 // TestHandleDelegate_MissingSublayoutName rejects empty input clearly.
 func TestHandleDelegate_MissingSublayoutName(t *testing.T) {
-	s := newTestServerWithPolicy(t, policyWithSublayout())
-	result, err := s.handleDelegate(context.Background(), newTestRequest(nil))
+	s, tok := authedDelegateServer(t, policyWithSublayout())
+	result, err := s.handleDelegate(context.Background(),
+		newTestRequest(map[string]any{"_token": tok}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -143,9 +184,9 @@ func TestHandleDelegate_MissingSublayoutName(t *testing.T) {
 
 // TestHandleDelegate_UnknownSublayout refuses names not in policy.
 func TestHandleDelegate_UnknownSublayout(t *testing.T) {
-	s := newTestServerWithPolicy(t, policyWithSublayout())
+	s, tok := authedDelegateServer(t, policyWithSublayout())
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"sublayout_name": "nope"}))
+		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "nope"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -160,10 +201,10 @@ func TestHandleDelegate_AttenuationViolation(t *testing.T) {
 	pol := policyWithSublayout()
 	// Bump the sublayout above the parent.
 	pol.Sublayouts[0].Limits.MaxSpendUSD = &aflock.Limit{Value: 99.0, Enforcement: "fail-fast"}
-	s := newTestServerWithPolicy(t, pol)
+	s, tok := authedDelegateServer(t, pol)
 
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"sublayout_name": "research-agent"}))
+		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -172,19 +213,32 @@ func TestHandleDelegate_AttenuationViolation(t *testing.T) {
 	}
 }
 
+// TestHandleDelegate_RejectsBadChildSessionID — caller-supplied IDs
+// with disallowed characters must be rejected before any side effect.
+func TestHandleDelegate_RejectsBadChildSessionID(t *testing.T) {
+	s, tok := authedDelegateServer(t, policyWithSublayout())
+	result, err := s.handleDelegate(context.Background(),
+		newTestRequest(map[string]any{
+			"_token":           tok,
+			"sublayout_name":   "research-agent",
+			"child_session_id": "../../etc/passwd",
+		}))
+	if err != nil {
+		t.Fatalf("handleDelegate: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "child_session_id must be") {
+		t.Errorf("expected child_session_id format error, got: %+v", result)
+	}
+}
+
 // TestHandleDelegate_HappyPath validates the full success flow:
 // returns ok=true, includes the sublayout name, mints a child JWT, and
 // the JWT's claims carry the attenuated limit.
 func TestHandleDelegate_HappyPath(t *testing.T) {
-	s := newTestServerWithPolicy(t, policyWithSublayout())
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	s.tokenIssuer = auth.NewTokenIssuerFromSigner(key, "test-signer")
+	s, tok := authedDelegateServer(t, policyWithSublayout())
 
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"sublayout_name": "research-agent"}))
+		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
