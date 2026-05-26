@@ -1605,11 +1605,19 @@ func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallTool
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
 	}
-	if claims == nil && s.authActive.Load() {
-		return mcp.NewToolResultError("Authorization denied: sign_attestation requires a valid JWT once auth is active (issue #40)"), nil
+	// Use the actually-invoked tool name so the paper-named alias
+	// (aflock_attest) and the legacy name (sign_attestation) both
+	// authorize correctly when present in a policy allowlist
+	// (Copilot review on PR #149).
+	invoked := request.Params.Name
+	if invoked == "" {
+		invoked = "sign_attestation"
 	}
-	if claims != nil && !auth.IsToolAllowed("sign_attestation", claims.AllowedTools, claims.DeniedTools) {
-		return mcp.NewToolResultError("Authorization denied: tool 'sign_attestation' not permitted by token scope"), nil
+	if claims == nil && s.authActive.Load() {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %s requires a valid JWT once auth is active (issue #40)", invoked)), nil
+	}
+	if claims != nil && !auth.IsToolAllowed(invoked, claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: tool %q not permitted by token scope", invoked)), nil
 	}
 
 	if !s.signingEnabled {
@@ -1784,6 +1792,14 @@ func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest
 	if claims == nil {
 		return mcp.NewToolResultError("Authorization denied: aflock_delegate requires a valid JWT"), nil
 	}
+	// Tool-scope check: a token issued under a policy allowlist that
+	// does not include the invoked name must not be able to mint child
+	// JWTs (Copilot review on PR #149). Use the actually-invoked name
+	// so the same handler covers any future alias.
+	invoked := request.Params.Name
+	if !auth.IsToolAllowed(invoked, claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: tool %q not permitted by token scope", invoked)), nil
+	}
 	if s.tokenIssuer == nil {
 		return mcp.NewToolResultError("aflock_delegate: token issuer not initialized"), nil
 	}
@@ -1839,6 +1855,14 @@ func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest
 
 	// Mint the JWT first. If minting fails, no propagation record is
 	// written — failed delegations have no observable side effects.
+	//
+	// IMPORTANT (Copilot review on PR #149): the minted token is bound
+	// to the child session ID and the attenuated child policy digest.
+	// It is NOT usable against THIS server's validateJWT, which checks
+	// every call against the parent session/policy. The intended
+	// consumer is a downstream aflock instance that loads the child
+	// policy and runs the child session. Callers handing this token
+	// back to the parent socket will be rejected — by design.
 	agentID := ""
 	identityHash := ""
 	if s.agentIdentity != nil {
@@ -1862,6 +1886,7 @@ func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest
 		"parent_session":   s.sessionID,
 		"child_session_id": childSessionID,
 		"child_jwt":        childJWT,
+		"child_jwt_note":   "Token is bound to child_session_id + attenuated child policy. Present it to a downstream aflock instance loaded with the child policy, not to this server.",
 		"limits":           matched.Limits,
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")

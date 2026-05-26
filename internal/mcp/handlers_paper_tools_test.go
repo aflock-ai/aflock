@@ -109,12 +109,15 @@ func TestHandleCheckLimits_NoPolicy(t *testing.T) {
 }
 
 // policyWithSublayout returns a policy declaring one valid sublayout
-// (`research-agent`) so handleDelegate has something to match.
+// (`research-agent`) so handleDelegate has something to match. The
+// allowlist includes `aflock_delegate` so the new tool-scope check
+// passes for the happy-path tests; a separate fixture below omits it
+// to exercise the scope rejection.
 func policyWithSublayout() *aflock.Policy {
 	return &aflock.Policy{
 		Version: "1.0",
 		Name:    "delegate-fixture",
-		Tools:   &aflock.ToolsPolicy{Allow: []string{"Read", "Bash"}},
+		Tools:   &aflock.ToolsPolicy{Allow: []string{"Read", "Bash", "aflock_delegate"}},
 		Limits: &aflock.LimitsPolicy{
 			MaxSpendUSD: &aflock.Limit{Value: 10.0, Enforcement: "fail-fast"},
 			MaxTokensIn: &aflock.Limit{Value: 500_000, Enforcement: "fail-fast"},
@@ -127,6 +130,15 @@ func policyWithSublayout() *aflock.Policy {
 			},
 		}},
 	}
+}
+
+// delegateRequest mirrors a real MCP server's CallToolRequest by
+// stamping the invoked tool name into Params.Name — the scope check
+// in handleDelegate reads it. Defaults to "aflock_delegate".
+func delegateRequest(args map[string]any) mcp.CallToolRequest {
+	r := newTestRequest(args)
+	r.Params.Name = "aflock_delegate"
+	return r
 }
 
 // authedDelegateServer wires up a server with the sublayout fixture and
@@ -160,7 +172,7 @@ func TestHandleDelegate_RequiresJWT(t *testing.T) {
 	// apply to aflock_delegate.
 
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"sublayout_name": "research-agent"}))
+		delegateRequest(map[string]any{"sublayout_name": "research-agent"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -169,11 +181,32 @@ func TestHandleDelegate_RequiresJWT(t *testing.T) {
 	}
 }
 
+// TestHandleDelegate_TokenScopeRejected pins the Copilot review fix:
+// a token issued under a policy whose allowlist does NOT include
+// aflock_delegate must be rejected before any propagation/JWT-mint
+// side effect. Regression test for issue #149 review.
+func TestHandleDelegate_TokenScopeRejected(t *testing.T) {
+	pol := policyWithSublayout()
+	// Drop aflock_delegate from the allowlist — the token issued from
+	// this policy then scopes the caller out of the new tool.
+	pol.Tools.Allow = []string{"Read", "Bash"}
+	s, tok := authedDelegateServer(t, pol)
+
+	result, err := s.handleDelegate(context.Background(),
+		delegateRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
+	if err != nil {
+		t.Fatalf("handleDelegate: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "not permitted by token scope") {
+		t.Errorf("expected 'not permitted by token scope' error, got: %+v", result)
+	}
+}
+
 // TestHandleDelegate_MissingSublayoutName rejects empty input clearly.
 func TestHandleDelegate_MissingSublayoutName(t *testing.T) {
 	s, tok := authedDelegateServer(t, policyWithSublayout())
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"_token": tok}))
+		delegateRequest(map[string]any{"_token": tok}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -186,7 +219,7 @@ func TestHandleDelegate_MissingSublayoutName(t *testing.T) {
 func TestHandleDelegate_UnknownSublayout(t *testing.T) {
 	s, tok := authedDelegateServer(t, policyWithSublayout())
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "nope"}))
+		delegateRequest(map[string]any{"_token": tok, "sublayout_name": "nope"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -204,7 +237,7 @@ func TestHandleDelegate_AttenuationViolation(t *testing.T) {
 	s, tok := authedDelegateServer(t, pol)
 
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
+		delegateRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
@@ -218,7 +251,7 @@ func TestHandleDelegate_AttenuationViolation(t *testing.T) {
 func TestHandleDelegate_RejectsBadChildSessionID(t *testing.T) {
 	s, tok := authedDelegateServer(t, policyWithSublayout())
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{
+		delegateRequest(map[string]any{
 			"_token":           tok,
 			"sublayout_name":   "research-agent",
 			"child_session_id": "../../etc/passwd",
@@ -238,7 +271,7 @@ func TestHandleDelegate_HappyPath(t *testing.T) {
 	s, tok := authedDelegateServer(t, policyWithSublayout())
 
 	result, err := s.handleDelegate(context.Background(),
-		newTestRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
+		delegateRequest(map[string]any{"_token": tok, "sublayout_name": "research-agent"}))
 	if err != nil {
 		t.Fatalf("handleDelegate: %v", err)
 	}
