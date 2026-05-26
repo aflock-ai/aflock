@@ -223,6 +223,13 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
+	// Refuse to start with an already-expired policy (#136). Mirrors hooks
+	// mode (handler.go) and verify CLI; MCP mode previously skipped this and
+	// served past Expires.
+	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
 	// Identity discovery + policy-digest binding per paper §3.1.
 	s.initAgentIdentity()
 
@@ -290,6 +297,11 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 			s.policy = pol
 			s.policyPath = path
 		}
+	}
+
+	// Refuse to start with an already-expired policy (#136).
+	if err := s.errPolicyExpired(); err != nil {
+		return err
 	}
 
 	// Identity discovery + policy-digest binding per paper §3.1. Mirrors
@@ -442,6 +454,11 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		}
 	}
 
+	// Refuse to start with an already-expired policy (#136).
+	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
 	// Refuse to start if the socket path already exists. Lstat (not Stat)
 	// so a dangling symlink also blocks us — an attacker pre-creating either
 	// a file or a symlink at the path could otherwise win the bind race.
@@ -551,6 +568,22 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 	// uses, just over a socket whose peer is kernel-attested.
 	stdioServer := server.NewStdioServer(s.mcpServer)
 	return stdioServer.Listen(context.Background(), conn, conn)
+}
+
+// errPolicyExpired returns a formatted error if the loaded policy has passed
+// its Expires deadline. Returns nil if no policy is loaded or no Expires is
+// set. Used at server startup (Serve/ServeHTTP/ServeUnix) to fail closed
+// before any session state is initialized, and inside long-lived handlers
+// (get_token, check_tool) so a policy that expires mid-session stops serving.
+//
+// Hooks mode and the verify CLI enforce Expires elsewhere (handler.go,
+// verifier.go); without this check, MCP mode silently served expired
+// policies — issue #136.
+func (s *Server) errPolicyExpired() error {
+	if s.policy == nil || !s.policy.IsExpired() {
+		return nil
+	}
+	return fmt.Errorf("policy %q expired at %s", s.policy.Name, s.policy.Expires.Format(time.RFC3339))
 }
 
 // computePolicyDigest returns the SHA-256 digest of the loaded policy.
@@ -720,6 +753,13 @@ func (s *Server) initAuth() error {
 func (s *Server) handleGetToken(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if s.tokenIssuer == nil {
 		return mcp.NewToolResultError("Token issuer not initialized"), nil
+	}
+
+	// Refuse to mint a token once the policy has expired (#136). The JWT TTL
+	// alone is not enough: a long-lived HTTP server can outlive the policy
+	// itself, and we must not extend authorization past Expires.
+	if err := s.errPolicyExpired(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Track whether this call authenticated via bootstrap, so we can clear
@@ -979,6 +1019,19 @@ func (s *Server) handleCheckTool(ctx context.Context, request mcp.CallToolReques
 
 	if s.policy == nil {
 		return mcp.NewToolResultText(`{"allowed": true, "reason": "No policy loaded"}`), nil
+	}
+
+	// Expired policies deny everything (#136). Without this, an expired
+	// policy still evaluates its rules and returns allow for tools in the
+	// allowlist — which silently extends authorization past Expires.
+	if err := s.errPolicyExpired(); err != nil {
+		result := map[string]any{
+			"allowed":  false,
+			"decision": string(aflock.DecisionDeny),
+			"reason":   err.Error(),
+		}
+		data, _ := json.MarshalIndent(result, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
 	}
 
 	inputJSON, _ := json.Marshal(toolInputMap)
