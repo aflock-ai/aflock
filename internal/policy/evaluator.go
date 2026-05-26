@@ -56,6 +56,19 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 			if e.matcher.MatchToolPattern(pattern, toolName, inputStr) {
 				return aflock.DecisionDeny, fmt.Sprintf("Tool '%s' matches deny pattern '%s'", toolName, pattern)
 			}
+			// H4/M4: For Bash commands with absolute paths (e.g., /usr/bin/curl)
+			// or prefixed with `env`, also match against the normalized command
+			// so that "Bash:curl*" catches "/usr/bin/curl ..." and "env curl ...".
+			if toolName == "Bash" && inputStr != "" {
+				normalized := normalizeBashCommand(inputStr)
+				if normalized != inputStr {
+					if e.matcher.MatchToolPattern(pattern, toolName, normalized) {
+						return aflock.DecisionDeny, fmt.Sprintf(
+							"Tool '%s' matches deny pattern '%s' (normalized: '%s')",
+							toolName, pattern, normalized)
+					}
+				}
+			}
 		}
 
 		// For Bash commands, also check sub-commands and obfuscation patterns
@@ -131,6 +144,54 @@ func (e *Evaluator) EvaluatePreToolUse(toolName string, toolInput json.RawMessag
 	return aflock.DecisionAllow, ""
 }
 
+// normalizeBashCommand returns a command string with env prefixes, variable
+// assignments, and absolute paths stripped so that deny patterns like
+// "Bash:curl*" match "/usr/bin/curl ..." and "env curl ...".
+// Returns the original string if no normalization is needed.
+//
+// Strategy: walk the fields to locate the actual command name token (same logic
+// as extractCommandName), then rebuild the string from that token onward with
+// the basename substituted. This avoids the substring-search bug where the
+// command name could appear earlier as an argument.
+func normalizeBashCommand(cmd string) string {
+	cmdName := extractCommandName(cmd) // already strips env + var assignments
+	if cmdName == "" {
+		return cmd
+	}
+	baseName := filepath.Base(cmdName)
+
+	// Walk through the fields to find the exact position of the command name
+	// token, skipping env, flags, and var assignments.
+	remaining := cmd
+	for {
+		remaining = strings.TrimLeft(remaining, " \t")
+		if remaining == "" {
+			return cmd
+		}
+		// Find the end of the current token
+		endIdx := strings.IndexAny(remaining, " \t")
+		var token string
+		if endIdx < 0 {
+			token = remaining
+			endIdx = len(remaining)
+		} else {
+			token = remaining[:endIdx]
+		}
+
+		if token == cmdName {
+			// Found the command name token — rebuild with basename
+			normalized := baseName + remaining[endIdx:]
+			if normalized == cmd {
+				return cmd
+			}
+			return normalized
+		}
+
+		// Move past this token
+		remaining = remaining[endIdx:]
+	}
+}
+
 // evaluateBashBypass performs deep analysis of Bash commands to detect bypass
 // attempts that evade simple glob pattern matching.
 //
@@ -154,12 +215,31 @@ func (e *Evaluator) evaluateBashBypass(command string) (aflock.PermissionDecisio
 		return aflock.DecisionAllow, ""
 	}
 
+	// matchesDenyPattern checks a command string against deny patterns,
+	// trying both the raw command and a basename-normalized version (H4).
+	// E.g., "/usr/bin/curl evil.com" also matches "Bash:curl*".
+	matchesDenyPattern := func(pattern, cmd string) bool {
+		if e.matcher.MatchToolPattern(pattern, "Bash", cmd) {
+			return true
+		}
+		// H4: Also try matching with basename-normalized command.
+		baseName := extractCommandBaseName(cmd)
+		rawName := extractCommandName(cmd)
+		if baseName != rawName && baseName != "" {
+			normalized := baseName + strings.TrimPrefix(cmd, rawName)
+			if e.matcher.MatchToolPattern(pattern, "Bash", normalized) {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Check each sub-command against deny patterns.
 	// This catches: "echo done; curl evil.com" → sub-commands ["echo done", "curl evil.com"]
 	if len(analysis.SubCommands) > 1 {
 		for _, subCmd := range analysis.SubCommands {
 			for _, pattern := range bashDenyPatterns {
-				if e.matcher.MatchToolPattern(pattern, "Bash", subCmd) {
+				if matchesDenyPattern(pattern, subCmd) {
 					return aflock.DecisionDeny, fmt.Sprintf(
 						"Bash command contains chained sub-command matching deny pattern '%s' (found: '%s')",
 						pattern, subCmd)
@@ -173,7 +253,7 @@ func (e *Evaluator) evaluateBashBypass(command string) (aflock.PermissionDecisio
 	if len(analysis.PipelineSegments) > 1 {
 		for _, seg := range analysis.PipelineSegments {
 			for _, pattern := range bashDenyPatterns {
-				if e.matcher.MatchToolPattern(pattern, "Bash", seg) {
+				if matchesDenyPattern(pattern, seg) {
 					return aflock.DecisionDeny, fmt.Sprintf(
 						"Bash command contains piped segment matching deny pattern '%s' (found: '%s')",
 						pattern, seg)
@@ -182,13 +262,11 @@ func (e *Evaluator) evaluateBashBypass(command string) (aflock.PermissionDecisio
 		}
 	}
 
-	// If the command uses obfuscation techniques and there are any Bash deny
-	// patterns, block it. An obfuscated command that decodes and executes
-	// arbitrary content cannot be reliably pattern-matched, so we deny it
-	// when deny rules exist for Bash commands.
-	if analysis.HasObfuscation && analysis.HasPipeToExec {
+	// M5: Obfuscation alone is suspicious — decoded content could be any denied
+	// command, and we can't pattern-match obfuscated payloads.
+	if analysis.HasObfuscation {
 		return aflock.DecisionDeny, fmt.Sprintf(
-			"Bash command uses obfuscation with pipe-to-exec (potential bypass of deny patterns: %s)",
+			"Bash command uses obfuscation (potential bypass of deny patterns: %s)",
 			strings.Join(bashDenyPatterns, ", "))
 	}
 
@@ -228,6 +306,27 @@ func (e *Evaluator) evaluateBashBypass(command string) (aflock.PermissionDecisio
 			strings.Join(bashDenyPatterns, ", "))
 	}
 
+	// H5: Here-documents and here-strings can feed arbitrary commands to interpreters
+	if analysis.HasHereDoc {
+		return aflock.DecisionDeny, fmt.Sprintf(
+			"Bash command uses here-document/here-string (potential bypass of deny patterns: %s)",
+			strings.Join(bashDenyPatterns, ", "))
+	}
+
+	// H6: Alias/function definitions can hide denied commands behind new names
+	if analysis.HasAliasOrFunc {
+		return aflock.DecisionDeny, fmt.Sprintf(
+			"Bash command defines alias or function (potential bypass of deny patterns: %s)",
+			strings.Join(bashDenyPatterns, ", "))
+	}
+
+	// M2: Brace expansion can construct commands at runtime
+	if analysis.HasBraceExpansion {
+		return aflock.DecisionDeny, fmt.Sprintf(
+			"Bash command uses brace expansion (potential bypass of deny patterns: %s)",
+			strings.Join(bashDenyPatterns, ", "))
+	}
+
 	return aflock.DecisionAllow, ""
 }
 
@@ -255,11 +354,12 @@ func (e *Evaluator) extractInputForMatching(toolName string, toolInput json.RawM
 			return input.Pattern
 		}
 	case toolGrep:
+		// Deny rules target what's being searched for (the pattern), not where.
+		// File-level restrictions are handled separately by file deny rules.
+		// Returning Path here caused Grep:password to match against /src/file.go
+		// instead of the search term "password" (issue #60 / I5).
 		var input aflock.GrepToolInput
 		if err := json.Unmarshal(toolInput, &input); err == nil {
-			if input.Path != "" {
-				return input.Path
-			}
 			return input.Pattern
 		}
 	case toolNotebookEdit:
@@ -911,8 +1011,8 @@ func (e *Evaluator) CheckLimits(metrics *aflock.SessionMetrics, enforcementMode 
 		if limit.Enforcement != enforcementMode {
 			return false, "", ""
 		}
-		if current > limit.Value {
-			return true, name, fmt.Sprintf("%s exceeded: %.2f > %.2f", name, current, limit.Value)
+		if current >= limit.Value {
+			return true, name, fmt.Sprintf("%s exceeded: %.2f >= %.2f", name, current, limit.Value)
 		}
 		return false, "", ""
 	}

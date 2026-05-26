@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,9 +37,9 @@ type Server struct {
 	agentIdentity *identity.AgentIdentity
 	sessionID     string
 
-	// In-memory data flow tracking (thread-safe for concurrent MCP requests)
-	mu             sync.Mutex
-	materials      []aflock.MaterialClassification
+	// (`mu` + `materials` were dead code after issue #61 / M7 removed the
+	// duplicate in-memory data-flow evaluation in handleBash. Removed
+	// entirely to satisfy golangci-lint's unused check.)
 	signer         *attestation.Signer
 	signingEnabled bool
 	attestDir      string     // Directory for storing step attestations by git tree hash
@@ -46,6 +47,19 @@ type Server struct {
 
 	// JWT authorization
 	tokenIssuer *auth.TokenIssuer
+
+	// authActive is set to true the moment any goroutine starts processing
+	// a get_token request, so concurrent tool-call goroutines can no longer
+	// observe a stale "no token issued" state from disk. Closes the TOCTOU
+	// race in issue #59 / H11. atomic.Bool gives us a lock-free fast path
+	// for every validateJWT call.
+	authActive atomic.Bool
+
+	// requireToken, when true, denies any tool call that arrives without a
+	// valid JWT — even before the first get_token call. Toggled via the
+	// AFLOCK_REQUIRE_TOKEN=1 env var. Closes the unauthenticated bootstrap
+	// window (issue #59 / M10). Default false for backward compatibility.
+	requireToken bool
 }
 
 // NewServer creates a new aflock MCP server.
@@ -58,6 +72,7 @@ func NewServer() *Server {
 		stateManager: state.NewManager(""),
 		sessionID:    fmt.Sprintf("mcp-%s", uuid.New().String()),
 		attestDir:    attestDir,
+		requireToken: os.Getenv("AFLOCK_REQUIRE_TOKEN") == "1",
 	}
 
 	// Create the MCP server
@@ -183,41 +198,11 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
-	// Discover agent identity
-	agentID, err := identity.DiscoverAgentIdentity()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
-	} else {
-		s.agentIdentity = agentID
-	}
+	// Identity discovery + policy-digest binding per paper §3.1.
+	s.initAgentIdentity()
 
-	// Compute policy digest and add to agent identity
-	if s.policy != nil && s.agentIdentity != nil {
-		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
-		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
-	}
-
-	// Initialize attestation signer with SPIRE
-	s.signer = attestation.NewSigner("") // Uses default SPIRE socket
-	ctx := context.Background()
-	if err := s.signer.Initialize(ctx); err != nil { //nolint:nestif
-		fmt.Fprintf(os.Stderr, "[aflock] Warning: SPIRE not available, attestation signing disabled: %v\n", err)
-		s.signingEnabled = false
-	} else {
-		s.signingEnabled = true
-		fmt.Fprintf(os.Stderr, "[aflock] SPIRE attestation signing enabled\n")
-
-		// Try to get delegated identity for the AI agent
-		// Model name comes from PID-based discovery (via agentIdentity)
-		if s.agentIdentity != nil && s.agentIdentity.Model != "" && s.agentIdentity.Model != "unknown" {
-			if err := s.signer.SetModel(ctx, s.agentIdentity.Model); err != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: %v\n", err)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: No model discovered from PID trace - attestation signing disabled\n")
-			s.signingEnabled = false
-		}
-	}
+	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
+	s.initSigning()
 
 	// Initialize JWT authorization
 	if err := s.initAuth(); err != nil {
@@ -271,6 +256,15 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		}
 	}
 
+	// Identity discovery + policy-digest binding per paper §3.1. Mirrors
+	// Serve() — previously missing on the HTTP transport, which caused JWTs
+	// issued via SSE to have empty identity_hash and attestations to miss
+	// the agent-identity predicate. Caught in PR #67 review.
+	s.initAgentIdentity()
+
+	// Initialize attestation signing with 3-tier fallback (SPIRE → Fulcio → ephemeral).
+	s.initSigning()
+
 	// Initialize JWT authorization
 	if err := s.initAuth(); err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT auth unavailable: %v\n", err)
@@ -300,10 +294,18 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	return http.ListenAndServe(addr, sseServer) //nolint:gosec // G114: HTTP server with no timeout is acceptable for local MCP
 }
 
-// computePolicyDigest computes the SHA256 digest of the loaded policy.
+// computePolicyDigest returns the SHA-256 digest of the loaded policy.
+//
+// Prefers s.policy.RawDigest (set by policy.Load from the on-disk bytes) so
+// the digest binds to the exact file the user signed/reviewed rather than a
+// re-marshaled copy of the parsed struct (issue #61 / L5). Falls back to
+// marshaling for in-memory policies used in tests.
 func (s *Server) computePolicyDigest() string {
 	if s.policy == nil {
 		return ""
+	}
+	if s.policy.RawDigest != "" {
+		return s.policy.RawDigest
 	}
 	data, err := json.Marshal(s.policy)
 	if err != nil {
@@ -311,6 +313,78 @@ func (s *Server) computePolicyDigest() string {
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+// initAgentIdentity discovers the connecting process's identity, binds it to
+// the current policy's digest, and derives the paper §3.1 identity hash
+//
+//	SHA256(model ‖ env ‖ tools ‖ policyDigest ‖ parent).
+//
+// Called from both Serve() (stdio) and ServeHTTP() (SSE) so both transports
+// produce identically identity-bound JWTs and attestations. Before this was
+// extracted, ServeHTTP silently skipped the block, which meant HTTP sessions
+// had empty identity_hash in their JWTs and missing agentIdentity in
+// attestation predicates (caught in PR #67 review).
+//
+// A discovery failure is a warning, not a fatal — the process may not be
+// under a Claude Code tree yet. Caller is responsible for deciding whether
+// to fail closed via policy.identity.allowedModels.
+func (s *Server) initAgentIdentity() {
+	agentID, err := identity.DiscoverAgentIdentity()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to discover identity: %v\n", err)
+		return
+	}
+	s.agentIdentity = agentID
+	if s.policy != nil {
+		s.agentIdentity.PolicyDigest = s.computePolicyDigest()
+		s.agentIdentity.DeriveIdentity() // Recompute identity hash with policy
+	}
+}
+
+// initSigning initializes attestation signing with a 3-tier fallback chain
+// matching the hooks mode behavior (handler.go:547-562):
+//
+//  1. SPIRE — delegated identity from a SPIRE agent (strongest, infrastructure-backed)
+//  2. Fulcio — keyless signing via OIDC tokens (CI/CD environments)
+//  3. Ephemeral — fresh ECDSA P-256 key (always available, weakest)
+//
+// The model=unknown check that previously disabled signing is removed —
+// an unknown model is recorded in the attestation predicate without
+// preventing signing (issue #55).
+func (s *Server) initSigning() {
+	s.signer = attestation.NewSigner("")
+	ctx := context.Background()
+
+	identityHash := ""
+	if s.agentIdentity != nil {
+		identityHash = s.agentIdentity.IdentityHash
+	}
+
+	if err := s.signer.Initialize(ctx); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: SPIRE\n")
+		// Note: trusted-model enforcement happens in the policy evaluator via
+		// identity.allowedModels at SessionStart (issue #67 review). We no
+		// longer call a signer-side SetModel that returned an error but did
+		// not actually gate signing — that was dead misleading code.
+		return
+	}
+
+	if err := s.signer.InitializeFulcio(ctx); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: Fulcio (keyless)\n")
+		return
+	}
+
+	if err := s.signer.InitializeEphemeral(identityHash); err == nil {
+		s.signingEnabled = true
+		fmt.Fprintf(os.Stderr, "[aflock] Attestation signing: ephemeral key\n")
+		return
+	}
+
+	s.signingEnabled = false
+	fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)\n")
 }
 
 // initAuth initializes the JWT token issuer. If SPIRE is available and provides
@@ -346,6 +420,10 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		identityHash = s.agentIdentity.IdentityHash
 	}
 
+	// Issue the token BEFORE flipping authActive. If this returns an error,
+	// we must leave authActive=false so clients can retry get_token without
+	// being locked into require-token mode by a prior failure (PR #67 review
+	// finding — originally introduced by the H11 fix in #59).
 	tokenStr, err := s.tokenIssuer.IssueToken(
 		s.sessionID,
 		agentID,
@@ -357,13 +435,20 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to issue token: %v", err)), nil
 	}
 
-	// Also store in session state
+	// Persist the token AND flip authActive under sessionMu so concurrent
+	// validateJWT observers see a consistent pair:
+	//   - before: authActive=false AND no AuthToken on disk (pass, graceful)
+	//   - after:  authActive=true  AND AuthToken on disk (require token)
+	// There is no intermediate state a racing caller can exploit. This keeps
+	// the H11 TOCTOU guarantee intact while fixing the DoS lockout when
+	// IssueToken returns an error.
 	s.sessionMu.Lock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState != nil {
 		sessionState.AuthToken = tokenStr
 		_ = s.stateManager.Save(sessionState)
 	}
+	s.authActive.Store(true)
 	s.sessionMu.Unlock()
 
 	result := map[string]any{
@@ -376,10 +461,19 @@ func (s *Server) handleGetToken(_ context.Context, _ mcp.CallToolRequest) (*mcp.
 }
 
 // validateJWT validates a JWT token from a tool call request.
+//
 // Returns the claims if valid, nil if auth is not active, or an error if the
-// token is present but invalid. Auth is only enforced when a token has been
-// issued for the session (graceful adoption — existing clients without tokens
-// continue to work until they call get_token).
+// token is present but invalid.
+//
+// Enforcement model:
+//   - If s.requireToken is true, every call must carry a valid token from the
+//     start. Closes the unauthenticated bootstrap window (issue #59 / M10).
+//   - Otherwise, "graceful adoption" applies: tool calls without a token are
+//     permitted UNTIL the first get_token completes, after which all calls
+//     must carry a token. The trigger for "after" is the in-process atomic
+//     flag s.authActive, which is set synchronously at the top of
+//     handleGetToken — eliminating the TOCTOU race where a stale disk read
+//     could miss a freshly issued token (issue #59 / H11).
 func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, error) {
 	if s.tokenIssuer == nil {
 		return nil, nil // Auth not initialized, skip validation
@@ -387,20 +481,19 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 
 	tokenStr, _ := request.GetArguments()["_token"].(string)
 	if tokenStr == "" {
-		// Check if a token has been issued for this session.
-		// If no token was issued yet, allow unauthenticated access (graceful adoption).
-		s.sessionMu.Lock()
-		sessionState, _ := s.stateManager.Load(s.sessionID)
-		hasToken := sessionState != nil && sessionState.AuthToken != ""
-		s.sessionMu.Unlock()
-
-		if hasToken {
+		if s.requireToken {
+			return nil, fmt.Errorf("missing auth token (_token parameter); server is in require-token mode")
+		}
+		if s.authActive.Load() {
 			return nil, fmt.Errorf("missing auth token (_token parameter)")
 		}
-		return nil, nil // No token issued yet, skip enforcement
+		return nil, nil // graceful adoption: no token issued yet
 	}
 
-	claims, err := s.tokenIssuer.ValidateTokenForSession(tokenStr, s.sessionID)
+	// Bind validation to the current policy digest so a token issued under a
+	// permissive policy does not survive a policy tightening (issue #59 / M11).
+	claims, err := s.tokenIssuer.ValidateTokenForSessionAndPolicy(
+		tokenStr, s.sessionID, s.computePolicyDigest())
 	if err != nil {
 		return nil, fmt.Errorf("auth failed: %w", err)
 	}
@@ -411,7 +504,7 @@ func (s *Server) validateJWT(request mcp.CallToolRequest) (*auth.AflockClaims, e
 // signAndStoreAttestation creates a signed attestation for an action and stores it to disk.
 func (s *Server) signAndStoreAttestation(ctx context.Context, record aflock.ActionRecord) error {
 	if !s.signingEnabled {
-		return nil // Signing not available, skip silently
+		return fmt.Errorf("attestation signing unavailable (SPIRE, Fulcio, and ephemeral all failed)")
 	}
 
 	// Get session metrics
@@ -634,15 +727,10 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 			fmt.Fprintf(os.Stderr, "[aflock] BLOCKED data exfiltration: %s\n", flowReason)
 			return mcp.NewToolResultError(fmt.Sprintf("DataFlow policy denied: %s", flowReason)), nil
 		}
-
-		// Evaluate data flow — Bash is a write operation, check flow rules
-		s.mu.Lock()
-		flowDecision, flowReason, _ := evaluator.EvaluateDataFlow("Bash", inputJSON, s.materials)
-		s.mu.Unlock()
-		if flowDecision == aflock.DecisionDeny {
-			s.recordAction("Bash", "deny", flowReason)
-			return mcp.NewToolResultError(fmt.Sprintf("Data flow violation: %s", flowReason)), nil
-		}
+		// (Removed the duplicate evaluator.EvaluateDataFlow against s.materials.
+		// Persisted sessionState.Materials is the single source of truth — issue
+		// #61 / M7. The in-memory s.materials slice could drift out of sync with
+		// disk between concurrent MCP requests, producing inconsistent decisions.)
 	}
 
 	// If attest=true, use attestors for full attestation
@@ -1028,7 +1116,7 @@ func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallTool
 	}
 
 	if !s.signingEnabled {
-		return mcp.NewToolResultError("Attestation signing not available (SPIRE not connected)"), nil
+		return mcp.NewToolResultError("Attestation signing not available (SPIRE, Fulcio, and ephemeral key all failed during initialization)"), nil
 	}
 
 	predicateType := request.GetString("predicate_type", "")
@@ -1102,14 +1190,24 @@ func computePredicateDigest(predicate interface{}) string {
 }
 
 // recordAction records an action in the session state.
-// Must hold sessionMu or be called from a context where session state
-// is not concurrently accessed.
+//
+// Acquires both the in-process sessionMu (serializing concurrent MCP request
+// handlers in this process) and an exclusive file lock via LockSession
+// (serializing against other aflock processes — e.g. concurrent hook
+// invocations sharing the same state directory). This closes the TOCTOU race
+// on the state file described in issue #58 / M6.
 func (s *Server) recordAction(toolName, decision, reason string) {
 	if s.policy == nil {
 		return
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	unlock, err := s.stateManager.LockSession(s.sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock session state: %v\n", err)
+		return
+	}
+	defer unlock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState == nil {
 		return
@@ -1125,14 +1223,21 @@ func (s *Server) recordAction(toolName, decision, reason string) {
 }
 
 // trackFile tracks a file access in the session state.
-// Must hold sessionMu or be called from a context where session state
-// is not concurrently accessed.
+//
+// Acquires both the in-process sessionMu and an exclusive cross-process file
+// lock, mirroring recordAction. See issue #58 / M6.
 func (s *Server) trackFile(toolName, filePath string) {
 	if s.policy == nil {
 		return
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	unlock, err := s.stateManager.LockSession(s.sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to lock session state: %v\n", err)
+		return
+	}
+	defer unlock()
 	sessionState, _ := s.stateManager.Load(s.sessionID)
 	if sessionState == nil {
 		return

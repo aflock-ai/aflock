@@ -69,22 +69,37 @@ func (m *Manager) WritePropagation(parentState *aflock.SessionState) error {
 	return nil
 }
 
-// ReadPropagation reads and consumes (deletes) a propagation file for the
-// given policy path. Returns nil if no file exists or if the record is expired.
+// ReadPropagation reads and consumes (via an atomic rename) a propagation file
+// for the given policy path. Returns nil if no file exists or if the record is
+// expired.
+//
+// Consume-once semantics: the file is first renamed to a unique marker path
+// before being read. os.Rename on the same filesystem is atomic and only one
+// caller can succeed, so two concurrent children racing on the same propagation
+// file cannot both observe the record (issue #58 / L4).
 func (m *Manager) ReadPropagation(policyPath string) (*aflock.PropagationRecord, error) {
 	key := propagationKey(policyPath)
-	path := filepath.Join(propagationBaseDir(), key)
+	dir := propagationBaseDir()
+	path := filepath.Join(dir, key)
 
-	data, err := os.ReadFile(path) //nolint:gosec // G304: propagation file path is derived from SHA-256 hash
-	if err != nil {
+	// Atomically claim the propagation file. Use a unique suffix so concurrent
+	// readers that both attempt a rename resolve to different targets; only the
+	// one whose source rename succeeds observes the record.
+	claimed := filepath.Join(dir, fmt.Sprintf("%s.consumed.%d.%d", key, os.Getpid(), time.Now().UnixNano()))
+	if err := os.Rename(path, claimed); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("claim propagation: %w", err)
+	}
+	defer func() {
+		_ = os.Remove(claimed)
+	}()
+
+	data, err := os.ReadFile(claimed) //nolint:gosec // G304: path derived from validated key under propagation dir
+	if err != nil {
 		return nil, fmt.Errorf("read propagation: %w", err)
 	}
-
-	// Consume-once: always remove the file after reading
-	os.Remove(path) //nolint:errcheck // best-effort cleanup
 
 	var rec aflock.PropagationRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
@@ -116,6 +131,8 @@ func (m *Manager) CleanStalePropagation() {
 		if err != nil {
 			continue
 		}
+		// Clean up both live propagation records and orphaned .consumed
+		// markers left behind by crashed readers.
 		if time.Since(info.ModTime()) > maxAge {
 			os.Remove(filepath.Join(dir, entry.Name())) //nolint:errcheck // best-effort cleanup
 		}

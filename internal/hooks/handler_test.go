@@ -872,24 +872,21 @@ func TestHandleStop_MissingAttestation(t *testing.T) {
 
 func TestHandleStop_UnusedToolNotRequired(t *testing.T) {
 	h := newTestHandler(t)
+	// Require Bash attestations only. The session never uses Bash, so the
+	// required-attestations gate must not fire.
 	pol := &aflock.Policy{
 		Name:                 "test-unused",
-		RequiredAttestations: []string{"Bash", "Read"},
+		RequiredAttestations: []string{"Bash"},
 	}
 	seedSession(t, h, "session-unused-tool", pol)
 
-	// Only Read was used, Bash was never used
+	// Record an unrelated tool (Grep) to show the session did something but
+	// never used Bash.
 	ss, _ := h.stateManager.Load("session-unused-tool")
 	h.stateManager.RecordAction(ss, aflock.ActionRecord{
-		ToolName: "Read", Decision: "allow",
+		ToolName: "Grep", Decision: "allow",
 	})
 	h.stateManager.Save(ss)
-
-	// Create Read attestation
-	attestDir := h.stateManager.AttestationsDir("session-unused-tool")
-	os.MkdirAll(attestDir, 0755)
-	os.WriteFile(filepath.Join(attestDir, "Read.json"),
-		[]byte(`{"payload":"eyJ0ZXN0IjoidmFsaWQifQ==","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"s"}]}`), 0644)
 
 	input := &aflock.HookInput{SessionID: "session-unused-tool"}
 
@@ -1351,10 +1348,33 @@ func TestFindAttestation_EmptyDir(t *testing.T) {
 	}
 }
 
+// Helper: minimum envelope that passes the tightened integrity check —
+// parseable in-toto Statement payload + proper DSSE content type + base64-
+// decodable non-empty sig with non-empty keyid. Crypto verification is
+// tested separately via the ephemeral-signer fixtures in handler_forgery_test.go.
+func minimalValidEnvelope(predicateToolName string) string {
+	stmt := map[string]interface{}{
+		"_type":         "https://in-toto.io/Statement/v1",
+		"subject":       []map[string]string{{"name": "x"}},
+		"predicateType": "https://aflock.ai/attestations/action/v0.1",
+		"predicate":     map[string]string{"toolName": predicateToolName},
+	}
+	stmtBytes, _ := json.Marshal(stmt)
+	env := map[string]interface{}{
+		"payload":     base64.StdEncoding.EncodeToString(stmtBytes),
+		"payloadType": "application/vnd.in-toto+json",
+		"signatures": []map[string]string{{
+			"keyid": "k",
+			"sig":   base64.StdEncoding.EncodeToString([]byte("sig-bytes")),
+		}},
+	}
+	envBytes, _ := json.Marshal(env)
+	return string(envBytes)
+}
+
 func TestFindAttestation_ExactMatch(t *testing.T) {
 	dir := t.TempDir()
-	validDSSE := `{"payload":"dGVzdA==","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"s"}]}`
-	os.WriteFile(filepath.Join(dir, "myattest.json"), []byte(validDSSE), 0644)
+	os.WriteFile(filepath.Join(dir, "myattest.json"), []byte(minimalValidEnvelope("")), 0600)
 	if !findAttestation(dir, "myattest") {
 		t.Error("expected true for exact .json match")
 	}
@@ -1362,8 +1382,7 @@ func TestFindAttestation_ExactMatch(t *testing.T) {
 
 func TestFindAttestation_IntotoMatch(t *testing.T) {
 	dir := t.TempDir()
-	validDSSE := `{"payload":"dGVzdA==","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"s"}]}`
-	os.WriteFile(filepath.Join(dir, "step1.intoto.json"), []byte(validDSSE), 0644)
+	os.WriteFile(filepath.Join(dir, "step1.intoto.json"), []byte(minimalValidEnvelope("")), 0600)
 	if !findAttestation(dir, "step1") {
 		t.Error("expected true for exact .intoto.json match")
 	}
@@ -1371,19 +1390,7 @@ func TestFindAttestation_IntotoMatch(t *testing.T) {
 
 func TestFindAttestation_ContentMatch(t *testing.T) {
 	dir := t.TempDir()
-
-	// Create a valid DSSE envelope whose payload's predicate has toolName "Build"
-	predicate := map[string]string{"toolName": "Build"}
-	stmt := map[string]interface{}{"predicate": predicate}
-	stmtBytes, _ := json.Marshal(stmt)
-	env := map[string]interface{}{
-		"payload":     base64.StdEncoding.EncodeToString(stmtBytes),
-		"payloadType": "application/vnd.in-toto+json",
-		"signatures":  []map[string]string{{"keyid": "k", "sig": "s"}},
-	}
-	envBytes, _ := json.Marshal(env)
-
-	os.WriteFile(filepath.Join(dir, "20260101-abcdef.intoto.json"), envBytes, 0644)
+	os.WriteFile(filepath.Join(dir, "20260101-abcdef.intoto.json"), []byte(minimalValidEnvelope("Build")), 0600)
 
 	if !findAttestation(dir, "Build") {
 		t.Error("expected true for content-based toolName match")
@@ -1395,18 +1402,7 @@ func TestFindAttestation_ContentMatch(t *testing.T) {
 
 func TestFindAttestation_CaseInsensitive(t *testing.T) {
 	dir := t.TempDir()
-
-	predicate := map[string]string{"toolName": "bash"}
-	stmt := map[string]interface{}{"predicate": predicate}
-	stmtBytes, _ := json.Marshal(stmt)
-	env := map[string]interface{}{
-		"payload":     base64.StdEncoding.EncodeToString(stmtBytes),
-		"payloadType": "application/vnd.in-toto+json",
-		"signatures":  []map[string]string{{"keyid": "k", "sig": "s"}},
-	}
-	envBytes, _ := json.Marshal(env)
-
-	os.WriteFile(filepath.Join(dir, "random.intoto.json"), envBytes, 0644)
+	os.WriteFile(filepath.Join(dir, "random.intoto.json"), []byte(minimalValidEnvelope("bash")), 0600)
 
 	if !findAttestation(dir, "Bash") {
 		t.Error("expected case-insensitive match for Bash vs bash")
@@ -1688,9 +1684,13 @@ func TestHandlePreToolUse_WildcardAllow(t *testing.T) {
 	}
 }
 
-// ----- PreToolUse: nil policy in session -> allow -----
-
-func TestHandlePreToolUse_NilPolicyInSession_FallsThrough(t *testing.T) {
+// ----- PreToolUse: nil policy in existing session state -> fail closed -----
+//
+// Regression for issue #58 / M13. A session state file exists on disk but its
+// Policy field is nil (corruption or tampering). The handler must fail closed
+// rather than fall through to the ephemeral policy loader — which would
+// otherwise allow-all whenever no .aflock file is discoverable from cwd.
+func TestHandlePreToolUse_NilPolicyInSession_FailsClosed(t *testing.T) {
 	h := newTestHandler(t)
 	// Create a session but with nil policy, and cwd has no policy
 	ss := h.stateManager.Initialize("session-nil-pol", nil, "")
@@ -1713,8 +1713,9 @@ func TestHandlePreToolUse_NilPolicyInSession_FallsThrough(t *testing.T) {
 	if err := json.Unmarshal([]byte(got), &out); err != nil {
 		t.Fatalf("unmarshal output: %v", err)
 	}
-	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionAllow {
-		t.Errorf("expected allow when no policy found, got %v", out.HookSpecificOutput.PermissionDecision)
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Errorf("expected deny (fail-closed) when session state has nil policy, got %v",
+			out.HookSpecificOutput.PermissionDecision)
 	}
 }
 
@@ -2199,17 +2200,24 @@ func TestHandleStop_EmptySignaturesRejected(t *testing.T) {
 func TestValidateAttestationIntegrity(t *testing.T) {
 	dir := t.TempDir()
 
+	// Tightened in issue #67 review: the integrity check now requires the
+	// payload to be a parseable in-toto Statement with non-empty subject,
+	// the payloadType to be application/vnd.in-toto+json exactly, and at
+	// least one signature with non-empty keyid + base64-decodable non-empty
+	// sig. The "valid DSSE" fixture is updated to satisfy the new contract.
+	validPayload := base64.StdEncoding.EncodeToString([]byte(`{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"x"}]}`))
+	validSig := base64.StdEncoding.EncodeToString([]byte("sig-bytes"))
 	tests := []struct {
 		name    string
 		content string
 		want    bool
 	}{
-		{"valid DSSE", `{"payload":"eyJ0ZXN0IjoidmFsaWQifQ==","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"s"}]}`, true},
+		{"valid DSSE", `{"payload":"` + validPayload + `","payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"` + validSig + `"}]}`, true},
 		{"empty object", `{}`, false},
-		{"missing signatures", `{"payload":"eyJ0ZXN0IjoidmFsaWQifQ==","payloadType":"application/vnd.in-toto+json"}`, false},
-		{"empty signatures", `{"payload":"eyJ0ZXN0IjoidmFsaWQifQ==","payloadType":"application/vnd.in-toto+json","signatures":[]}`, false},
-		{"missing payload", `{"payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"s"}]}`, false},
-		{"missing payloadType", `{"payload":"eyJ0ZXN0IjoidmFsaWQifQ==","signatures":[{"keyid":"k","sig":"s"}]}`, false},
+		{"missing signatures", `{"payload":"` + validPayload + `","payloadType":"application/vnd.in-toto+json"}`, false},
+		{"empty signatures", `{"payload":"` + validPayload + `","payloadType":"application/vnd.in-toto+json","signatures":[]}`, false},
+		{"missing payload", `{"payloadType":"application/vnd.in-toto+json","signatures":[{"keyid":"k","sig":"` + validSig + `"}]}`, false},
+		{"missing payloadType", `{"payload":"` + validPayload + `","signatures":[{"keyid":"k","sig":"` + validSig + `"}]}`, false},
 		{"not JSON", `this is not json`, false},
 	}
 
