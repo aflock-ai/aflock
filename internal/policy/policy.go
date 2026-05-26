@@ -66,6 +66,13 @@ func Load(path string) (*aflock.Policy, string, error) {
 		return nil, "", fmt.Errorf("parse policy: %w", err)
 	}
 
+	// Resolve ${...} placeholders against the environment (paper §4.4 / #134).
+	// Done after unmarshal so every consumer (verifier, hooks, MCP) sees
+	// fully-expanded values rather than literal placeholder strings.
+	if err := expandPlaceholders(&policy, os.Getenv); err != nil {
+		return nil, "", fmt.Errorf("expand placeholders: %w", err)
+	}
+
 	// Bind the digest to the exact file bytes the user signed/reviewed
 	// (issue #61 / L5). Re-marshaling the parsed struct would normalize
 	// whitespace, key order, and number formatting, producing a digest that
