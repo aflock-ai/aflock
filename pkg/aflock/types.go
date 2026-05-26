@@ -653,8 +653,16 @@ type SessionMetrics struct {
 }
 
 // ActionRecord represents a recorded action.
+//
+// Seq is the contiguous, zero-based position of this action within the
+// session. Stamped at record time so verifiers can prove paper §4.4
+// Distance (no gaps) and, together with Timestamp monotonicity, prove
+// Order beyond what the merkle root alone catches (issue #146).
+// Records written by older aflock versions have Seq=0 across the board;
+// the verifier treats that as "legacy, distance check skipped".
 type ActionRecord struct {
 	Timestamp time.Time       `json:"timestamp"`
+	Seq       int64           `json:"seq"`
 	ToolName  string          `json:"tool_name"`
 	ToolUseID string          `json:"tool_use_id"`
 	ToolInput json.RawMessage `json:"tool_input,omitempty"`

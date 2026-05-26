@@ -1894,16 +1894,33 @@ func evaluateSessionRego(sessionState *aflock.SessionState, attestDir string) []
 // an expected root, the auto-computed sessionState.SessionMerkleRoot (written at
 // SessionEnd) is used as the expected value, which catches post-hoc tampering of
 // state.json (issue #119).
+//
+// After the root match succeeds, the paper §4.4 Order/Distance proofs
+// (issue #146) run via verifyActionOrderingAndDistance — root equality
+// alone does not prove ordering or contiguity, especially on the
+// self-anchored path where the expected root came from
+// sessionState.SessionMerkleRoot rather than a third-party-declared
+// policy.MaterialsFrom.Session.MerkleRoot.
 func verifySessionMerkle(sessionState *aflock.SessionState) []string {
 	expectedRoot := ""
+	policyDeclared := false
 	if sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil {
 		expectedRoot = sessionState.Policy.MaterialsFrom.Session.MerkleRoot
+		policyDeclared = expectedRoot != ""
 	}
 	if expectedRoot == "" {
 		expectedRoot = sessionState.SessionMerkleRoot
 	}
 	if expectedRoot == "" {
 		return nil // No expected root and none auto-recorded — nothing to verify.
+	}
+
+	if !policyDeclared {
+		// Audit visibility: callers should know when the binding is
+		// self-anchored versus tied to an externally declared root.
+		fmt.Fprintf(os.Stderr,
+			"[aflock] session %s: merkle root anchored to recorded session state (no third-party proof; policy did not declare materialsFrom.session.merkleRoot)\n",
+			sessionState.SessionID)
 	}
 
 	if len(sessionState.Actions) == 0 {
@@ -1924,7 +1941,59 @@ func verifySessionMerkle(sessionState *aflock.SessionState) []string {
 		return []string{fmt.Sprintf("Materials binding failed: %v", err)}
 	}
 
-	return nil
+	// Paper §4.4 Order/Distance proofs (issue #146).
+	return verifyActionOrderingAndDistance(sessionState.SessionID, sessionState.Actions)
+}
+
+// verifyActionOrderingAndDistance proves paper §4.4 Order and Distance
+// over a session's actions, given that the merkle root already matched.
+//
+//   - Order: Actions[i].Timestamp must be >= Actions[i-1].Timestamp.
+//   - Distance: Actions[i].Seq must equal int64(i) — contiguous from 0.
+//
+// Completeness follows from those two: no gaps in seq and no timestamp
+// reversal means every turn between first and last was recorded.
+//
+// Legacy records (written before Seq was stamped) all carry Seq=0; in
+// that case we skip the distance check and log a single line so
+// auditors can see why this older session only got the order proof.
+func verifyActionOrderingAndDistance(sessionID string, actions []aflock.ActionRecord) []string {
+	if len(actions) <= 1 {
+		return nil
+	}
+
+	hasSeq := false
+	for _, a := range actions {
+		if a.Seq != 0 {
+			hasSeq = true
+			break
+		}
+	}
+
+	var violations []string
+	for i := 1; i < len(actions); i++ {
+		if actions[i].Timestamp.Before(actions[i-1].Timestamp) {
+			violations = append(violations, fmt.Sprintf(
+				"session ordering violation at action %d: timestamp %s precedes prior %s",
+				i, actions[i].Timestamp.Format(time.RFC3339Nano), actions[i-1].Timestamp.Format(time.RFC3339Nano)))
+		}
+	}
+
+	if !hasSeq {
+		fmt.Fprintf(os.Stderr,
+			"[aflock] session %s: action records have no Seq stamp, skipping distance proof (legacy session)\n",
+			sessionID)
+		return violations
+	}
+
+	for i := range actions {
+		if actions[i].Seq != int64(i) {
+			violations = append(violations, fmt.Sprintf(
+				"session distance violation at action %d: seq=%d, expected %d",
+				i, actions[i].Seq, i))
+		}
+	}
+	return violations
 }
 
 // IdentityFields holds the identity fields extracted from an attestation or session
