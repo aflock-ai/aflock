@@ -1536,6 +1536,47 @@ func topoSortSteps(steps map[string]aflock.Step) ([]string, error) {
 //  3. Recursively verifies the child session against the sublayout's policy
 //  4. Accumulates child spend toward parent metrics
 //
+// verifySublayoutNamespacing enforces paper §5 invariant #3 — every
+// child attestation that carries a sublayoutBinding must name THIS
+// sublayout. Reads each *.intoto.json envelope under attestDir, parses
+// the predicate, and validates the embedded binding's `name` (and
+// `prefix` when the sublayout declares one). Attestations without a
+// sublayoutBinding are skipped: only action attestations stamp the
+// field today, so other kinds (e.g. step attestations) pass through.
+//
+// Closes the gap from issue #147 where the paper's Phase 6 prefix
+// filter (`A_s = {a in A : a.prefix == s.name}`) was implicit only —
+// the recursive verify trusted the child session's stored
+// AttestationPrefix rather than re-checking each attestation.
+func verifySublayoutNamespacing(attestDir, subName, subPrefix string) []string {
+	statements, _ := loadAttestationStatements(attestDir)
+	var msgs []string
+	for i, s := range statements {
+		stmt, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		pred, ok := stmt["predicate"].(map[string]any)
+		if !ok {
+			continue
+		}
+		binding, ok := pred["sublayoutBinding"].(map[string]any)
+		if !ok {
+			// Not a sublayout-bound attestation (e.g. step attestation).
+			continue
+		}
+		if gotName, _ := binding["name"].(string); gotName != subName {
+			msgs = append(msgs, fmt.Sprintf("attestation %d sublayoutBinding.name=%q, expected %q", i, gotName, subName))
+		}
+		if subPrefix != "" {
+			if gotPrefix, _ := binding["prefix"].(string); gotPrefix != subPrefix {
+				msgs = append(msgs, fmt.Sprintf("attestation %d sublayoutBinding.prefix=%q, expected %q", i, gotPrefix, subPrefix))
+			}
+		}
+	}
+	return msgs
+}
+
 //nolint:gocognit // sublayout verification requires many checks
 func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int) []string {
 	if len(parentState.Policy.Sublayouts) == 0 {
@@ -1567,6 +1608,20 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int)
 			}
 
 			childFound = true
+
+			// Phase 6 namespacing invariant (paper Listing 1
+			// `A_s = {a in A : a.prefix == s.name}`, §5 invariant #3):
+			// every child attestation that carries a sublayoutBinding
+			// must name THIS sublayout. Without this check a forged
+			// or misattributed attestation could land in the wrong
+			// sublayout slot and still pass verify because the
+			// recursive call only looks at the child session, not
+			// at the binding the attestation claims (issue #147).
+			if msgs := verifySublayoutNamespacing(v.stateManager.AttestationsDir(childID), sub.Name, sub.AttestationPrefix); len(msgs) > 0 {
+				for _, m := range msgs {
+					errors = append(errors, fmt.Sprintf("sublayout %q [%s]: %s", sub.Name, childID, m))
+				}
+			}
 
 			// Stage an Inherit overlay for the recursive verify if the
 			// sublayout declares any. verifySessionWithDepth consumes it
