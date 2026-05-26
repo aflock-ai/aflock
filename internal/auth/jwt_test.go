@@ -379,3 +379,48 @@ func TestValidatorRejectsForeignToken(t *testing.T) {
 	_, err = validatorB.ValidateToken(tokenA)
 	assert.Error(t, err)
 }
+
+func TestMintChildToken_MergesLimits(t *testing.T) {
+	issuer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	parent := &aflock.Policy{
+		Version: "1.0",
+		Name:    "parent",
+		Tools:   &aflock.ToolsPolicy{Allow: []string{"Read", "Bash"}},
+		Limits: &aflock.LimitsPolicy{
+			MaxSpendUSD: &aflock.Limit{Value: 10.0, Enforcement: "fail-fast"},
+			MaxTokensIn: &aflock.Limit{Value: 500_000, Enforcement: "fail-fast"},
+		},
+	}
+	sub := &aflock.Sublayout{
+		Name: "research-agent",
+		Limits: &aflock.LimitsPolicy{
+			MaxSpendUSD: &aflock.Limit{Value: 2.0, Enforcement: "fail-fast"},
+			// MaxTokensIn not declared — should inherit from parent.
+		},
+	}
+
+	tok, err := issuer.MintChildToken(parent, sub, "child-1", "spiffe://aflock.ai/agent/child", "hash-1", time.Hour)
+	require.NoError(t, err)
+
+	claims, err := issuer.ValidateTokenForSessionAndPolicy(tok, "child-1", "")
+	require.NoError(t, err)
+
+	require.NotNil(t, claims.Limits, "child JWT must carry limits")
+	require.NotNil(t, claims.Limits.MaxSpendUSD, "MaxSpendUSD must be present")
+	assert.Equal(t, 2.0, claims.Limits.MaxSpendUSD.Value, "child takes sublayout's MaxSpendUSD")
+	require.NotNil(t, claims.Limits.MaxTokensIn, "MaxTokensIn must inherit from parent")
+	assert.Equal(t, 500_000.0, claims.Limits.MaxTokensIn.Value, "child inherits parent's MaxTokensIn")
+}
+
+func TestMintChildToken_NilArgs(t *testing.T) {
+	issuer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	_, err = issuer.MintChildToken(nil, &aflock.Sublayout{Name: "x"}, "child", "agent", "hash", time.Hour)
+	assert.Error(t, err, "nil parent policy must error")
+
+	_, err = issuer.MintChildToken(&aflock.Policy{}, nil, "child", "agent", "hash", time.Hour)
+	assert.Error(t, err, "nil sublayout must error")
+}

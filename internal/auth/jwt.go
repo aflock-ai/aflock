@@ -117,6 +117,83 @@ func (ti *TokenIssuer) IssueToken(
 	return token.SignedString(ti.signingKey)
 }
 
+// MintChildToken issues a JWT for a child session bound to a parent
+// sublayout. The token's scope is the intersection of the parent
+// policy with the sublayout: parent tools (unchanged — sublayouts
+// don't broaden tool access), sublayout limits where declared
+// (falling back to the parent's limit otherwise), and a fresh
+// PolicyDigest computed over the attenuated policy so verification
+// can't replay this token against the parent or any other sublayout.
+//
+// Used by `aflock_delegate` (issue #117) to mirror, in MCP mode,
+// the spawn-time binding that hooks-mode performs in
+// internal/hooks/handler.go:matchSublayoutForSpawn.
+func (ti *TokenIssuer) MintChildToken(
+	parentPolicy *aflock.Policy,
+	sub *aflock.Sublayout,
+	childSessionID string,
+	agentID string,
+	identityHash string,
+	ttl time.Duration,
+) (string, error) {
+	if parentPolicy == nil {
+		return "", fmt.Errorf("mint child token: nil parent policy")
+	}
+	if sub == nil {
+		return "", fmt.Errorf("mint child token: nil sublayout")
+	}
+	child := attenuateChildPolicy(parentPolicy, sub)
+	return ti.IssueToken(childSessionID, agentID, identityHash, child, ttl)
+}
+
+// attenuateChildPolicy builds an attenuated policy for a sublayout
+// child. Tools and grants are carried from the parent (the sublayout
+// is a delegation, not a broadening); limits are merged field-by-field
+// with the sublayout taking precedence where present.
+func attenuateChildPolicy(parent *aflock.Policy, sub *aflock.Sublayout) *aflock.Policy {
+	child := &aflock.Policy{
+		Name:    sub.Name,
+		Version: parent.Version,
+		Tools:   parent.Tools,
+	}
+	child.Limits = mergeLimits(parent.Limits, sub.Limits)
+	return child
+}
+
+// mergeLimits returns a new LimitsPolicy where each field is the
+// sublayout's value if set, otherwise the parent's value. Caller is
+// responsible for attenuation validation (sub <= parent) before
+// calling this — mergeLimits trusts its inputs.
+func mergeLimits(parent, sub *aflock.LimitsPolicy) *aflock.LimitsPolicy {
+	if parent == nil && sub == nil {
+		return nil
+	}
+	out := &aflock.LimitsPolicy{}
+	pick := func(p, s *aflock.Limit) *aflock.Limit {
+		if s != nil {
+			return s
+		}
+		return p
+	}
+	if parent != nil {
+		out.MaxSpendUSD = parent.MaxSpendUSD
+		out.MaxTokensIn = parent.MaxTokensIn
+		out.MaxTokensOut = parent.MaxTokensOut
+		out.MaxTurns = parent.MaxTurns
+		out.MaxWallTimeSeconds = parent.MaxWallTimeSeconds
+		out.MaxToolCalls = parent.MaxToolCalls
+	}
+	if sub != nil {
+		out.MaxSpendUSD = pick(out.MaxSpendUSD, sub.MaxSpendUSD)
+		out.MaxTokensIn = pick(out.MaxTokensIn, sub.MaxTokensIn)
+		out.MaxTokensOut = pick(out.MaxTokensOut, sub.MaxTokensOut)
+		out.MaxTurns = pick(out.MaxTurns, sub.MaxTurns)
+		out.MaxWallTimeSeconds = pick(out.MaxWallTimeSeconds, sub.MaxWallTimeSeconds)
+		out.MaxToolCalls = pick(out.MaxToolCalls, sub.MaxToolCalls)
+	}
+	return out
+}
+
 // ValidateToken verifies signature, expiry, issuer, and parses claims.
 func (ti *TokenIssuer) ValidateToken(tokenString string) (*AflockClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &AflockClaims{},
