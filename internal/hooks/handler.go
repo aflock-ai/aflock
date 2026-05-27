@@ -1618,11 +1618,21 @@ func attenuateLimits(childLimits, parentLimits *aflock.LimitsPolicy, parentMetri
 
 // mergeChildIntoParent merges the child session's actions, metrics, and
 // materials back into the parent session state.
+//
+// Child actions are renumbered to extend the parent's contiguous Seq
+// sequence (issue #146): the merged parent's Actions slice must satisfy
+// Seq[i] == int64(i) so verify's Distance proof fires correctly.
+// Without this, the merged child actions carry their child-local Seq
+// (which restarts at 0) and the parent's distance check would treat
+// the post-merge tail as a "legacy/mixed" session and silently skip.
+// The child's original state file retains its own Seq sequence and is
+// verified independently via Phase 6 sublayout recursion.
 func mergeChildIntoParent(parent, child *aflock.SessionState) {
-	// Annotate and append child actions
+	// Annotate, renumber, and append child actions
 	for _, action := range child.Actions {
 		annotated := action
 		annotated.Reason = fmt.Sprintf("[subagent:%s] %s", child.SessionID, action.Reason)
+		annotated.Seq = int64(len(parent.Actions))
 		parent.Actions = append(parent.Actions, annotated)
 	}
 

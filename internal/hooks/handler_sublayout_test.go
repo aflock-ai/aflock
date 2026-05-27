@@ -764,3 +764,35 @@ func TestMergeChildIntoParent(t *testing.T) {
 		t.Errorf("ChildSessionIDs = %v", parent.ChildSessionIDs)
 	}
 }
+
+// TestMergeChildIntoParent_RenumbersSeq pins the issue-#146 fix: merged
+// child actions must extend the parent's contiguous Seq sequence so
+// verify's Distance proof still fires. Without renumbering, the child's
+// local Seq (which restarts at 0) would land at a non-zero index in
+// the parent and trip the legacy/mixed detection.
+func TestMergeChildIntoParent_RenumbersSeq(t *testing.T) {
+	parent := &aflock.SessionState{
+		SessionID: "p1",
+		Metrics:   &aflock.SessionMetrics{Tools: map[string]int{}},
+		Actions: []aflock.ActionRecord{
+			{Seq: 0, ToolName: "Read", ToolUseID: "p-tu-0", Decision: "allow"},
+			{Seq: 1, ToolName: "Read", ToolUseID: "p-tu-1", Decision: "allow"},
+		},
+	}
+	child := &aflock.SessionState{
+		SessionID: "c1",
+		Metrics:   &aflock.SessionMetrics{Tools: map[string]int{}},
+		Actions: []aflock.ActionRecord{
+			{Seq: 0, ToolName: "Read", ToolUseID: "c-tu-0", Decision: "allow"},
+			{Seq: 1, ToolName: "Read", ToolUseID: "c-tu-1", Decision: "allow"},
+		},
+	}
+
+	mergeChildIntoParent(parent, child)
+
+	for i, a := range parent.Actions {
+		if a.Seq != int64(i) {
+			t.Errorf("parent.Actions[%d].Seq = %d, want %d (child actions must be renumbered)", i, a.Seq, i)
+		}
+	}
+}
