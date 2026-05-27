@@ -1657,37 +1657,11 @@ func matchesSublayout(child *aflock.SessionState, sub *aflock.Sublayout) bool {
 }
 
 // verifyAttenuation checks that sub-agent limits are ≤ parent limits.
-// This prevents privilege escalation: a sub-agent cannot have higher limits than its parent.
-// Returns a list of violations. Empty list = attenuation is valid.
+// Thin wrapper over policy.AttenuationViolations so verify-time and
+// spawn-time (hooks PreToolUse, MCP aflock_delegate) enforce the same
+// rule and can't drift apart.
 func verifyAttenuation(parent, child *aflock.LimitsPolicy) []string {
-	if child == nil {
-		return nil // No child limits = inherits parent (always valid)
-	}
-	if parent == nil {
-		return nil // No parent limits = no constraints to violate
-	}
-
-	var violations []string
-
-	checkLimit := func(name string, parentLimit, childLimit *aflock.Limit) {
-		if childLimit == nil || parentLimit == nil {
-			return // No limit set on one side = no violation
-		}
-		if childLimit.Value > parentLimit.Value {
-			violations = append(violations, fmt.Sprintf(
-				"%s: child %.2f > parent %.2f",
-				name, childLimit.Value, parentLimit.Value))
-		}
-	}
-
-	checkLimit("maxSpendUSD", parent.MaxSpendUSD, child.MaxSpendUSD)
-	checkLimit("maxTokensIn", parent.MaxTokensIn, child.MaxTokensIn)
-	checkLimit("maxTokensOut", parent.MaxTokensOut, child.MaxTokensOut)
-	checkLimit("maxTurns", parent.MaxTurns, child.MaxTurns)
-	checkLimit("maxWallTimeSeconds", parent.MaxWallTimeSeconds, child.MaxWallTimeSeconds)
-	checkLimit("maxToolCalls", parent.MaxToolCalls, child.MaxToolCalls)
-
-	return violations
+	return policy.AttenuationViolations(parent, child)
 }
 
 // loadAttestationStatements reads the session's *.intoto.json envelopes,

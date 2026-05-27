@@ -200,6 +200,51 @@ func (s *Server) registerTools() {
 		),
 		s.handleSignAttestation,
 	)
+
+	// Paper-named tools (issue #117, paper §3.3). aflock_authorize and
+	// aflock_attest are aliases of check_tool and sign_attestation so
+	// readers of the paper can probe the server with the names the paper
+	// uses. check_tool and sign_attestation remain registered for
+	// backward compatibility.
+
+	// aflock_authorize - Paper §3.3 alias of check_tool.
+	s.mcpServer.AddTool(
+		mcp.NewTool("aflock_authorize",
+			mcp.WithDescription("Request authorization for an action (paper §3.3). Alias of check_tool."),
+			mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to check")),
+			mcp.WithObject("tool_input", mcp.Description("Tool input parameters")),
+		),
+		s.handleCheckTool,
+	)
+
+	// aflock_attest - Paper §3.3 alias of sign_attestation.
+	s.mcpServer.AddTool(
+		mcp.NewTool("aflock_attest",
+			mcp.WithDescription("Record an action — server signs attestation (paper §3.3). Alias of sign_attestation."),
+			mcp.WithString("predicate_type", mcp.Required(), mcp.Description("Predicate type URI")),
+			mcp.WithObject("predicate", mcp.Required(), mcp.Description("Predicate data to attest")),
+			mcp.WithObject("subject", mcp.Description("Subject to bind attestation to (name and digest)")),
+		),
+		s.handleSignAttestation,
+	)
+
+	// aflock_check_limits - Paper §3.3, returns remaining budget per limit.
+	s.mcpServer.AddTool(
+		mcp.NewTool("aflock_check_limits",
+			mcp.WithDescription("Query remaining budget against each declared policy limit (paper §3.3)."),
+		),
+		s.handleCheckLimits,
+	)
+
+	// aflock_delegate - Paper §3.3, creates a sublayout binding for a sub-agent.
+	s.mcpServer.AddTool(
+		mcp.NewTool("aflock_delegate",
+			mcp.WithDescription("Create a sublayout binding for a sub-agent (paper §3.3). Validates the named sublayout against parent attenuation, writes a propagation record, and returns an attenuated child JWT."),
+			mcp.WithString("sublayout_name", mcp.Required(), mcp.Description("Name of a sublayout declared in the parent policy")),
+			mcp.WithString("child_session_id", mcp.Description("Optional pre-bound child session ID; one is generated if omitted")),
+		),
+		s.handleDelegate,
+	)
 }
 
 // Serve starts the MCP server on stdio.
@@ -1560,11 +1605,19 @@ func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallTool
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
 	}
-	if claims == nil && s.authActive.Load() {
-		return mcp.NewToolResultError("Authorization denied: sign_attestation requires a valid JWT once auth is active (issue #40)"), nil
+	// Use the actually-invoked tool name so the paper-named alias
+	// (aflock_attest) and the legacy name (sign_attestation) both
+	// authorize correctly when present in a policy allowlist
+	// (Copilot review on PR #149).
+	invoked := request.Params.Name
+	if invoked == "" {
+		invoked = "sign_attestation"
 	}
-	if claims != nil && !auth.IsToolAllowed("sign_attestation", claims.AllowedTools, claims.DeniedTools) {
-		return mcp.NewToolResultError("Authorization denied: tool 'sign_attestation' not permitted by token scope"), nil
+	if claims == nil && s.authActive.Load() {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %s requires a valid JWT once auth is active (issue #40)", invoked)), nil
+	}
+	if claims != nil && !auth.IsToolAllowed(invoked, claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: tool %q not permitted by token scope", invoked)), nil
 	}
 
 	if !s.signingEnabled {
@@ -1632,6 +1685,234 @@ func (s *Server) handleSignAttestation(ctx context.Context, request mcp.CallTool
 
 	data, _ := json.MarshalIndent(envelope, "", "  ")
 	return mcp.NewToolResultText(string(data)), nil
+}
+
+// handleCheckLimits returns the configured resource limits alongside
+// their current consumption and remaining budget. Paper §3.3 names
+// this `aflock_check_limits`. Read-only: no JWT required, since this
+// just exposes data already returned by `get_session` and the loaded
+// policy. Omits any limit category the policy hasn't declared.
+func (s *Server) handleCheckLimits(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if s.policy == nil || s.policy.Limits == nil {
+		return mcp.NewToolResultText(`{"limits": {}}`), nil
+	}
+
+	sessionState, err := s.stateManager.Load(s.sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load session: %w", err)
+	}
+
+	var (
+		costUSD   float64
+		tokensIn  int64
+		tokensOut int64
+		turns     int
+		toolCalls int
+	)
+	startedAt := time.Now()
+	if sessionState != nil {
+		startedAt = sessionState.StartedAt
+		if sessionState.Metrics != nil {
+			costUSD = sessionState.Metrics.CostUSD
+			tokensIn = sessionState.Metrics.TokensIn
+			tokensOut = sessionState.Metrics.TokensOut
+			turns = sessionState.Metrics.Turns
+			toolCalls = sessionState.Metrics.ToolCalls
+		}
+	}
+
+	limits := map[string]any{}
+	addFloat := func(name string, lim *aflock.Limit, used float64) {
+		if lim == nil {
+			return
+		}
+		remaining := lim.Value - used
+		if remaining < 0 {
+			remaining = 0
+		}
+		limits[name] = map[string]any{
+			"value":       lim.Value,
+			"used":        used,
+			"remaining":   remaining,
+			"enforcement": lim.Enforcement,
+		}
+	}
+	addInt := func(name string, lim *aflock.Limit, used int64) {
+		if lim == nil {
+			return
+		}
+		remaining := int64(lim.Value) - used
+		if remaining < 0 {
+			remaining = 0
+		}
+		limits[name] = map[string]any{
+			"value":       int64(lim.Value),
+			"used":        used,
+			"remaining":   remaining,
+			"enforcement": lim.Enforcement,
+		}
+	}
+
+	pol := s.policy.Limits
+	addFloat("maxSpendUSD", pol.MaxSpendUSD, costUSD)
+	addInt("maxTokensIn", pol.MaxTokensIn, tokensIn)
+	addInt("maxTokensOut", pol.MaxTokensOut, tokensOut)
+	addInt("maxTurns", pol.MaxTurns, int64(turns))
+	addInt("maxToolCalls", pol.MaxToolCalls, int64(toolCalls))
+	if pol.MaxWallTimeSeconds != nil {
+		elapsed := time.Since(startedAt).Seconds()
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		addFloat("maxWallTimeSeconds", pol.MaxWallTimeSeconds, elapsed)
+	}
+
+	result := map[string]any{"limits": limits}
+	data, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+// handleDelegate creates a sublayout binding for a sub-agent. Paper
+// §3.3 names this `aflock_delegate`. JWT-gated (parent agent must be
+// authorized). Validates the named sublayout exists, checks
+// attenuation, writes a propagation record, and mints an attenuated
+// child JWT.
+//
+// This mirrors, in MCP mode, the spawn-time binding that
+// internal/hooks/handler.go performs at PreToolUse when Claude Code's
+// Task/Agent tool is invoked.
+func (s *Server) handleDelegate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// aflock_delegate is sensitive (issues child JWTs + writes propagation),
+	// so we require a validated JWT unconditionally rather than honoring
+	// the graceful-adoption fallback used by less-privileged tools.
+	claims, err := s.validateJWT(request)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: %v", err)), nil
+	}
+	if claims == nil {
+		return mcp.NewToolResultError("Authorization denied: aflock_delegate requires a valid JWT"), nil
+	}
+	// Tool-scope check: a token issued under a policy allowlist that
+	// does not include the invoked name must not be able to mint child
+	// JWTs (Copilot review on PR #149). Use the actually-invoked name
+	// so the same handler covers any future alias.
+	invoked := request.Params.Name
+	if !auth.IsToolAllowed(invoked, claims.AllowedTools, claims.DeniedTools) {
+		return mcp.NewToolResultError(fmt.Sprintf("Authorization denied: tool %q not permitted by token scope", invoked)), nil
+	}
+	if s.tokenIssuer == nil {
+		return mcp.NewToolResultError("aflock_delegate: token issuer not initialized"), nil
+	}
+
+	if s.policy == nil {
+		return mcp.NewToolResultError("aflock_delegate: no policy loaded"), nil
+	}
+	if err := s.errPolicyExpired(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	sublayoutName := request.GetString("sublayout_name", "")
+	if sublayoutName == "" {
+		return mcp.NewToolResultError("sublayout_name is required"), nil
+	}
+
+	var matched *aflock.Sublayout
+	for i := range s.policy.Sublayouts {
+		if s.policy.Sublayouts[i].Name == sublayoutName {
+			matched = &s.policy.Sublayouts[i]
+			break
+		}
+	}
+	if matched == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: sublayout %q not declared in policy", sublayoutName)), nil
+	}
+
+	if violations := policy.AttenuationViolations(s.policy.Limits, matched.Limits); len(violations) > 0 {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: sublayout %q violates parent attenuation: %s",
+			sublayoutName, strings.Join(violations, "; "))), nil
+	}
+
+	parentState, err := s.stateManager.Load(s.sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load parent session: %w", err)
+	}
+	if parentState == nil {
+		return mcp.NewToolResultError("aflock_delegate: no parent session state; call get_token / start a session first"), nil
+	}
+
+	// Caller-supplied child_session_id must be a safe identifier the
+	// state manager and downstream tooling can use as a filename
+	// component. We allow alphanumerics, hyphen, and underscore;
+	// anything else is rejected so a malformed id can't slip through
+	// to a JWT and then fail at state-load time.
+	childSessionID := request.GetString("child_session_id", "")
+	if childSessionID == "" {
+		childSessionID = fmt.Sprintf("delegate-%s", uuid.New().String())
+	} else if !validSessionID(childSessionID) {
+		return mcp.NewToolResultError(
+			"aflock_delegate: child_session_id must be 1-128 chars of [a-zA-Z0-9_-]"), nil
+	}
+
+	// Mint the JWT first. If minting fails, no propagation record is
+	// written — failed delegations have no observable side effects.
+	//
+	// IMPORTANT (Copilot review on PR #149): the minted token is bound
+	// to the child session ID and the attenuated child policy digest.
+	// It is NOT usable against THIS server's validateJWT, which checks
+	// every call against the parent session/policy. The intended
+	// consumer is a downstream aflock instance that loads the child
+	// policy and runs the child session. Callers handing this token
+	// back to the parent socket will be rejected — by design.
+	agentID := ""
+	identityHash := ""
+	if s.agentIdentity != nil {
+		if spiffeID, sErr := s.agentIdentity.ToSPIFFEID("aflock.ai"); sErr == nil {
+			agentID = spiffeID.String()
+		}
+		identityHash = s.agentIdentity.IdentityHash
+	}
+	childJWT, err := s.tokenIssuer.MintChildToken(s.policy, matched, childSessionID, agentID, identityHash, time.Hour)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: mint child JWT: %v", err)), nil
+	}
+
+	if err := s.stateManager.WritePropagationForSublayout(parentState, matched); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("aflock_delegate: write propagation: %v", err)), nil
+	}
+
+	result := map[string]any{
+		"ok":               true,
+		"sublayout":        matched.Name,
+		"parent_session":   s.sessionID,
+		"child_session_id": childSessionID,
+		"child_jwt":        childJWT,
+		"child_jwt_note":   "Token is bound to child_session_id + attenuated child policy. Present it to a downstream aflock instance loaded with the child policy, not to this server.",
+		"limits":           matched.Limits,
+	}
+	data, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+// validSessionID enforces the safe-identifier rule for caller-supplied
+// child_session_id values: 1-128 chars, restricted to [a-zA-Z0-9_-].
+// Keeps malformed IDs from reaching the state manager (where they'd
+// become filename components) and from being baked into a JWT that
+// downstream tooling can't load.
+func validSessionID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // computePredicateDigest computes SHA256 of predicate data.
