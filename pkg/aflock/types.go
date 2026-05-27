@@ -170,7 +170,89 @@ type Policy struct {
 	// (rather than re-marshal) is issue #61 / L5; this field's value is the
 	// frozen digest captured at SessionStart, intentionally not recomputed
 	// from the on-disk file mid-session.
+	//
+	// When the policy was loaded from a DSSE envelope (signed), RawDigest is the
+	// SHA-256 of the inner payload bytes — not the envelope — so JWT binding stays
+	// invariant under re-signing with a different ephemeral key.
 	RawDigest string `json:"rawDigest,omitempty"`
+
+	// SignatureInfo describes the cryptographic signature that gated this policy
+	// load. Populated only when Load went through the DSSE envelope path and
+	// signature verification passed. Nil for unsigned policies.
+	SignatureInfo *SignatureInfo `json:"signatureInfo,omitempty"`
+}
+
+// SignatureInfo captures the verified identity that signed a policy envelope.
+// Surfaced in attestations so audits can prove a signed policy gated the session.
+type SignatureInfo struct {
+	// Issuer is the OIDC issuer URL from the Fulcio certificate
+	// (e.g., "https://token.actions.githubusercontent.com"). For raw-pubkey
+	// verifiers this is the literal string "pubkey".
+	Issuer string `json:"issuer"`
+	// Subject is the OIDC subject from the cert SAN (URI or email) for
+	// sigstore-typed verifiers, or the loaded key's SHA-256 fingerprint for
+	// raw-pubkey verifiers.
+	Subject string `json:"subject"`
+	// CertNotBefore / CertNotAfter are the Fulcio cert validity window.
+	// Omitted in raw-pubkey output where they have no meaning.
+	CertNotBefore *time.Time `json:"certNotBefore,omitempty"`
+	CertNotAfter  *time.Time `json:"certNotAfter,omitempty"`
+	// PayloadType is the DSSE payload type (always
+	// "application/vnd.aflock.policy+json" for this release).
+	PayloadType string `json:"payloadType"`
+}
+
+// TrustConfig declares which signing identities aflock will accept for policy
+// envelopes. Loaded from aflock-trust.json — see internal/policy/trust.go.
+type TrustConfig struct {
+	Version   string           `json:"version"`
+	Verifiers []TrustedVerifier `json:"verifiers"`
+}
+
+// TrustedVerifier is a single accepted signing identity. The discriminator
+// "type" selects which fields are consulted at verify time.
+type TrustedVerifier struct {
+	// Type is one of:
+	//   "sigstore" — match a Fulcio-issued leaf cert against {Issuer, SubjectPattern}
+	//   "pubkey"   — match against a raw PEM-encoded public key on disk
+	// Mirrors the StepFunctionary.Type taxonomy used for attestation verification
+	// so operators see the same trust-model vocabulary on both surfaces.
+	Type string `json:"type"`
+
+	// --- Sigstore-only fields ---
+
+	// Issuer is the exact OIDC issuer URL the Fulcio cert must declare.
+	Issuer string `json:"issuer,omitempty"`
+	// SubjectPattern is exact-matched against the cert SAN email (for human
+	// OIDC identities like Google/GitHub login) or SAN URI (for CI workflow
+	// identities like GitHub Actions). The match is routed by shape: contains
+	// "@" and no "://" → email constraint; otherwise → URI constraint.
+	// Rookery's underlying CertConstraint does NOT glob-match SAN fields, so
+	// wildcards like "*@gmail.com" will not match — pin the exact identity.
+	SubjectPattern string `json:"subjectPattern,omitempty"`
+	// FulcioRootPath optionally overrides the embedded Sigstore production root.
+	// When empty, the embedded root is used.
+	FulcioRootPath string `json:"fulcioRootPath,omitempty"`
+	// TSARootPath optionally overrides the embedded Sigstore production TSA
+	// cert chain. Required when signing was done against a self-hosted TSA
+	// (AFLOCK_TSA_URL); otherwise timestamp verification will fail with chain
+	// errors at load time. When empty, the embedded production chain is used.
+	TSARootPath string `json:"tsaRootPath,omitempty"`
+
+	// --- Pubkey-only fields ---
+
+	// KeyPath points to a PEM-encoded public key file. ECDSA, RSA, and Ed25519
+	// are accepted (rookery cryptoutil dispatches on the parsed type).
+	KeyPath string `json:"keyPath,omitempty"`
+	// KeyID, when non-empty, must match the SHA-256 hex fingerprint of the
+	// public key actually loaded from KeyPath (computed by rookery's
+	// cryptoutil.Verifier.KeyID). Use this to pin a specific key when KeyPath
+	// could resolve to alternates (symlinks, env-substituted paths). The
+	// envelope's own signatures[*].keyid metadata field is informational only;
+	// cryptographic verification against the loaded public key is what gates
+	// trust. Optional — if omitted, any signature that verifies against the
+	// loaded key is accepted, matching witness's publickey functionary semantics.
+	KeyID string `json:"keyid,omitempty"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.
