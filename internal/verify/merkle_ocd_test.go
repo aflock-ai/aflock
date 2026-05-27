@@ -138,12 +138,12 @@ func TestVerifyActionOrderingAndDistance_ShortSequence(t *testing.T) {
 }
 
 // TestVerifySessionMerkle_OrderViolationAfterRootMatch — end-to-end:
-// build a valid session state with a matching auto-recorded root,
-// then mutate one action's timestamp to step backwards. The merkle
-// root would no longer match (timestamps are in the leaves), so this
-// test mutates AFTER root computation by injecting a precomputed root.
-// Confirms the OCD check fires when the root happens to match but
-// the ordering invariant is violated — the self-anchored attack path.
+// simulate the self-anchored attack path. Build a happy-path session,
+// swap actions[1] and actions[2] in place so the resulting slice has a
+// timestamp going backwards at index 2, then recompute the merkle root
+// over the reordered slice and stamp it as SessionMerkleRoot. The
+// root-match check now passes (the recorded root matches the tampered
+// leaves) and only the new Order proof catches the reordering.
 func TestVerifySessionMerkle_OrderViolationAfterRootMatch(t *testing.T) {
 	state := &aflock.SessionState{
 		SessionID: "ocd-order",

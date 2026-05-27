@@ -1951,8 +1951,17 @@ func verifySessionMerkle(sessionState *aflock.SessionState) []string {
 //   - Order: Actions[i].Timestamp must be >= Actions[i-1].Timestamp.
 //   - Distance: Actions[i].Seq must equal int64(i) — contiguous from 0.
 //
-// Completeness follows from those two: no gaps in seq and no timestamp
-// reversal means every turn between first and last was recorded.
+// Completeness is partially proven: on the *externally-anchored* path
+// (policy declares materialsFrom.session.merkleRoot), Order + Distance
+// together rule out any modification — an attacker can't drop or
+// reorder turns without producing a different root the policy's pinned
+// value will catch. On the *self-anchored* path (root only recorded
+// in sessionState.SessionMerkleRoot), an attacker who controls the
+// state file can drop tail actions, renumber the remainder so Seq is
+// still contiguous, and recompute the root — all three checks then
+// pass. Self-anchored Completeness requires an external anchor we
+// don't have here; the merkle root anchor-source log line warns when
+// the binding is self-anchored.
 //
 // Legacy records (written before Seq was stamped) all carry Seq=0; in
 // that case we skip the distance check and log a single line so
