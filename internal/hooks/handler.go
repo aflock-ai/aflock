@@ -165,6 +165,14 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	// internal/auth/claudeauth/detect.go for the why.
 	sessionState.AuthMode = string(claudeauth.Detect())
 
+	// Surface the auth-mode posture up front so users see the
+	// limitation before any tool runs, not only when a limit trips
+	// at PostToolUse (issue #111). Token limits stay enforced under
+	// both modes — only maxSpendUSD goes advisory.
+	if msg := subscriptionAdvisoryWarning(pol, sessionState.AuthMode); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+
 	// Save agent identity metadata for reuse in PostToolUse attestations
 	sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
 		Model:        agentIdentity.Model,
@@ -1630,6 +1638,25 @@ func matchSublayoutForSpawn(toolName string, toolInput json.RawMessage, sublayou
 		}
 	}
 	return nil, true
+}
+
+// subscriptionAdvisoryWarning returns the one-line stderr message
+// handleSessionStart emits when the policy declares a cost-derived
+// limit that downgrades to advisory under the current auth mode
+// (issue #111). Returns "" when no warning applies — i.e. when the
+// caller is on api_key billing, or when the policy doesn't declare
+// any limit affected by the auth mode. Token/turn limits remain
+// enforced regardless of mode, so they don't trigger a warning here.
+func subscriptionAdvisoryWarning(pol *aflock.Policy, authMode string) string {
+	if pol == nil || pol.Limits == nil || pol.Limits.MaxSpendUSD == nil {
+		return ""
+	}
+	if authMode == string(claudeauth.ModeAPIKey) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[aflock] Warning: auth_mode=%s — maxSpendUSD is advisory only (set ANTHROPIC_API_KEY for authoritative cost accounting). Token/turn limits remain enforced.",
+		authMode)
 }
 
 // attenuationViolations checks that sublayout limits are <= parent limits.
