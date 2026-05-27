@@ -1962,10 +1962,18 @@ func verifyActionOrderingAndDistance(sessionID string, actions []aflock.ActionRe
 		return nil
 	}
 
-	hasSeq := false
-	for _, a := range actions {
-		if a.Seq != 0 {
-			hasSeq = true
+	// Distance applies only when every action past index 0 has a
+	// non-zero Seq stamp. Action[0] legitimately has Seq=0, so it's
+	// not a signal either way; checking from index 1 keeps the
+	// detection robust against the legitimate first-action case.
+	// A mixed session (legacy prefix with Seq=0 followed by new
+	// actions with Seq>0) is treated as legacy and the distance proof
+	// is skipped — a partial enforcement would false-fail the legacy
+	// prefix even though those records pre-date the Seq stamp.
+	distanceSupported := true
+	for i := 1; i < len(actions); i++ {
+		if actions[i].Seq == 0 {
+			distanceSupported = false
 			break
 		}
 	}
@@ -1979,9 +1987,9 @@ func verifyActionOrderingAndDistance(sessionID string, actions []aflock.ActionRe
 		}
 	}
 
-	if !hasSeq {
+	if !distanceSupported {
 		fmt.Fprintf(os.Stderr,
-			"[aflock] session %s: action records have no Seq stamp, skipping distance proof (legacy session)\n",
+			"[aflock] session %s: action records have no Seq stamp past index 0, skipping distance proof (legacy or mixed-version session)\n",
 			sessionID)
 		return violations
 	}

@@ -71,19 +71,13 @@ func TestVerifyActionOrderingAndDistance_ReorderFails(t *testing.T) {
 }
 
 // TestVerifyActionOrderingAndDistance_DistanceFails — paper §4.4
-// Distance: a missing seq (gap) fails with a precise "distance
-// violation" message and the expected index.
+// Distance: out-of-place seq values at index 2 and index 3 each
+// produce one "distance violation" message with the expected index.
 func TestVerifyActionOrderingAndDistance_DistanceFails(t *testing.T) {
-	a := actionsHappyPath(t, 4)
-	a[2].Seq = 5 // gap: 0,1,5,3
-	a[3].Seq = 3
+	a := actionsHappyPath(t, 4) // seq: 0,1,2,3
+	a[2].Seq = 5                // expected 2, got 5
+	a[3].Seq = 99               // expected 3, got 99
 	v := verifyActionOrderingAndDistance("s", a)
-	// expect exactly the index-2 mismatch and index-3 mismatch (since
-	// index 3 has seq=3 which would normally be fine but the chain
-	// re-checks each index independently — 3 matches 3 so only index 2
-	// fails). Use the seq layout above to keep this deterministic.
-	a[3].Seq = 99 // make sure index 3 also fails so we don't have to be subtle
-	v = verifyActionOrderingAndDistance("s", a)
 	hits := 0
 	for _, msg := range v {
 		if strings.Contains(msg, "distance violation") {
@@ -92,6 +86,22 @@ func TestVerifyActionOrderingAndDistance_DistanceFails(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Errorf("expected 2 distance violations, got %d: %v", hits, v)
+	}
+}
+
+// TestVerifyActionOrderingAndDistance_MixedSessionSkipsDistance —
+// a session that crosses an aflock upgrade: legacy actions at the
+// start (Seq=0) followed by new actions with non-zero Seq. Partial
+// enforcement would false-fail the legacy prefix, so distance must
+// be skipped entirely. Order check still runs.
+func TestVerifyActionOrderingAndDistance_MixedSessionSkipsDistance(t *testing.T) {
+	a := actionsHappyPath(t, 4) // would normally have seq 0,1,2,3
+	a[0].Seq = 0                // legacy
+	a[1].Seq = 0                // legacy
+	a[2].Seq = 2                // post-upgrade, stamped
+	a[3].Seq = 3                // post-upgrade, stamped
+	if v := verifyActionOrderingAndDistance("s", a); len(v) != 0 {
+		t.Errorf("mixed-session must skip distance and produce no violations, got %v", v)
 	}
 }
 

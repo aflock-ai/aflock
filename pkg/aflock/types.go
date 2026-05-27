@@ -658,11 +658,17 @@ type SessionMetrics struct {
 // session. Stamped at record time so verifiers can prove paper §4.4
 // Distance (no gaps) and, together with Timestamp monotonicity, prove
 // Order beyond what the merkle root alone catches (issue #146).
-// Records written by older aflock versions have Seq=0 across the board;
-// the verifier treats that as "legacy, distance check skipped".
+//
+// `omitempty` is intentional: a legacy ActionRecord (recorded before
+// Seq existed) had no `seq` field in its JSON form. Re-marshaling it
+// must produce identical bytes so the merkle leaf hash — and the root
+// computed over it — stays stable. With `omitempty`, both old and new
+// aflock binaries serialize Seq=0 the same way (field absent).
+// Action[0] of a new session also has Seq=0 and likewise omits the
+// field; later actions carry Seq=1, Seq=2 ... and emit it normally.
 type ActionRecord struct {
 	Timestamp time.Time       `json:"timestamp"`
-	Seq       int64           `json:"seq"`
+	Seq       int64           `json:"seq,omitempty"`
 	ToolName  string          `json:"tool_name"`
 	ToolUseID string          `json:"tool_use_id"`
 	ToolInput json.RawMessage `json:"tool_input,omitempty"`
