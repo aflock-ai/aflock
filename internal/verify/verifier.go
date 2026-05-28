@@ -1548,6 +1548,47 @@ func topoSortSteps(steps map[string]aflock.Step) ([]string, error) {
 //  3. Recursively verifies the child session against the sublayout's policy
 //  4. Accumulates child spend toward parent metrics
 //
+// verifySublayoutNamespacing enforces paper §5 invariant #3 — every
+// child attestation that carries a sublayoutBinding must name THIS
+// sublayout. Reads each *.intoto.json envelope under attestDir, parses
+// the predicate, and validates the embedded binding's `name` (and
+// `prefix` when the sublayout declares one). Attestations without a
+// sublayoutBinding are skipped: only action attestations stamp the
+// field today, so other kinds (e.g. step attestations) pass through.
+//
+// Closes the gap from issue #147 where the paper's Phase 6 prefix
+// filter (`A_s = {a in A : a.prefix == s.name}`) was implicit only —
+// the recursive verify trusted the child session's stored
+// AttestationPrefix rather than re-checking each attestation.
+func verifySublayoutNamespacing(attestDir, subName, subPrefix string) []string {
+	statements, _ := loadAttestationStatements(attestDir)
+	var msgs []string
+	for i, s := range statements {
+		stmt, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		pred, ok := stmt["predicate"].(map[string]any)
+		if !ok {
+			continue
+		}
+		binding, ok := pred["sublayoutBinding"].(map[string]any)
+		if !ok {
+			// Not a sublayout-bound attestation (e.g. step attestation).
+			continue
+		}
+		if gotName, _ := binding["name"].(string); gotName != subName {
+			msgs = append(msgs, fmt.Sprintf("attestation %d sublayoutBinding.name=%q, expected %q", i, gotName, subName))
+		}
+		if subPrefix != "" {
+			if gotPrefix, _ := binding["prefix"].(string); gotPrefix != subPrefix {
+				msgs = append(msgs, fmt.Sprintf("attestation %d sublayoutBinding.prefix=%q, expected %q", i, gotPrefix, subPrefix))
+			}
+		}
+	}
+	return msgs
+}
+
 //nolint:gocognit // sublayout verification requires many checks
 func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int) []string {
 	if len(parentState.Policy.Sublayouts) == 0 {
@@ -1579,6 +1620,20 @@ func (v *Verifier) verifySublayouts(parentState *aflock.SessionState, depth int)
 			}
 
 			childFound = true
+
+			// Phase 6 namespacing invariant (paper Listing 1
+			// `A_s = {a in A : a.prefix == s.name}`, §5 invariant #3):
+			// every child attestation that carries a sublayoutBinding
+			// must name THIS sublayout. Without this check a forged
+			// or misattributed attestation could land in the wrong
+			// sublayout slot and still pass verify because the
+			// recursive call only looks at the child session, not
+			// at the binding the attestation claims (issue #147).
+			if msgs := verifySublayoutNamespacing(v.stateManager.AttestationsDir(childID), sub.Name, sub.AttestationPrefix); len(msgs) > 0 {
+				for _, m := range msgs {
+					errors = append(errors, fmt.Sprintf("sublayout %q [%s]: %s", sub.Name, childID, m))
+				}
+			}
 
 			// Stage an Inherit overlay for the recursive verify if the
 			// sublayout declares any. verifySessionWithDepth consumes it
@@ -1669,37 +1724,11 @@ func matchesSublayout(child *aflock.SessionState, sub *aflock.Sublayout) bool {
 }
 
 // verifyAttenuation checks that sub-agent limits are ≤ parent limits.
-// This prevents privilege escalation: a sub-agent cannot have higher limits than its parent.
-// Returns a list of violations. Empty list = attenuation is valid.
+// Thin wrapper over policy.AttenuationViolations so verify-time and
+// spawn-time (hooks PreToolUse, MCP aflock_delegate) enforce the same
+// rule and can't drift apart.
 func verifyAttenuation(parent, child *aflock.LimitsPolicy) []string {
-	if child == nil {
-		return nil // No child limits = inherits parent (always valid)
-	}
-	if parent == nil {
-		return nil // No parent limits = no constraints to violate
-	}
-
-	var violations []string
-
-	checkLimit := func(name string, parentLimit, childLimit *aflock.Limit) {
-		if childLimit == nil || parentLimit == nil {
-			return // No limit set on one side = no violation
-		}
-		if childLimit.Value > parentLimit.Value {
-			violations = append(violations, fmt.Sprintf(
-				"%s: child %.2f > parent %.2f",
-				name, childLimit.Value, parentLimit.Value))
-		}
-	}
-
-	checkLimit("maxSpendUSD", parent.MaxSpendUSD, child.MaxSpendUSD)
-	checkLimit("maxTokensIn", parent.MaxTokensIn, child.MaxTokensIn)
-	checkLimit("maxTokensOut", parent.MaxTokensOut, child.MaxTokensOut)
-	checkLimit("maxTurns", parent.MaxTurns, child.MaxTurns)
-	checkLimit("maxWallTimeSeconds", parent.MaxWallTimeSeconds, child.MaxWallTimeSeconds)
-	checkLimit("maxToolCalls", parent.MaxToolCalls, child.MaxToolCalls)
-
-	return violations
+	return policy.AttenuationViolations(parent, child)
 }
 
 // loadAttestationStatements reads the session's *.intoto.json envelopes,
@@ -1877,16 +1906,33 @@ func evaluateSessionRego(sessionState *aflock.SessionState, attestDir string) []
 // an expected root, the auto-computed sessionState.SessionMerkleRoot (written at
 // SessionEnd) is used as the expected value, which catches post-hoc tampering of
 // state.json (issue #119).
+//
+// After the root match succeeds, the paper §4.4 Order/Distance proofs
+// (issue #146) run via verifyActionOrderingAndDistance — root equality
+// alone does not prove ordering or contiguity, especially on the
+// self-anchored path where the expected root came from
+// sessionState.SessionMerkleRoot rather than a third-party-declared
+// policy.MaterialsFrom.Session.MerkleRoot.
 func verifySessionMerkle(sessionState *aflock.SessionState) []string {
 	expectedRoot := ""
+	policyDeclared := false
 	if sessionState.Policy.MaterialsFrom != nil && sessionState.Policy.MaterialsFrom.Session != nil {
 		expectedRoot = sessionState.Policy.MaterialsFrom.Session.MerkleRoot
+		policyDeclared = expectedRoot != ""
 	}
 	if expectedRoot == "" {
 		expectedRoot = sessionState.SessionMerkleRoot
 	}
 	if expectedRoot == "" {
 		return nil // No expected root and none auto-recorded — nothing to verify.
+	}
+
+	if !policyDeclared {
+		// Audit visibility: callers should know when the binding is
+		// self-anchored versus tied to an externally declared root.
+		fmt.Fprintf(os.Stderr,
+			"[aflock] session %s: merkle root anchored to recorded session state (no third-party proof; policy did not declare materialsFrom.session.merkleRoot)\n",
+			sessionState.SessionID)
 	}
 
 	if len(sessionState.Actions) == 0 {
@@ -1907,7 +1953,76 @@ func verifySessionMerkle(sessionState *aflock.SessionState) []string {
 		return []string{fmt.Sprintf("Materials binding failed: %v", err)}
 	}
 
-	return nil
+	// Paper §4.4 Order/Distance proofs (issue #146).
+	return verifyActionOrderingAndDistance(sessionState.SessionID, sessionState.Actions)
+}
+
+// verifyActionOrderingAndDistance proves paper §4.4 Order and Distance
+// over a session's actions, given that the merkle root already matched.
+//
+//   - Order: Actions[i].Timestamp must be >= Actions[i-1].Timestamp.
+//   - Distance: Actions[i].Seq must equal int64(i) — contiguous from 0.
+//
+// Completeness is partially proven: on the *externally-anchored* path
+// (policy declares materialsFrom.session.merkleRoot), Order + Distance
+// together rule out any modification — an attacker can't drop or
+// reorder turns without producing a different root the policy's pinned
+// value will catch. On the *self-anchored* path (root only recorded
+// in sessionState.SessionMerkleRoot), an attacker who controls the
+// state file can drop tail actions, renumber the remainder so Seq is
+// still contiguous, and recompute the root — all three checks then
+// pass. Self-anchored Completeness requires an external anchor we
+// don't have here; the merkle root anchor-source log line warns when
+// the binding is self-anchored.
+//
+// Legacy records (written before Seq was stamped) all carry Seq=0; in
+// that case we skip the distance check and log a single line so
+// auditors can see why this older session only got the order proof.
+func verifyActionOrderingAndDistance(sessionID string, actions []aflock.ActionRecord) []string {
+	if len(actions) <= 1 {
+		return nil
+	}
+
+	// Distance applies only when every action past index 0 has a
+	// non-zero Seq stamp. Action[0] legitimately has Seq=0, so it's
+	// not a signal either way; checking from index 1 keeps the
+	// detection robust against the legitimate first-action case.
+	// A mixed session (legacy prefix with Seq=0 followed by new
+	// actions with Seq>0) is treated as legacy and the distance proof
+	// is skipped — a partial enforcement would false-fail the legacy
+	// prefix even though those records pre-date the Seq stamp.
+	distanceSupported := true
+	for i := 1; i < len(actions); i++ {
+		if actions[i].Seq == 0 {
+			distanceSupported = false
+			break
+		}
+	}
+
+	var violations []string
+	for i := 1; i < len(actions); i++ {
+		if actions[i].Timestamp.Before(actions[i-1].Timestamp) {
+			violations = append(violations, fmt.Sprintf(
+				"session ordering violation at action %d: timestamp %s precedes prior %s",
+				i, actions[i].Timestamp.Format(time.RFC3339Nano), actions[i-1].Timestamp.Format(time.RFC3339Nano)))
+		}
+	}
+
+	if !distanceSupported {
+		fmt.Fprintf(os.Stderr,
+			"[aflock] session %s: action records have no Seq stamp past index 0, skipping distance proof (legacy or mixed-version session)\n",
+			sessionID)
+		return violations
+	}
+
+	for i := range actions {
+		if actions[i].Seq != int64(i) {
+			violations = append(violations, fmt.Sprintf(
+				"session distance violation at action %d: seq=%d, expected %d",
+				i, actions[i].Seq, i))
+		}
+	}
+	return violations
 }
 
 // IdentityFields holds the identity fields extracted from an attestation or session

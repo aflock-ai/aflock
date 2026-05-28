@@ -1,0 +1,10 @@
+{
+  "version": "1",
+  "verifiers": [
+    {
+      "type": "sigstore",
+      "issuer": "https://oauth2.sigstore.dev/auth",
+      "subjectPattern": "you@example.com"
+    }
+  ]
+}

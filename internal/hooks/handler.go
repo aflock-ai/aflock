@@ -592,7 +592,7 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		case hasDecl && matched != nil:
 			// Sublayout limits must already attenuate vs parent's limits;
 			// refusing at spawn time means a bad policy can't slip through.
-			if violations := attenuationViolations(sessionState.Policy.Limits, matched.Limits); len(violations) > 0 {
+			if violations := policy.AttenuationViolations(sessionState.Policy.Limits, matched.Limits); len(violations) > 0 {
 				return output.Write(output.PreToolUseDeny(fmt.Sprintf(
 					"[aflock] BLOCKED: sublayout %q violates parent attenuation: %s",
 					matched.Name, strings.Join(violations, "; "))))
@@ -1659,31 +1659,6 @@ func subscriptionAdvisoryWarning(pol *aflock.Policy, authMode string) string {
 		authMode)
 }
 
-// attenuationViolations checks that sublayout limits are <= parent limits.
-// Mirrors verify.verifyAttenuation but lives here so spawn-time enforcement
-// (issue #26 gap 4) doesn't pull in the verify package's dependencies.
-// Empty result means the sublayout is validly attenuated.
-func attenuationViolations(parent, sub *aflock.LimitsPolicy) []string {
-	if sub == nil || parent == nil {
-		return nil
-	}
-	var violations []string
-	check := func(name string, p, s *aflock.Limit) {
-		if p == nil || s == nil {
-			return
-		}
-		if s.Value > p.Value {
-			violations = append(violations, fmt.Sprintf("%s: sublayout %.2f > parent %.2f", name, s.Value, p.Value))
-		}
-	}
-	check("maxSpendUSD", parent.MaxSpendUSD, sub.MaxSpendUSD)
-	check("maxTokensIn", parent.MaxTokensIn, sub.MaxTokensIn)
-	check("maxTokensOut", parent.MaxTokensOut, sub.MaxTokensOut)
-	check("maxTurns", parent.MaxTurns, sub.MaxTurns)
-	check("maxWallTimeSeconds", parent.MaxWallTimeSeconds, sub.MaxWallTimeSeconds)
-	check("maxToolCalls", parent.MaxToolCalls, sub.MaxToolCalls)
-	return violations
-}
 
 // attenuateLimits computes effective limits for a child session.
 // For each limit field: child effective = min(child policy limit, parent remaining).
@@ -1783,11 +1758,21 @@ func rollupUnmergedChildren(parent *aflock.SessionState, children []*aflock.Sess
 
 // mergeChildIntoParent merges the child session's actions, metrics, and
 // materials back into the parent session state.
+//
+// Child actions are renumbered to extend the parent's contiguous Seq
+// sequence (issue #146): the merged parent's Actions slice must satisfy
+// Seq[i] == int64(i) so verify's Distance proof fires correctly.
+// Without this, the merged child actions carry their child-local Seq
+// (which restarts at 0) and the parent's distance check would treat
+// the post-merge tail as a "legacy/mixed" session and silently skip.
+// The child's original state file retains its own Seq sequence and is
+// verified independently via Phase 6 sublayout recursion.
 func mergeChildIntoParent(parent, child *aflock.SessionState) {
-	// Annotate and append child actions
+	// Annotate, renumber, and append child actions
 	for _, action := range child.Actions {
 		annotated := action
 		annotated.Reason = fmt.Sprintf("[subagent:%s] %s", child.SessionID, action.Reason)
+		annotated.Seq = int64(len(parent.Actions))
 		parent.Actions = append(parent.Actions, annotated)
 	}
 

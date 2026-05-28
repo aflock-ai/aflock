@@ -191,10 +191,13 @@ func (m *Manager) Initialize(sessionID string, policy *aflock.Policy, policyPath
 }
 
 // RecordAction records an action in the session state.
-// It is safe for concurrent use.
+// It is safe for concurrent use. Seq is stamped here so every action
+// carries a contiguous zero-based index for paper §4.4 Distance proofs
+// (issue #146). The pre-existing mutex serializes Seq assignment.
 func (m *Manager) RecordAction(state *aflock.SessionState, record aflock.ActionRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	record.Seq = int64(len(state.Actions))
 	state.Actions = append(state.Actions, record)
 	state.Metrics.ToolCalls++
 	if state.Metrics.Tools == nil {

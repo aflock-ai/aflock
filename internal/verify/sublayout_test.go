@@ -56,7 +56,7 @@ func TestVerifyAttenuation_Violation_SpendExceeds(t *testing.T) {
 	if len(violations) != 1 {
 		t.Fatalf("Expected 1 violation, got %d: %v", len(violations), violations)
 	}
-	if violations[0] != "maxSpendUSD: child 10.00 > parent 5.00" {
+	if violations[0] != "maxSpendUSD: sublayout 10.00 > parent 5.00" {
 		t.Errorf("Unexpected violation: %s", violations[0])
 	}
 }

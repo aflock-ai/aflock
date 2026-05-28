@@ -2,15 +2,7 @@
 package main
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -216,122 +208,63 @@ var statusCmd = &cobra.Command{
 	},
 }
 
-var signKeyPath string
-var signOutputPath string
+var (
+	signOutputPath string
+	signKeyPath    string
+)
 
 var signCmd = &cobra.Command{
 	Use:   "sign <policy.aflock>",
-	Short: "Sign a policy file",
-	Long: `Sign a policy file with an ECDSA key.
+	Short: "Sign a policy file (Sigstore keyless by default; --key for raw PEM)",
+	Long: `Sign a policy file as a DSSE envelope.
 
-If no key is provided via --key or AFLOCK_SIGNING_KEY, a new ephemeral
-key is generated and the public key is printed to stderr.
+Two signer paths, picked by flags / env:
 
-This creates a DSSE-signed policy envelope that cannot be modified by the agent.`,
+  Sigstore keyless (default):
+    Fulcio issues an ephemeral cert bound to the caller's OIDC identity, then
+    aflock bundles an RFC 3161 timestamp so the signature survives the
+    ~10-min cert validity window. Requires network at sign time.
+    OIDC sources: GITHUB_ACTIONS=true | $FULCIO_TOKEN | $FULCIO_TOKEN_PATH |
+                  $FULCIO_OIDC_ISSUER (interactive browser)
+
+  Raw key (--key <pem> or $AFLOCK_SIGNING_KEY):
+    PEM-encoded ECDSA, RSA, or Ed25519 private key. Operator manages the key.
+    No TSA needed (raw keys don't expire), no network needed.
+
+The verifier picks which path to take by reading aflock-trust.json — see
+docs/concepts/policies.md#signing-and-trust.`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		policyPath := args[0]
 
-		// Read the policy file
 		policyData, err := os.ReadFile(policyPath) //nolint:gosec // G304: policy file path from CLI arg
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to read policy: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Validate it's valid JSON
 		var policyJSON json.RawMessage
 		if err := json.Unmarshal(policyData, &policyJSON); err != nil {
 			fmt.Fprintf(os.Stderr, "Invalid policy JSON: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Load or generate signing key
 		keyPath := signKeyPath
 		if keyPath == "" {
 			keyPath = os.Getenv("AFLOCK_SIGNING_KEY")
 		}
 
-		var privKey *ecdsa.PrivateKey
+		var envelopeJSON []byte
 		if keyPath != "" {
-			keyData, err := os.ReadFile(keyPath) //nolint:gosec // G304: key file path from CLI arg
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to read key: %v\n", err)
-				os.Exit(1)
-			}
-			privKey, err = parseECDSAPrivateKey(keyData)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to parse key: %v\n", err)
-				os.Exit(1)
-			}
+			envelopeJSON, err = policy.SignWithKey(cmd.Context(), keyPath, policyData)
 		} else {
-			// Generate ephemeral key
-			privKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to generate key: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Fprintf(os.Stderr, "Generated ephemeral signing key (no --key provided)\n")
+			envelopeJSON, err = policy.SignWithFulcio(cmd.Context(), policyData)
 		}
-
-		// Compute keyid as SHA256 fingerprint of the DER-encoded public key
-		pubDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to marshal public key: %v\n", err)
-			os.Exit(1)
-		}
-		keyFingerprint := sha256.Sum256(pubDER)
-		keyID := fmt.Sprintf("SHA256:%x", keyFingerprint)
-
-		// For ephemeral keys, output the public key PEM so the user can verify later
-		if keyPath == "" {
-			pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
-			fmt.Fprintf(os.Stderr, "Public key (save this to verify signatures):\n%s", pubPEM)
-		}
-
-		// Create DSSE envelope
-		payloadType := "application/vnd.aflock.policy+json"
-		payload := base64.StdEncoding.EncodeToString(policyData)
-
-		// Create PAE (Pre-Authentication Encoding)
-		paeData := createSignPAE(payloadType, policyData)
-		hash := sha256.Sum256(paeData)
-
-		// Sign
-		sigBytes, err := ecdsa.SignASN1(rand.Reader, privKey, hash[:])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to sign: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Sign failed: %v\n", err)
 			os.Exit(1)
 		}
 
-		envelope := struct {
-			PayloadType string `json:"payloadType"`
-			Payload     string `json:"payload"`
-			Signatures  []struct {
-				KeyID string `json:"keyid"`
-				Sig   string `json:"sig"`
-			} `json:"signatures"`
-		}{
-			PayloadType: payloadType,
-			Payload:     payload,
-			Signatures: []struct {
-				KeyID string `json:"keyid"`
-				Sig   string `json:"sig"`
-			}{
-				{
-					KeyID: keyID,
-					Sig:   base64.StdEncoding.EncodeToString(sigBytes),
-				},
-			},
-		}
-
-		envelopeJSON, err := json.MarshalIndent(envelope, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to marshal envelope: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Write output
 		outputPath := signOutputPath
 		if outputPath == "" {
 			outputPath = policyPath + ".signed"
@@ -349,38 +282,40 @@ This creates a DSSE-signed policy envelope that cannot be modified by the agent.
 	},
 }
 
-// createSignPAE creates a DSSE Pre-Authentication Encoding.
-func createSignPAE(payloadType string, payload []byte) []byte {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "DSSEv1 %d %s %d ", len(payloadType), payloadType, len(payload))
-	buf.Write(payload)
-	return buf.Bytes()
+var policyCmd = &cobra.Command{
+	Use:   "policy",
+	Short: "Inspect, sign, and verify .aflock policies",
 }
 
-// parseECDSAPrivateKey parses a PEM-encoded ECDSA private key.
-func parseECDSAPrivateKey(data []byte) (*ecdsa.PrivateKey, error) {
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("no PEM block found in key file")
-	}
+var policyVerifyCmd = &cobra.Command{
+	Use:   "verify <policy.aflock.signed>",
+	Short: "Verify a signed policy against the configured trust root",
+	Long: `Verify a DSSE-signed .aflock policy.
 
-	// Try EC private key format (SEC1) first
-	key, ecErr := x509.ParseECPrivateKey(block.Bytes)
-	if ecErr == nil {
-		return key, nil
-	}
+Loads the trust config from $AFLOCK_TRUST_CONFIG, <policy_dir>/aflock-trust.json,
+or ~/.aflock/trust.json (first hit wins) and checks the embedded Fulcio cert
+against the declared issuer + subjectPattern.
 
-	// Try PKCS8
-	pkcs8Key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if pkcs8Err != nil {
-		return nil, fmt.Errorf("failed to parse private key (SEC1: %v; PKCS8: %w)", ecErr, pkcs8Err)
-	}
-
-	ecKey, ok := pkcs8Key.(*ecdsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("key is not an ECDSA private key (got %T)", pkcs8Key)
-	}
-	return ecKey, nil
+Exits 0 if verification passed, 1 otherwise. Prints the verified identity to
+stdout on success.`,
+	Args: cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		pol, _, err := policy.Load(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Verification failed: %v\n", err)
+			os.Exit(1)
+		}
+		if pol.SignatureInfo == nil {
+			fmt.Fprintf(os.Stderr, "Policy loaded but no signature info — not a signed envelope?\n")
+			os.Exit(1)
+		}
+		out, err := json.MarshalIndent(pol.SignatureInfo, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Marshal signature info: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+	},
 }
 
 // plan-to-policy command flags
@@ -680,6 +615,8 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(signCmd)
+	rootCmd.AddCommand(policyCmd)
+	policyCmd.AddCommand(policyVerifyCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(planToPolicyCmd)
 	rootCmd.AddCommand(replayCmd)
@@ -695,8 +632,8 @@ func init() {
 	verifyCmd.Flags().BoolVar(&verifySkipAI, "skip-ai", false, "Skip Phase 5 (AI Evaluation) — saves cost, no network needed")
 
 	// Sign command flags
-	signCmd.Flags().StringVarP(&signKeyPath, "key", "k", "", "Path to ECDSA private key PEM file (or set AFLOCK_SIGNING_KEY)")
 	signCmd.Flags().StringVarP(&signOutputPath, "output", "o", "", "Output path for signed envelope (default: <input>.signed, use - for stdout)")
+	signCmd.Flags().StringVarP(&signKeyPath, "key", "k", "", "Path to PEM-encoded private key (ECDSA / RSA / Ed25519). Falls back to $AFLOCK_SIGNING_KEY. When unset, signs via Sigstore Fulcio.")
 
 	// Plan-to-policy command flags
 	planToPolicyCmd.Flags().StringVar(&planPath, "plan", "", "Path to Claude plan markdown file (required)")
