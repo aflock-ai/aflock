@@ -130,7 +130,7 @@ func Simulate(session *Session, pol *aflock.Policy, policyPath string) (*Simulat
 		// flagged as exceeded; matches the live hook-handler behavior.
 		if pol.Limits != nil {
 			exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "fail-fast")
-			if exceeded && !evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) && !report.LimitExceeded {
+			if exceeded && !evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) && !report.LimitExceeded {
 				report.LimitExceeded = true
 				report.LimitMessage = fmt.Sprintf("%s: %s", limitName, msg)
 			}
@@ -176,7 +176,7 @@ func Simulate(session *Session, pol *aflock.Policy, policyPath string) (*Simulat
 	// ── Phase 4: SessionEnd — post-hoc limit check ──
 	if pol.Limits != nil {
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
-		if exceeded && !evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) && !report.LimitExceeded {
+		if exceeded && !evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) && !report.LimitExceeded {
 			report.LimitExceeded = true
 			report.LimitMessage = fmt.Sprintf("post-hoc: %s: %s", limitName, msg)
 		}

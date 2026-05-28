@@ -689,7 +689,7 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 
 		exceeded, limitName, msg := evaluator.CheckLimits(metricsForLimits, "fail-fast")
 		if exceeded {
-			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, metricsForLimits.CostMeasured) {
 				fmt.Fprintf(os.Stderr,
 					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced — JSONL-derived cost is approximate under non-api_key sessions): %s\n",
 					limitName, sessionState.AuthMode, msg)
@@ -1176,7 +1176,7 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 		evaluator := policy.NewEvaluator(childState.Policy, filepath.Dir(childState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(childState.Metrics, "post-hoc")
 		if exceeded {
-			if evaluator.IsAdvisoryLimit(limitName, childState.AuthMode) {
+			if evaluator.IsAdvisoryLimit(limitName, childState.AuthMode, childState.Metrics.CostMeasured) {
 				fmt.Fprintf(os.Stderr,
 					"[aflock] Advisory: subagent %s exceeded under auth_mode=%s (not enforced): %s\n",
 					limitName, childState.AuthMode, msg)
@@ -1238,7 +1238,7 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 			}
 		}
 		if exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc"); exceeded {
-			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) {
 				fmt.Fprintf(os.Stderr,
 					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced): %s\n",
 					limitName, sessionState.AuthMode, msg)

@@ -998,23 +998,26 @@ func matchGrantPattern(value string, patterns []string) (bool, string) {
 }
 
 // IsAdvisoryLimit reports whether a named limit must be downgraded
-// from enforce to advisory under the given auth mode. Cost-derived
-// limits (maxSpendUSD) are advisory under non-api_key modes because
-// the JSONL-derived dollar number doesn't include claude-code's
-// internal helper calls (title-gen haiku, compaction) and so cannot
-// match a subscription bill. Token limits (maxTokensIn/Out) stay
-// enforced under both modes because the transcript's token counts
-// match Anthropic's accounting for visible turns regardless of how
-// the session is billed.
+// from enforce to advisory. Cost-derived limits (maxSpendUSD) are
+// advisory unless we have an authoritative dollar figure, which means
+// BOTH: api_key billing (the JSONL cost matches the bill) AND every
+// model in the session was priceable (costMeasured). An unpriced model
+// computes as $0, so enforcing against that number would silently let
+// a session blow past maxSpendUSD — costMeasured=false keeps the cap
+// advisory instead of falsely enforcing an under-count. Token limits
+// (maxTokensIn/Out, maxTurns, maxToolCalls) stay enforced under every
+// mode because transcript token counts are accurate regardless of how
+// the session is billed; costMeasured does not affect them.
 //
-// Returns false when authMode is empty or api_key — i.e., enforce.
-func (e *Evaluator) IsAdvisoryLimit(limitName, authMode string) bool {
-	if authMode == "" || authMode == "api_key" {
+// Empty authMode preserves the legacy enforce-everything behavior for
+// sessions/tests that predate auth-mode capture.
+func (e *Evaluator) IsAdvisoryLimit(limitName, authMode string, costMeasured bool) bool {
+	if authMode == "" {
 		return false
 	}
 	switch limitName {
 	case "maxSpendUSD":
-		return true
+		return authMode != "api_key" || !costMeasured
 	}
 	return false
 }

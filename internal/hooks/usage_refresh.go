@@ -1,6 +1,9 @@
 package hooks
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/aflock-ai/aflock/internal/usage"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -36,15 +39,21 @@ func refreshUsageFromTranscript(state *aflock.SessionState, transcriptPath, auth
 	}
 	cost := usage.Compute(u)
 	state.Metrics.UsageSource = cost.Source
-	if authMode == "api_key" {
-		state.Metrics.CostUSD = cost.TotalUSD
+	state.Metrics.CostUSD = cost.TotalUSD
+
+	// Cost is authoritative only under api_key AND when every model in
+	// the transcript was priceable. An unpriced model contributes $0 to
+	// the total, so a session running one would silently slip under
+	// maxSpendUSD — mark cost unmeasured (keeps the cap advisory via
+	// IsAdvisoryLimit) and warn loudly so the gap is visible in audit.
+	if authMode == "api_key" && len(cost.UnknownModels) == 0 {
 		state.Metrics.CostMeasured = true
 	} else {
-		// Keep the computed value visible for diagnostics, but mark it
-		// unmeasured so audit downstream knows not to enforce against
-		// it. Policy.Evaluator.IsAdvisoryLimit makes the same call on
-		// the enforcement side.
-		state.Metrics.CostUSD = cost.TotalUSD
 		state.Metrics.CostMeasured = false
+		if authMode == "api_key" && len(cost.UnknownModels) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"[aflock] Warning: %d unpriced model(s) %v in transcript — cost is under-counted, maxSpendUSD downgraded to advisory. Add rates via AFLOCK_PRICE_* or update internal/usage/pricing.go.\n",
+				len(cost.UnknownModels), cost.UnknownModels)
+		}
 	}
 }

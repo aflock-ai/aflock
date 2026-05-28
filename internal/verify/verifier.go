@@ -304,7 +304,7 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
 		if exceeded {
-			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode) {
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) {
 				result.Warnings = append(result.Warnings,
 					fmt.Sprintf("advisory: %s exceeded under auth_mode=%s — %s", limitName, sessionState.AuthMode, msg))
 				result.Checks = append(result.Checks, CheckResult{
