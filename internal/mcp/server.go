@@ -275,6 +275,11 @@ func (s *Server) Serve(policyPath string) error {
 		return err
 	}
 
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
+		return err
+	}
+
 	// Identity discovery + policy-digest binding per paper §3.1.
 	s.initAgentIdentity()
 
@@ -346,6 +351,11 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 
 	// Refuse to start with an already-expired policy (#136).
 	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
 		return err
 	}
 
@@ -504,6 +514,11 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		return err
 	}
 
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
+		return err
+	}
+
 	// Refuse to start if the socket path already exists. Lstat (not Stat)
 	// so a dangling symlink also blocks us — an attacker pre-creating either
 	// a file or a symlink at the path could otherwise win the bind race.
@@ -629,6 +644,24 @@ func (s *Server) errPolicyExpired() error {
 		return nil
 	}
 	return fmt.Errorf("policy %q expired at %s", s.policy.Name, s.policy.Expires.Format(time.RFC3339))
+}
+
+// warnSubagentMisconfig logs a startup WARNING (or, with AFLOCK_STRICT=1,
+// returns an error to refuse startup) when the loaded policy permits spawning
+// an unconstrained subagent — the issue #100 enforcement bypass. In MCP mode a
+// subagent's native Bash/Write/Edit never route through aflock at all, so this
+// startup notice is the only point aflock can flag the misconfiguration to the
+// operator (deny Task/Agent in .claude/settings.local.json too).
+func (s *Server) warnSubagentMisconfig() error {
+	warn, msg := policy.CheckSubagentMisconfig(s.policy)
+	if !warn {
+		return nil
+	}
+	if os.Getenv("AFLOCK_STRICT") == "1" {
+		return fmt.Errorf("[aflock] %s (AFLOCK_STRICT=1)", msg)
+	}
+	fmt.Fprintf(os.Stderr, "[aflock] WARNING (#100): %s\n", msg)
+	return nil
 }
 
 // computePolicyDigest returns the SHA-256 digest of the loaded policy.

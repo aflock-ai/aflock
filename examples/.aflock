@@ -13,7 +13,7 @@
 
   "tools": {
     "allow": ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "mcp__*"],
-    "deny": ["Task"]
+    "deny": ["Task", "Agent"]
   },
 
   "dataFlow": {

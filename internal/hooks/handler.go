@@ -128,6 +128,17 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return nil
 	}
 
+	// Subagent-bypass guardrail (#100): a policy that permits Task/Agent without
+	// declaring sublayouts lets the agent spawn an unconstrained subagent whose
+	// native tools bypass aflock. Warn at session start; AFLOCK_STRICT=1 refuses.
+	if warn, msg := policy.CheckSubagentMisconfig(pol); warn {
+		if os.Getenv("AFLOCK_STRICT") == "1" {
+			output.ExitWithError(fmt.Sprintf("[aflock] %s (AFLOCK_STRICT=1)", msg))
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "[aflock] WARNING (#100): %s\n", msg)
+	}
+
 	// Discover agent identity. If the policy has identity constraints
 	// (AllowedModels), a discovery failure must block the session — otherwise
 	// the constraint is silently bypassed (issue #60 / H7).
@@ -1532,7 +1543,7 @@ func attestationMatchesName(path, name string) bool {
 
 // isSubagentSpawn returns true if the tool triggers a subagent spawn.
 func isSubagentSpawn(toolName string) bool {
-	return toolName == "Agent" || toolName == "Task"
+	return aflock.IsSubagentSpawn(toolName)
 }
 
 // matchSublayoutForSpawn finds the declared sublayout this spawn should bind
