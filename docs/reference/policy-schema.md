@@ -120,6 +120,18 @@ Complete reference for the `.aflock` policy file format.
 | `name` | string | Yes | Human-readable policy name |
 | `expires` | string | No | ISO-8601 expiration datetime |
 
+### Tools
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `allow` | string[] | Permitted tools/patterns. If non-empty, any tool not matched is denied. |
+| `deny` | string[] | Always-blocked tools/patterns. |
+| `requireApproval` | string[] | Patterns that prompt for human confirmation. |
+
+- **Precedence:** `deny` > `requireApproval` > `allow`. A tool in both `allow` and `deny` is denied.
+- **Matching:** glob-based. A wildcard-free literal (e.g. `Task`) matches that exact tool name only — `deny: ["Task"]` does **not** cover `Agent`. Use `Tool:pattern` to scope by command/argument (e.g. `Bash:rm -rf *`).
+- **Subagent spawn tools:** `Task` and `Agent` spawn a subagent whose native tools bypass aflock — deny **both** (issue #100). See [Policies › Subagent trust boundary](../concepts/policies.md#subagent-trust-boundary-issue-100).
+
 ### Limits
 
 | Field | Type | Description |

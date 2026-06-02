@@ -4,8 +4,10 @@ sidebar_position: 4
 
 # Sublayouts
 
-:::caution Active Development
-The sublayout security model is partially implemented. **Numeric limit attenuation** (invariant 1) and **metric accumulation** (invariant 2) work. **Attestation namespacing** (invariant 3), **recursive verification** (invariant 4), the `inherit` field, and constraint enforcement during sub-agent execution are not yet implemented. See [#26](https://github.com/aflock-ai/aflock/issues/26). **We're looking for contributors in this area.**
+:::caution Implementation status
+**Limit attenuation** (invariant 1), **metric accumulation** (invariant 2), **attestation namespacing** (invariant 3), and **recursive verification** (invariant 4) are implemented; the `inherit` field is applied at verification time. See [#26](https://github.com/aflock-ai/aflock/issues/26).
+
+What sublayouts do **not** provide is real-time enforcement of a spawned subagent's own *native* tool calls. Those route through Claude Code's harness, not aflock, so aflock can gate the **spawn** (deny it, or require it to match a declared sublayout — hook mode only) and account for the child after the fact, but cannot block the child's individual `Bash`/`Write`/`Edit` calls. See the [subagent trust boundary](policies.md#subagent-trust-boundary-issue-100) (issue #100).
 :::
 
 Inspired by [in-toto sublayouts](https://github.com/in-toto/specification), aflock supports **hierarchical sub-agent delegation** with mandatory constraint attenuation.
