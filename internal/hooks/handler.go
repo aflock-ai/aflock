@@ -468,6 +468,24 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
 	}
 
+	// The on-disk policy must still match the digest frozen at session init —
+	// an agent that rewrites .aflock mid-session must gain nothing from the
+	// edit. Fail closed on any mismatch or read error (issue #100).
+	if denied, reason := policy.CheckPolicyTamper(sessionState.PolicyPath, sessionState.PolicyDigest); denied {
+		return output.Write(output.PreToolUseDeny(reason))
+	}
+
+	// Self-protection guard: aflock's own guardrail files (the policy file,
+	// .aflock in cwd, .claude/settings.json hook wiring) are off-limits to
+	// the agent BEFORE policy evaluation, so even a policy that allows Write
+	// cannot permit modifying them (issue #100).
+	var guardInput map[string]interface{}
+	_ = json.Unmarshal(input.ToolInput, &guardInput)
+	protected := policy.ProtectedPaths(sessionState.PolicyPath, input.Cwd)
+	if denied, reason := policy.CheckSelfProtect(input.ToolName, guardInput, protected); denied {
+		return output.Write(output.PreToolUseDeny(reason))
+	}
+
 	// Defense in depth: re-check identity constraints against the persisted
 	// AgentIdentityMeta. SessionStart already enforced this, but state could
 	// have been tampered with between hooks (issue #121).

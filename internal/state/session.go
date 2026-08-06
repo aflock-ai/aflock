@@ -2,6 +2,8 @@
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -179,7 +181,7 @@ func (m *Manager) LockSession(sessionID string) (func(), error) {
 
 // Initialize creates a new session state.
 func (m *Manager) Initialize(sessionID string, policy *aflock.Policy, policyPath string) *aflock.SessionState {
-	return &aflock.SessionState{
+	state := &aflock.SessionState{
 		SessionID:  sessionID,
 		StartedAt:  time.Now(),
 		Policy:     policy,
@@ -188,6 +190,26 @@ func (m *Manager) Initialize(sessionID string, policy *aflock.Policy, policyPath
 			Tools: make(map[string]int),
 		},
 	}
+	// Freeze the on-disk policy digest so PreToolUse can detect a mid-session
+	// rewrite of the policy file (issue #100). Best-effort: an unreadable
+	// path (tests seed sessions with fake paths) leaves the digest empty,
+	// which skips the tamper check rather than breaking legacy sessions.
+	if policyPath != "" {
+		if digest, err := hashFile(policyPath); err == nil {
+			state.PolicyDigest = digest
+		}
+	}
+	return state
+}
+
+// hashFile returns the SHA-256 hex digest of the file's raw bytes.
+func hashFile(path string) (string, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: policy path from validated session init
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // RecordAction records an action in the session state.

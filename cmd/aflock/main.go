@@ -90,6 +90,28 @@ var initCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		fmt.Println("Created .aflock policy template")
+
+		if initNoHooks {
+			fmt.Println("Skipped hook installation (--no-hooks). Note: without hooks in .claude/settings.json, subagent native tool calls bypass aflock (issue #100).")
+			return
+		}
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to resolve cwd: %v\n", err)
+			os.Exit(1)
+		}
+		settingsPath, added, err := installAflockHooks(cwd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to install hooks: %v\n", err)
+			os.Exit(1)
+		}
+		if len(added) == 0 {
+			fmt.Printf("aflock hooks already present in %s — nothing to do\n", settingsPath)
+			return
+		}
+		fmt.Printf("Installed aflock hooks in %s (%d events: %v)\n", settingsPath, len(added), added)
+		fmt.Println("Hooks are the enforcement floor: unlike MCP-only integration, settings.json hooks also intercept subagent native tool calls (issue #100).")
 	},
 }
 
@@ -608,6 +630,7 @@ For Unix-domain socket (kernel-attested peer-cred identity, issue #63):
 }
 
 var hookFlag string
+var initNoHooks bool
 
 func init() {
 	rootCmd.AddCommand(hookCmd)
@@ -623,6 +646,9 @@ func init() {
 
 	// Add --hook flag as alternative to hook subcommand for backwards compatibility
 	rootCmd.Flags().StringVar(&hookFlag, "hook", "", "Hook event to handle (alternative to 'hook' subcommand)")
+
+	// Init command flags
+	initCmd.Flags().BoolVar(&initNoHooks, "no-hooks", false, "Skip installing aflock hooks into .claude/settings.json")
 
 	// Verify command flags
 	verifyCmd.Flags().StringVarP(&verifyPolicyPath, "policy", "p", "", "Path to .aflock policy file (enables step-based verification)")
