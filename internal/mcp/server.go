@@ -81,9 +81,9 @@ type Server struct {
 	// generated when ServeHTTP starts, written to a 0600 file under the
 	// session dir so only the same-UID caller can read it, and cleared from
 	// memory + disk once consumed (one-time use).
-	httpBootstrapSecret      string
-	httpBootstrapSecretPath  string
-	httpBootstrapSecretMu    sync.Mutex
+	httpBootstrapSecret     string
+	httpBootstrapSecretPath string
+	httpBootstrapSecretMu   sync.Mutex
 }
 
 // NewServer creates a new aflock MCP server.

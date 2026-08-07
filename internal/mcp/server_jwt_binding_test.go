@@ -37,8 +37,8 @@ func TestBuildJWTBinding_NoTokenInRequest(t *testing.T) {
 // its issuance log to prove "this action used that token."
 func TestBuildJWTBinding_Happy(t *testing.T) {
 	s := newTestServerWithPolicy(t, &aflock.Policy{
-		Name:    "happy-binding",
-		Tools:   &aflock.ToolsPolicy{Allow: []string{"Bash"}, Deny: []string{"WebFetch"}},
+		Name:  "happy-binding",
+		Tools: &aflock.ToolsPolicy{Allow: []string{"Bash"}, Deny: []string{"WebFetch"}},
 	})
 	issuer, err := auth.NewTokenIssuer()
 	if err != nil {

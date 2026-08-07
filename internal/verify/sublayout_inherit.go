@@ -40,9 +40,10 @@ func applyInherit(parent, child *aflock.Policy, inheritFields []string) *aflock.
 				out.Domains = parent.Domains
 			}
 		case "functionaries":
-			// Two fields carry functionaries: top-level Functionaries
-			// (legacy) and Steps.Functionaries (current). Inherit fills
-			// whichever the child left empty.
+			// Only the legacy top-level Functionaries field is inherited.
+			// Per-step functionaries (Steps[].Functionaries) are never
+			// filled from the parent — a child that defines steps must
+			// declare their functionaries itself.
 			if len(out.Functionaries) == 0 && len(parent.Functionaries) > 0 {
 				out.Functionaries = parent.Functionaries
 			}

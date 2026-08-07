@@ -2,7 +2,6 @@ package state
 
 import (
 	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 
@@ -14,42 +13,26 @@ import (
 // inheritance. The old code keyed by policy path only and silently
 // overwrote, leaving all-but-one child empty-handed.
 //
-// NOTE on isolation: propagationBaseDir() points at ~/.aflock/propagation/
-// (real user home, not the test's tmpDir — pre-existing behavior). Each
-// test here uses a unique policy path and cleans up its own files at
-// teardown so cross-test pollution stays bounded.
+// NOTE on isolation: propagationBaseDir() resolves ~ via HOME, so each test
+// points HOME at its own temp dir (isolatePropagationHome) — nothing here
+// reads or writes the developer's real ~/.aflock. Requires non-parallel
+// tests (t.Setenv).
 
 func uniquePolicyPath(t *testing.T) string {
 	t.Helper()
 	return "/test-issue26/" + t.Name() + "/.aflock"
 }
 
-// cleanupPropagation removes any leftover files for the test's policy path
-// at end of test, defending against state shared via the real ~/.aflock
-// dir from concurrent failures.
-func cleanupPropagation(t *testing.T, policyPath string) {
+func isolatePropagationHome(t *testing.T) {
 	t.Helper()
-	t.Cleanup(func() {
-		prefix := propagationKeyPrefix(policyPath)
-		dir := propagationBaseDir()
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if len(name) >= len(prefix) && name[:len(prefix)] == prefix {
-				_ = os.Remove(filepath.Join(dir, name))
-			}
-		}
-	})
+	t.Setenv("HOME", t.TempDir())
 }
 
 func TestPropagation_ConcurrentWritesAreDistinctFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(tmpDir)
+	isolatePropagationHome(t)
 	policyPath := uniquePolicyPath(t)
-	cleanupPropagation(t, policyPath)
 
 	const N = 5
 	for i := 0; i < N; i++ {
@@ -84,8 +67,8 @@ func TestPropagation_ConcurrentWritesAreDistinctFiles(t *testing.T) {
 func TestPropagation_MultipleReadersEachGetARecord(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(tmpDir)
+	isolatePropagationHome(t)
 	policyPath := uniquePolicyPath(t)
-	cleanupPropagation(t, policyPath)
 
 	const N = 4
 	for i := 0; i < N; i++ {
@@ -135,10 +118,9 @@ func TestPropagation_MultipleReadersEachGetARecord(t *testing.T) {
 func TestPropagation_PrefixOnlyMatchesOwnPolicy(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(tmpDir)
+	isolatePropagationHome(t)
 	pathA := uniquePolicyPath(t) + "/a"
 	pathB := uniquePolicyPath(t) + "/b"
-	cleanupPropagation(t, pathA)
-	cleanupPropagation(t, pathB)
 
 	parentA := testParentState()
 	parentA.PolicyPath = pathA

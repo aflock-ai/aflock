@@ -205,7 +205,7 @@ type SignatureInfo struct {
 // TrustConfig declares which signing identities aflock will accept for policy
 // envelopes. Loaded from aflock-trust.json — see internal/policy/trust.go.
 type TrustConfig struct {
-	Version   string           `json:"version"`
+	Version   string            `json:"version"`
 	Verifiers []TrustedVerifier `json:"verifiers"`
 }
 

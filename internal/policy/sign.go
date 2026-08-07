@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"os"
 
-	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/cryptoutil"
+	rdsse "github.com/aflock-ai/rookery/attestation/dsse"
 	"github.com/aflock-ai/rookery/attestation/timestamp"
 	fulcioSigner "github.com/aflock-ai/rookery/plugins/signers/fulcio"
 )
