@@ -147,15 +147,125 @@ Explicit authorization for resource access:
 }
 ```
 
-## Signing and Immutability
+## Signing and trust
 
-Policies are signed using a DSSE (Dead Simple Signing Envelope):
+aflock signs `.aflock` policies as DSSE envelopes using a Sigstore Fulcio-issued
+short-lived certificate bound to the signer's OIDC identity. There's no
+long-lived signing key to lose. Verification at `policy.Load` time chains the
+embedded cert to the Sigstore root and matches it against an operator-controlled
+`aflock-trust.json`.
+
+### Sign
+
+Two signer paths; pick by flag/env:
+
+**Sigstore keyless (default).** Fulcio issues an ephemeral cert bound to the
+caller's OIDC identity; aflock bundles an RFC 3161 timestamp from the
+Sigstore TSA so the signature outlives the cert's 10-minute window.
 
 ```bash
-aflock sign policy.aflock
+GITHUB_ACTIONS=true aflock sign .aflock         # in CI with id-token: write
+FULCIO_OIDC_ISSUER=https://oauth2.sigstore.dev/auth aflock sign .aflock  # local browser flow
+FULCIO_TOKEN=<jwt> aflock sign .aflock          # OIDC token provided out-of-band
 ```
 
-Once signed, the agent cannot modify the policy. The signature is verified during every attestation check.
+**Raw key (`--key` / `$AFLOCK_SIGNING_KEY`).** Operator-managed PEM private
+key (ECDSA, RSA, or Ed25519). No network at sign time, no TSA needed (raw
+keys don't have a Fulcio-style validity window).
+
+```bash
+aflock sign .aflock --key ./team-signing.priv.pem
+```
+
+The produced `.aflock.signed` is a DSSE envelope
+(`payloadType: application/vnd.aflock.policy+json`). For Sigstore: contains
+the Fulcio leaf cert + TSA timestamp. For raw-key: just the signature + keyid.
+
+### Trust config
+
+Trust roots live in `aflock-trust.json`, resolved in this order (first hit wins):
+
+1. `$AFLOCK_TRUST_CONFIG` (explicit operator override)
+2. `~/.aflock/trust.json` (per-user default)
+
+There is intentionally NO `<policy_dir>/aflock-trust.json` fallback. If trust
+lived next to the policy, anyone with write access to the policy could also
+rewrite its trust root — which collapses the "signed by authorized
+principals" guarantee into ordinary repo-write access. Operators must point
+`$AFLOCK_TRUST_CONFIG` at a path the policy author can't reach, or rely on
+the per-user `~/.aflock/trust.json`.
+
+```json
+{
+  "version": "1",
+  "verifiers": [
+    {
+      "type": "sigstore",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "subjectPattern": "https://github.com/org/repo/.github/workflows/sign-policy.yml@refs/heads/main"
+    },
+    {
+      "type": "pubkey",
+      "keyPath": "/etc/aflock/team-signing.pub.pem"
+    }
+  ]
+}
+```
+
+`sigstore` verifiers match Fulcio-issued certs against `{Issuer,
+SubjectPattern}`. `subjectPattern` is **exact-match** against the cert's
+SAN email (for human OIDC identities like Google/GitHub login) or SAN URI
+(for CI workflow identities) — rookery's underlying `CertConstraint` does
+not glob-match SAN fields. Wildcards like `*@gmail.com` will NOT match;
+pin the exact identity instead. `FulcioRootPath` overrides the embedded
+production root for self-hosted Sigstore.
+
+`pubkey` verifiers load a PEM-encoded public key from `KeyPath`. ECDSA, RSA,
+and Ed25519 are accepted. Optional `keyid` enforces an exact SHA-256
+fingerprint match — leave unset to accept any signature that verifies against
+the loaded key.
+
+Multiple verifiers can coexist; a signature passing any one of them is
+accepted.
+
+The trust config is **not** part of the policy — an attacker who can write the
+policy must not be able to declare their own trust root. Keep it in
+operator-controlled locations.
+
+### Verify
+
+```bash
+aflock policy verify .aflock.signed
+# exits 0 + prints SignatureInfo on success, 1 on failure
+```
+
+### Enforcement modes
+
+By default, `policy.Load` warns when loading an unsigned policy but still
+proceeds (so existing unsigned deployments keep working through migration).
+Set `AFLOCK_REQUIRE_SIGNED_POLICY=1` to refuse unsigned policies.
+
+Any DSSE-envelope-shaped file is treated as "must verify or hard-fail." This
+closes the silent-degrade bug where passing an envelope to a pre-signing
+`policy.Load` returned an empty allow-most policy.
+
+### TSA timestamping
+
+Every signed envelope bundles an RFC 3161 timestamp from the Sigstore
+Public Good TSA (`https://timestamp.sigstore.dev/api/v1/timestamp`). Verifiers
+use the TSA-attested time when checking the Fulcio leaf cert's validity, so
+signatures stay verifiable past the cert's ~10-minute window. Sign once,
+verify forever.
+
+`$AFLOCK_TSA_URL` overrides the endpoint for self-hosted Sigstore.
+`$AFLOCK_TSA_DISABLE=1` skips timestamping at sign time (the resulting
+envelope only verifies inside the Fulcio cert window — only useful for
+air-gapped tests).
+
+Self-hosted TSA must also pin TSA roots at verify time. Set
+`tsaRootPath` on the trust-config verifier (or `$AFLOCK_TSA_ROOTS`) to a
+PEM chain that matches the signing TSA; otherwise verification falls back
+to the embedded Sigstore production chain and timestamp validation fails.
 
 ## Functionaries
 

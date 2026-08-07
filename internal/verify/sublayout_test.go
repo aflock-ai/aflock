@@ -56,7 +56,7 @@ func TestVerifyAttenuation_Violation_SpendExceeds(t *testing.T) {
 	if len(violations) != 1 {
 		t.Fatalf("Expected 1 violation, got %d: %v", len(violations), violations)
 	}
-	if violations[0] != "maxSpendUSD: child 10.00 > parent 5.00" {
+	if violations[0] != "maxSpendUSD: sublayout 10.00 > parent 5.00" {
 		t.Errorf("Unexpected violation: %s", violations[0])
 	}
 }
@@ -135,6 +135,57 @@ func TestMatchesSublayout_NilPolicy(t *testing.T) {
 	sub := &aflock.Sublayout{Name: "test"}
 	if matchesSublayout(child, sub) {
 		t.Error("Expected no match for nil policy")
+	}
+}
+
+// TestMatchesSublayout_ByParentSublayoutName_Match covers the precise
+// spawn-time binding set by PR #112 / handler.go SessionStart. A child
+// stamped with ParentSublayoutName="researcher" must match the
+// "researcher" sublayout declaration.
+func TestMatchesSublayout_ByParentSublayoutName_Match(t *testing.T) {
+	child := &aflock.SessionState{
+		Policy:              &aflock.Policy{Name: "anything-else"},
+		ParentSessionID:     "parent-001",
+		ParentSublayoutName: "researcher",
+	}
+	sub := &aflock.Sublayout{Name: "researcher"}
+	if !matchesSublayout(child, sub) {
+		t.Error("Expected match by ParentSublayoutName binding")
+	}
+}
+
+// TestMatchesSublayout_ByParentSublayoutName_NoMatchWrongSlot is the
+// core regression for #26's "wrong-slot misattribution" fix. A child
+// bound to sublayout "researcher" at spawn time MUST NOT match a
+// different sublayout "writer" during verify, even though the lax
+// pre-PR-A code would match anything with ParentSessionID set.
+func TestMatchesSublayout_ByParentSublayoutName_NoMatchWrongSlot(t *testing.T) {
+	child := &aflock.SessionState{
+		Policy:              &aflock.Policy{Name: "writer"}, // sneaky: name collides with the OTHER slot
+		ParentSessionID:     "parent-001",                   // would have matched loose branch (4)
+		ParentSublayoutName: "researcher",                   // authoritative: this child is a researcher
+	}
+	wrongSlot := &aflock.Sublayout{Name: "writer", AttestationPrefix: "writer"}
+	if matchesSublayout(child, wrongSlot) {
+		t.Error("Child bound to 'researcher' must not match the 'writer' slot, even though Policy.Name and AttestationPrefix would loose-match")
+	}
+}
+
+// TestMatchesSublayout_PreciseBindingOverridesLegacyFallbacks asserts
+// branch (1) is authoritative: when ParentSublayoutName is set, the
+// legacy policy-name / attestation-prefix / parent-id branches don't get
+// to vote. The precise binding wins, even returning false.
+func TestMatchesSublayout_PreciseBindingOverridesLegacyFallbacks(t *testing.T) {
+	child := &aflock.SessionState{
+		Policy:              &aflock.Policy{Name: "match-everything"},
+		ParentSessionID:     "parent-001",
+		ParentSublayoutName: "slot-A",
+	}
+	// Sublayout where every legacy fallback would have matched.
+	sub := &aflock.Sublayout{Name: "match-everything", AttestationPrefix: "match-everything"}
+	// But the precise binding says slot-A, not match-everything.
+	if matchesSublayout(child, sub) {
+		t.Error("Precise binding (slot-A) must override legacy name/prefix/parent-id fallbacks")
 	}
 }
 
@@ -408,6 +459,96 @@ func TestVerifySession_SublayoutNoChildSessions(t *testing.T) {
 		if c.Name == "sublayout" {
 			t.Error("Should not have sublayout check when no child sessions")
 		}
+	}
+}
+
+// TestVerifySession_SublayoutPreciseBindingPreventsCrossMatch is the
+// end-to-end regression for #26 wrong-slot misattribution.
+//
+// Scenario: parent declares two sublayouts, "researcher" and "writer".
+// Exactly one child was spawned, matched to "researcher" by PR #112's
+// spawn-time logic (so ParentSublayoutName="researcher"). The child's
+// own policy is named "writer" — a deliberately-chosen confusable name
+// that would have made the pre-PR-A loose matching attribute the child
+// to BOTH slots. After the fix, the child verifies against "researcher"
+// only and "writer" reports "no matching child session found".
+func TestVerifySession_SublayoutPreciseBindingPreventsCrossMatch(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	childState := &aflock.SessionState{
+		SessionID:           "child-precise",
+		StartedAt:           time.Now().Add(-2 * time.Minute),
+		ParentSessionID:     "parent-precise",
+		ParentSublayoutName: "researcher", // PR #112 spawn-time binding
+		Policy: &aflock.Policy{
+			Name:    "writer", // confusable name; pre-fix would also match "writer" slot
+			Version: "1.0",
+		},
+		Metrics: &aflock.SessionMetrics{
+			CostUSD: 1.00,
+			Tools:   map[string]int{"Read": 5},
+		},
+		Actions: []aflock.ActionRecord{
+			{Timestamp: time.Now(), ToolName: "Read", ToolUseID: "c1", Decision: "allow"},
+		},
+	}
+	writeSessionState(t, tmpDir, "child-precise", childState)
+
+	parentState := &aflock.SessionState{
+		SessionID: "parent-precise",
+		StartedAt: time.Now().Add(-5 * time.Minute),
+		Policy: &aflock.Policy{
+			Name:    "main",
+			Version: "1.0",
+			Limits: &aflock.LimitsPolicy{
+				MaxSpendUSD: &aflock.Limit{Value: 20.0},
+			},
+			Sublayouts: []aflock.Sublayout{
+				{
+					Name:   "researcher",
+					Policy: "researcher.aflock",
+					Limits: &aflock.LimitsPolicy{
+						MaxSpendUSD: &aflock.Limit{Value: 10.0},
+					},
+				},
+				{
+					Name:   "writer",
+					Policy: "writer.aflock",
+					Limits: &aflock.LimitsPolicy{
+						MaxSpendUSD: &aflock.Limit{Value: 5.0},
+					},
+				},
+			},
+		},
+		Metrics:         &aflock.SessionMetrics{Tools: map[string]int{}},
+		ChildSessionIDs: []string{"child-precise"},
+	}
+	writeSessionState(t, tmpDir, "parent-precise", parentState)
+
+	v := newTestVerifier(tmpDir)
+	result, err := v.VerifySession("parent-precise")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+
+	// The "writer" slot has no matching child — verifySublayouts must
+	// report exactly that, not silently re-use the researcher child.
+	foundNoMatchForWriter := false
+	for _, e := range result.Errors {
+		if e == `sublayout "writer": no matching child session found` {
+			foundNoMatchForWriter = true
+		}
+	}
+	if !foundNoMatchForWriter {
+		t.Errorf("expected 'writer' slot to report no matching child; got errors: %v", result.Errors)
+	}
+
+	// The researcher slot should have matched the bound child without
+	// trying to double-verify it under writer's stricter limits.
+	if result.Success {
+		// Verify expected: writer's "no matching child" makes the overall
+		// result fail. Just sanity-check the failure mode is the right one.
+		t.Logf("result.Errors: %v", result.Errors)
 	}
 }
 

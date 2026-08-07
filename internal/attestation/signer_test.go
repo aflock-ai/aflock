@@ -722,6 +722,7 @@ func TestCreateActionAttestation_BasicAction(t *testing.T) {
 		"session-xyz",
 		metrics,
 		agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -867,6 +868,7 @@ func TestCreateActionAttestation_NilToolInput(t *testing.T) {
 		"session-nil",
 		nil, // nil metrics
 		nil, // nil agent identity
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation with nil input: %v", err)
@@ -922,6 +924,7 @@ func TestCreateActionAttestation_InvalidToolInputJSON(t *testing.T) {
 		"session-bad-json",
 		nil,
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation with bad JSON: %v", err)
@@ -950,9 +953,127 @@ func TestCreateActionAttestation_NoIdentity(t *testing.T) {
 		"session-no-id",
 		nil,
 		nil,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected error when creating attestation without identity")
+	}
+}
+
+// TestCreateActionAttestation_BinaryWithEmptyVersion regression-tests the
+// kernel-attested peer-cred path: when the BinaryIdentity has a Name but no
+// Version (peerBinaryIdentity intentionally leaves Version empty because the
+// Digest is the authoritative version), the predicate's binary string must
+// NOT carry a dangling "@" suffix. Closes #92.
+func TestCreateActionAttestation_BinaryWithEmptyVersion(t *testing.T) {
+	signer, _, _ := newSignerWithIdentity(t)
+
+	record := aflock.ActionRecord{
+		Timestamp: time.Now(),
+		ToolName:  "Read",
+		ToolUseID: "tu_kernel_attested",
+		Decision:  "allow",
+	}
+
+	// Mirrors what peerBinaryIdentity returns for a kernel-attested peer
+	// on macOS: a real basename + digest, no version string.
+	agentID := &identity.AgentIdentity{
+		Model:        "claude-opus-4-7",
+		ModelVersion: "4.7.0",
+		Binary: &identity.BinaryIdentity{
+			Name:    "socat1",
+			Version: "",
+			Path:    "/opt/homebrew/Cellar/socat/1.8.1.0/bin/socat1",
+			Digest:  "aba6184a9a8390e048193234b027fcbf134bd5306d90c8dd429fdc214b5b40f7",
+		},
+		IdentityHash: "abcdef1234567890",
+	}
+
+	env, err := signer.CreateActionAttestation(
+		context.Background(),
+		record,
+		"session-kernel",
+		nil,
+		agentID,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("CreateActionAttestation: %v", err)
+	}
+
+	payloadBytes, _ := base64.StdEncoding.DecodeString(env.Payload)
+	var stmt Statement
+	if err := json.Unmarshal(payloadBytes, &stmt); err != nil {
+		t.Fatalf("unmarshal statement: %v", err)
+	}
+	predicateJSON, _ := json.Marshal(stmt.Predicate)
+	var pred ActionPredicate
+	if err := json.Unmarshal(predicateJSON, &pred); err != nil {
+		t.Fatalf("unmarshal predicate: %v", err)
+	}
+
+	if pred.AgentIdentity == nil {
+		t.Fatal("agentIdentity should not be nil")
+	}
+	if pred.AgentIdentity.Binary != "socat1" {
+		t.Errorf("binary = %q, want %q (no trailing @ when Version is empty)",
+			pred.AgentIdentity.Binary, "socat1")
+	}
+	if pred.AgentIdentity.BinaryHash == "" {
+		t.Error("binaryHash should still be populated even with empty Version")
+	}
+}
+
+// TestCreateActionAttestation_BinaryWithEmptyName guards the symmetric
+// edge case Copilot flagged on PR #93: if Name is empty but Version is
+// somehow set (e.g. discovery returns "0.0.0" default without resolving
+// a path), the predicate must NOT emit a leading "@0.0.0" — it should
+// stay empty. Closes the empty-name half of the @ formatting fix.
+func TestCreateActionAttestation_BinaryWithEmptyName(t *testing.T) {
+	signer, _, _ := newSignerWithIdentity(t)
+
+	record := aflock.ActionRecord{
+		Timestamp: time.Now(),
+		ToolName:  "Read",
+		ToolUseID: "tu_empty_name",
+		Decision:  "allow",
+	}
+
+	agentID := &identity.AgentIdentity{
+		Model: "claude-opus-4-7",
+		Binary: &identity.BinaryIdentity{
+			Name:    "",
+			Version: "0.0.0",
+			Digest:  "sha256:placeholder",
+		},
+		IdentityHash: "abcdef1234567890",
+	}
+
+	env, err := signer.CreateActionAttestation(
+		context.Background(), record, "session-empty-name", nil, agentID,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("CreateActionAttestation: %v", err)
+	}
+
+	payloadBytes, _ := base64.StdEncoding.DecodeString(env.Payload)
+	var stmt Statement
+	if err := json.Unmarshal(payloadBytes, &stmt); err != nil {
+		t.Fatalf("unmarshal statement: %v", err)
+	}
+	predicateJSON, _ := json.Marshal(stmt.Predicate)
+	var pred ActionPredicate
+	if err := json.Unmarshal(predicateJSON, &pred); err != nil {
+		t.Fatalf("unmarshal predicate: %v", err)
+	}
+
+	if pred.AgentIdentity == nil {
+		t.Fatal("agentIdentity should not be nil")
+	}
+	if pred.AgentIdentity.Binary != "" {
+		t.Errorf("binary = %q, want empty (no leading @ when Name is missing)",
+			pred.AgentIdentity.Binary)
 	}
 }
 
@@ -980,6 +1101,7 @@ func TestCreateActionAttestation_AgentIdentityWithoutBinary(t *testing.T) {
 		"session-no-binary",
 		nil,
 		agentID,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CreateActionAttestation: %v", err)
@@ -1394,6 +1516,7 @@ func TestEndToEnd_SignAndVerify(t *testing.T) {
 		record,
 		"session-e2e-test",
 		metrics,
+		nil,
 		nil,
 	)
 	if err != nil {

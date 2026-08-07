@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	aflockMerkle "github.com/aflock-ai/aflock/internal/merkle"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -190,16 +191,44 @@ func (m *Manager) Initialize(sessionID string, policy *aflock.Policy, policyPath
 }
 
 // RecordAction records an action in the session state.
-// It is safe for concurrent use.
+// It is safe for concurrent use. Seq is stamped here so every action
+// carries a contiguous zero-based index for paper §4.4 Distance proofs
+// (issue #146). The pre-existing mutex serializes Seq assignment.
 func (m *Manager) RecordAction(state *aflock.SessionState, record aflock.ActionRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	record.Seq = int64(len(state.Actions))
 	state.Actions = append(state.Actions, record)
 	state.Metrics.ToolCalls++
 	if state.Metrics.Tools == nil {
 		state.Metrics.Tools = make(map[string]int)
 	}
 	state.Metrics.Tools[record.ToolName]++
+}
+
+// ComputeSessionMerkleRoot builds the RFC 6962 Merkle root over the session's
+// recorded actions and writes it to state.SessionMerkleRoot. Empty actions
+// list leaves the field untouched (no root to commit). Used at SessionEnd so
+// Phase 3 materials verification fires on real sessions without the policy
+// author having to set materialsFrom.session.merkleRoot up front (issue #119).
+func (m *Manager) ComputeSessionMerkleRoot(state *aflock.SessionState) error {
+	if state == nil || len(state.Actions) == 0 {
+		return nil
+	}
+	entries := make([][]byte, 0, len(state.Actions))
+	for i, action := range state.Actions {
+		data, err := json.Marshal(action)
+		if err != nil {
+			return fmt.Errorf("marshal action %d: %w", i, err)
+		}
+		entries = append(entries, data)
+	}
+	root, err := aflockMerkle.BuildRoot(entries)
+	if err != nil {
+		return fmt.Errorf("build merkle root: %w", err)
+	}
+	state.SessionMerkleRoot = root
+	return nil
 }
 
 // AttestationsDir returns the attestations directory for a session.

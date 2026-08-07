@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "name": "signed-policy-demo",
+  "identity": {
+    "allowedModels": ["claude-opus-4-7*", "claude-sonnet-4-*"],
+    "requiredTools": ["Read", "Edit"]
+  },
+  "tools": {
+    "allow": ["Read", "Edit", "Grep", "Glob"],
+    "deny": ["Bash", "Task", "WebFetch"],
+    "requireApproval": []
+  },
+  "files": {
+    "allow": ["src/**", "tests/**", "*.md"],
+    "deny": [".env*", "**/secrets/**", "**/.ssh/**"]
+  },
+  "limits": {
+    "maxSpendUSD": {"value": 0.50, "enforcement": "fail-fast"},
+    "maxTurns": {"value": 25, "enforcement": "post-hoc"}
+  }
+}

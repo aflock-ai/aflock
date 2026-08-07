@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -244,6 +245,35 @@ func TestPolicyDigestBinding(t *testing.T) {
 	assert.NotEmpty(t, claims2.PolicyDigest)
 }
 
+// TestPolicyDigest_SurvivesStateJSONRoundTrip pins the fix for the hooks
+// JWT-validation bug: a Policy with RawDigest set must round-trip through
+// JSON without losing the digest, so subprocess hooks that load
+// SessionState from disk compute the same digest the JWT was bound to at
+// SessionStart. Before the fix, RawDigest had `json:"-"` and was stripped
+// from state.json — re-marshaling the parsed struct then produced a
+// different digest and every PreToolUse call was rejected as "token bound
+// to a different policy version".
+func TestPolicyDigest_SurvivesStateJSONRoundTrip(t *testing.T) {
+	pol := &aflock.Policy{
+		Name:      "round-trip",
+		Version:   "1.0",
+		RawDigest: "deadbeefcafef00d1234567890abcdef",
+	}
+	before := ComputePolicyDigest(pol)
+	require.Equal(t, "deadbeefcafef00d1234567890abcdef", before)
+
+	data, err := json.Marshal(pol)
+	require.NoError(t, err)
+
+	var restored aflock.Policy
+	require.NoError(t, json.Unmarshal(data, &restored))
+
+	after := ComputePolicyDigest(&restored)
+	assert.Equal(t, before, after,
+		"RawDigest must survive JSON round-trip — otherwise hook subprocesses reject the parent's JWT")
+	assert.Equal(t, "deadbeefcafef00d1234567890abcdef", restored.RawDigest)
+}
+
 func TestNilPolicy(t *testing.T) {
 	issuer, err := NewTokenIssuer()
 	require.NoError(t, err)
@@ -286,4 +316,111 @@ func TestNewTokenIssuerFromSigner(t *testing.T) {
 	claims, err := issuer.ValidateToken(tokenStr)
 	require.NoError(t, err)
 	assert.Equal(t, "a1", claims.AgentID)
+}
+
+// TestPublicKeyRoundtrip exercises issue #48: hooks mode persists the JWT
+// public key to disk so a separate PreToolUse subprocess can validate the
+// token. Marshal → Parse must reproduce a working validation-only issuer.
+func TestPublicKeyRoundtrip(t *testing.T) {
+	signer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	tokenStr, err := signer.IssueToken("s1", "a1", "h1", nil, time.Hour)
+	require.NoError(t, err)
+
+	pemBytes, err := signer.MarshalPublicKey()
+	require.NoError(t, err)
+	assert.Contains(t, string(pemBytes), "-----BEGIN PUBLIC KEY-----")
+
+	validator, err := NewTokenIssuerFromPublicKey(pemBytes)
+	require.NoError(t, err)
+
+	// The cross-process validator accepts tokens issued by the original signer.
+	claims, err := validator.ValidateToken(tokenStr)
+	require.NoError(t, err)
+	assert.Equal(t, "a1", claims.AgentID)
+}
+
+// TestNewTokenIssuerFromPublicKey_RejectsTamperedPEM guards the parser
+// against malformed inputs that could otherwise turn into nil-pointer
+// surprises during validation.
+func TestNewTokenIssuerFromPublicKey_RejectsTamperedPEM(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":       []byte(""),
+		"not pem":     []byte("not a pem block"),
+		"empty block": []byte("-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n"),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewTokenIssuerFromPublicKey(data)
+			assert.Error(t, err)
+		})
+	}
+}
+
+// TestValidatorRejectsForeignToken — a token issued by a different signer
+// must fail validation, even though both keys are valid ECDSA P-256. This
+// is the security claim of the hooks-mode design: an attacker who swaps
+// the persisted pubkey file invalidates the existing token.
+func TestValidatorRejectsForeignToken(t *testing.T) {
+	signerA, err := NewTokenIssuer()
+	require.NoError(t, err)
+	signerB, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	tokenA, err := signerA.IssueToken("s1", "a1", "h1", nil, time.Hour)
+	require.NoError(t, err)
+
+	pemB, err := signerB.MarshalPublicKey()
+	require.NoError(t, err)
+	validatorB, err := NewTokenIssuerFromPublicKey(pemB)
+	require.NoError(t, err)
+
+	_, err = validatorB.ValidateToken(tokenA)
+	assert.Error(t, err)
+}
+
+func TestMintChildToken_MergesLimits(t *testing.T) {
+	issuer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	parent := &aflock.Policy{
+		Version: "1.0",
+		Name:    "parent",
+		Tools:   &aflock.ToolsPolicy{Allow: []string{"Read", "Bash"}},
+		Limits: &aflock.LimitsPolicy{
+			MaxSpendUSD: &aflock.Limit{Value: 10.0, Enforcement: "fail-fast"},
+			MaxTokensIn: &aflock.Limit{Value: 500_000, Enforcement: "fail-fast"},
+		},
+	}
+	sub := &aflock.Sublayout{
+		Name: "research-agent",
+		Limits: &aflock.LimitsPolicy{
+			MaxSpendUSD: &aflock.Limit{Value: 2.0, Enforcement: "fail-fast"},
+			// MaxTokensIn not declared — should inherit from parent.
+		},
+	}
+
+	tok, err := issuer.MintChildToken(parent, sub, "child-1", "spiffe://aflock.ai/agent/child", "hash-1", time.Hour)
+	require.NoError(t, err)
+
+	claims, err := issuer.ValidateTokenForSessionAndPolicy(tok, "child-1", "")
+	require.NoError(t, err)
+
+	require.NotNil(t, claims.Limits, "child JWT must carry limits")
+	require.NotNil(t, claims.Limits.MaxSpendUSD, "MaxSpendUSD must be present")
+	assert.Equal(t, 2.0, claims.Limits.MaxSpendUSD.Value, "child takes sublayout's MaxSpendUSD")
+	require.NotNil(t, claims.Limits.MaxTokensIn, "MaxTokensIn must inherit from parent")
+	assert.Equal(t, 500_000.0, claims.Limits.MaxTokensIn.Value, "child inherits parent's MaxTokensIn")
+}
+
+func TestMintChildToken_NilArgs(t *testing.T) {
+	issuer, err := NewTokenIssuer()
+	require.NoError(t, err)
+
+	_, err = issuer.MintChildToken(nil, &aflock.Sublayout{Name: "x"}, "child", "agent", "hash", time.Hour)
+	assert.Error(t, err, "nil parent policy must error")
+
+	_, err = issuer.MintChildToken(&aflock.Policy{}, nil, "child", "agent", "hash", time.Hour)
+	assert.Error(t, err, "nil sublayout must error")
 }

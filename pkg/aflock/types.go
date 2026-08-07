@@ -161,11 +161,98 @@ type Policy struct {
 	Functionaries        []Functionary     `json:"functionaries,omitempty"` // Legacy, use Steps.Functionaries instead
 
 	// RawDigest is the SHA-256 hex digest of the raw policy file bytes captured
-	// at load time. Stored here (json:"-") so callers can bind tokens and
-	// attestations to the exact file the user reviewed/signed, rather than
-	// re-marshaling the parsed struct (which can normalize formatting and
-	// produce a different digest for byte-identical input — issue #61 / L5).
-	RawDigest string `json:"-"`
+	// at load time. Persisted into state.json so subprocess hooks (PreToolUse,
+	// PostToolUse, Stop) recover the same digest the JWT was bound to at
+	// SessionStart — without this, the parent process's parsed Policy struct
+	// would re-marshal to different bytes (key order, whitespace) and JWT
+	// validation would reject every tool call as "token bound to a different
+	// policy version". The original justification for binding to raw bytes
+	// (rather than re-marshal) is issue #61 / L5; this field's value is the
+	// frozen digest captured at SessionStart, intentionally not recomputed
+	// from the on-disk file mid-session.
+	//
+	// When the policy was loaded from a DSSE envelope (signed), RawDigest is the
+	// SHA-256 of the inner payload bytes — not the envelope — so JWT binding stays
+	// invariant under re-signing with a different ephemeral key.
+	RawDigest string `json:"rawDigest,omitempty"`
+
+	// SignatureInfo describes the cryptographic signature that gated this policy
+	// load. Populated only when Load went through the DSSE envelope path and
+	// signature verification passed. Nil for unsigned policies.
+	SignatureInfo *SignatureInfo `json:"signatureInfo,omitempty"`
+}
+
+// SignatureInfo captures the verified identity that signed a policy envelope.
+// Surfaced in attestations so audits can prove a signed policy gated the session.
+type SignatureInfo struct {
+	// Issuer is the OIDC issuer URL from the Fulcio certificate
+	// (e.g., "https://token.actions.githubusercontent.com"). For raw-pubkey
+	// verifiers this is the literal string "pubkey".
+	Issuer string `json:"issuer"`
+	// Subject is the OIDC subject from the cert SAN (URI or email) for
+	// sigstore-typed verifiers, or the loaded key's SHA-256 fingerprint for
+	// raw-pubkey verifiers.
+	Subject string `json:"subject"`
+	// CertNotBefore / CertNotAfter are the Fulcio cert validity window.
+	// Omitted in raw-pubkey output where they have no meaning.
+	CertNotBefore *time.Time `json:"certNotBefore,omitempty"`
+	CertNotAfter  *time.Time `json:"certNotAfter,omitempty"`
+	// PayloadType is the DSSE payload type (always
+	// "application/vnd.aflock.policy+json" for this release).
+	PayloadType string `json:"payloadType"`
+}
+
+// TrustConfig declares which signing identities aflock will accept for policy
+// envelopes. Loaded from aflock-trust.json — see internal/policy/trust.go.
+type TrustConfig struct {
+	Version   string            `json:"version"`
+	Verifiers []TrustedVerifier `json:"verifiers"`
+}
+
+// TrustedVerifier is a single accepted signing identity. The discriminator
+// "type" selects which fields are consulted at verify time.
+type TrustedVerifier struct {
+	// Type is one of:
+	//   "sigstore" — match a Fulcio-issued leaf cert against {Issuer, SubjectPattern}
+	//   "pubkey"   — match against a raw PEM-encoded public key on disk
+	// Mirrors the StepFunctionary.Type taxonomy used for attestation verification
+	// so operators see the same trust-model vocabulary on both surfaces.
+	Type string `json:"type"`
+
+	// --- Sigstore-only fields ---
+
+	// Issuer is the exact OIDC issuer URL the Fulcio cert must declare.
+	Issuer string `json:"issuer,omitempty"`
+	// SubjectPattern is exact-matched against the cert SAN email (for human
+	// OIDC identities like Google/GitHub login) or SAN URI (for CI workflow
+	// identities like GitHub Actions). The match is routed by shape: contains
+	// "@" and no "://" → email constraint; otherwise → URI constraint.
+	// Rookery's underlying CertConstraint does NOT glob-match SAN fields, so
+	// wildcards like "*@gmail.com" will not match — pin the exact identity.
+	SubjectPattern string `json:"subjectPattern,omitempty"`
+	// FulcioRootPath optionally overrides the embedded Sigstore production root.
+	// When empty, the embedded root is used.
+	FulcioRootPath string `json:"fulcioRootPath,omitempty"`
+	// TSARootPath optionally overrides the embedded Sigstore production TSA
+	// cert chain. Required when signing was done against a self-hosted TSA
+	// (AFLOCK_TSA_URL); otherwise timestamp verification will fail with chain
+	// errors at load time. When empty, the embedded production chain is used.
+	TSARootPath string `json:"tsaRootPath,omitempty"`
+
+	// --- Pubkey-only fields ---
+
+	// KeyPath points to a PEM-encoded public key file. ECDSA, RSA, and Ed25519
+	// are accepted (rookery cryptoutil dispatches on the parsed type).
+	KeyPath string `json:"keyPath,omitempty"`
+	// KeyID, when non-empty, must match the SHA-256 hex fingerprint of the
+	// public key actually loaded from KeyPath (computed by rookery's
+	// cryptoutil.Verifier.KeyID). Use this to pin a specific key when KeyPath
+	// could resolve to alternates (symlinks, env-substituted paths). The
+	// envelope's own signatures[*].keyid metadata field is informational only;
+	// cryptographic verification against the loaded public key is what gates
+	// trust. Optional — if omitted, any signature that verifies against the
+	// loaded key is accepted, matching witness's publickey functionary semantics.
+	KeyID string `json:"keyid,omitempty"`
 }
 
 // Root represents a trust anchor (CA certificate) for signature verification.
@@ -474,6 +561,17 @@ type SessionState struct {
 	Materials []MaterialClassification `json:"materials,omitempty"`
 	// ParentSessionID is set when this session was spawned by a parent agent
 	ParentSessionID string `json:"parent_session_id,omitempty"`
+	// ParentSublayoutName is the name of the parent's declared sublayout this
+	// child was bound to at spawn time. Empty when the parent had no
+	// sublayout declarations. Used by verification to confirm a child stayed
+	// within the sublayout's promised scope (issue #26).
+	ParentSublayoutName string `json:"parent_sublayout_name,omitempty"`
+	// AttestationPrefix is the parent sublayout's AttestationPrefix string,
+	// inherited via propagation. Stamped into every attestation predicate so
+	// audit tools can group child attestations under the declared sublayout
+	// slot (issue #26 gap 1). Empty when the parent had no sublayouts or the
+	// matched sublayout didn't set a prefix.
+	AttestationPrefix string `json:"attestation_prefix,omitempty"`
 	// ChildSessionIDs tracks subagent sessions spawned from this session
 	ChildSessionIDs []string `json:"child_session_ids,omitempty"`
 	// AgentIdentityMeta stores identity discovered at SessionStart for reuse in PostToolUse
@@ -481,6 +579,24 @@ type SessionState struct {
 	// AuthToken is the JWT issued at SessionStart for request-level authorization.
 	// Scoped to the session, agent identity, and policy grants.
 	AuthToken string `json:"auth_token,omitempty"`
+	// SignerPubKeyFingerprint is the hex-encoded SHA-256 of the SPKI for the
+	// per-session attestation signing pubkey persisted at SessionStart. The
+	// Stop gate uses this to reject attestations signed by any key other than
+	// the pinned one (issue #68). Empty for legacy sessions established
+	// before pinning was introduced.
+	SignerPubKeyFingerprint string `json:"signer_pubkey_fingerprint,omitempty"`
+	// SigningMode records how the session's signing key was established.
+	// Hooks mode always sets this to "ephemeral" today (see
+	// establishSessionSigner in internal/hooks/handler.go for why SPIRE/Fulcio
+	// aren't selected in hooks). The field is kept on the wire so future
+	// chain-validation work for SPIRE/Fulcio (#62) can branch Stop-gate
+	// behavior without a state-shape migration.
+	SigningMode string `json:"signing_mode,omitempty"`
+	// SessionMerkleRoot is the RFC 6962 Merkle root computed over JCS-canonical
+	// session.Actions at SessionEnd. Auto-populated so Phase 3 materials checks
+	// fire on real sessions without needing the policy author to manually set
+	// materialsFrom.session.merkleRoot up front (issue #119).
+	SessionMerkleRoot string `json:"session_merkle_root,omitempty"`
 }
 
 // AgentIdentityMeta stores agent identity metadata in session state.
@@ -507,6 +623,16 @@ type PropagationRecord struct {
 	ParentMetrics   *SessionMetrics          `json:"parent_metrics"`
 	ParentLimits    *LimitsPolicy            `json:"parent_limits,omitempty"`
 	CreatedAt       time.Time                `json:"created_at"`
+	// SublayoutName is the name of the declared parent sublayout this spawn
+	// was matched against at PreToolUse time. Empty when the parent declared
+	// no sublayouts (legacy / unconstrained delegation). When set, the child
+	// session is bound to this sublayout for verification (issue #26 gaps
+	// 4 and 5).
+	SublayoutName string `json:"sublayout_name,omitempty"`
+	// AttestationPrefix carries the matched sublayout's AttestationPrefix
+	// over to the child so its PostToolUse attestations can stamp it into
+	// the predicate (issue #26 gap 1).
+	AttestationPrefix string `json:"attestation_prefix,omitempty"`
 }
 
 // IsExpiredPropagation checks if the propagation record has exceeded the given TTL.
@@ -527,8 +653,22 @@ type SessionMetrics struct {
 }
 
 // ActionRecord represents a recorded action.
+//
+// Seq is the contiguous, zero-based position of this action within the
+// session. Stamped at record time so verifiers can prove paper §4.4
+// Distance (no gaps) and, together with Timestamp monotonicity, prove
+// Order beyond what the merkle root alone catches (issue #146).
+//
+// `omitempty` is intentional: a legacy ActionRecord (recorded before
+// Seq existed) had no `seq` field in its JSON form. Re-marshaling it
+// must produce identical bytes so the merkle leaf hash — and the root
+// computed over it — stays stable. With `omitempty`, both old and new
+// aflock binaries serialize Seq=0 the same way (field absent).
+// Action[0] of a new session also has Seq=0 and likewise omits the
+// field; later actions carry Seq=1, Seq=2 ... and emit it normally.
 type ActionRecord struct {
 	Timestamp time.Time       `json:"timestamp"`
+	Seq       int64           `json:"seq,omitempty"`
 	ToolName  string          `json:"tool_name"`
 	ToolUseID string          `json:"tool_use_id"`
 	ToolInput json.RawMessage `json:"tool_input,omitempty"`

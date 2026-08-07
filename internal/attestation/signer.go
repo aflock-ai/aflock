@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -119,6 +120,118 @@ func (s *Signer) GetSigningIdentity() (*identity.Identity, string) {
 	return s.identity, ""
 }
 
+// InitializeFromPersistedKey reconstructs an ephemeral signing identity from
+// a PEM-encoded ECDSA P-256 private key previously written via
+// MarshalEphemeralKey (the hook writes it to <session-dir>/signer-key.pem at
+// SessionStart). Used by PostToolUse subprocesses to reuse the session-scoped
+// key rather than minting a fresh one per attestation — which made
+// attestations from one session unverifiable against any pinned key
+// (issue #68).
+func (s *Signer) InitializeFromPersistedKey(keyPEM []byte, agentIdentityHash string) error {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return fmt.Errorf("decode signer key PEM: no PEM block found")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse persisted EC private key: %w", err)
+	}
+
+	serialMax := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialMax)
+	if err != nil {
+		return fmt.Errorf("generate certificate serial: %w", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return fmt.Errorf("create ephemeral certificate: %w", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return fmt.Errorf("parse ephemeral certificate: %w", err)
+	}
+
+	spiffeID, err := spiffeid.FromString(fmt.Sprintf("spiffe://aflock.ai/agent/ephemeral/%s", agentIdentityHash))
+	if err != nil {
+		spiffeID = spiffeid.RequireFromString("spiffe://aflock.ai/agent/ephemeral/unknown")
+	}
+
+	s.identity = &identity.Identity{
+		SPIFFEID:    spiffeID,
+		Certificate: cert,
+		PrivateKey:  key,
+		ExpiresAt:   template.NotAfter,
+	}
+	return nil
+}
+
+// MarshalEphemeralKey returns the PEM-encoded SEC1 representation of the
+// ephemeral private key, for persistence at SessionStart. Errors if the
+// signer is not in ephemeral mode (SPIRE/Fulcio private keys are not
+// exportable through this path).
+func (s *Signer) MarshalEphemeralKey() ([]byte, error) {
+	if s.identity == nil || s.identity.PrivateKey == nil {
+		return nil, fmt.Errorf("no signing identity available")
+	}
+	key, ok := s.identity.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("ephemeral key export only supported for ECDSA keys (got %T)", s.identity.PrivateKey)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EC private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
+}
+
+// MarshalSigningPublicKey returns the PEM-encoded PKIX representation of the
+// signer's public key plus the hex SHA-256 of the SPKI bytes. Used by the
+// Stop gate as the pin (issue #68): the gate refuses any attestation whose
+// signing cert's SPKI hash does not match this fingerprint.
+func (s *Signer) MarshalSigningPublicKey() (pubPEM []byte, spkiFingerprint string, err error) {
+	if s.identity == nil {
+		return nil, "", fmt.Errorf("no signing identity available")
+	}
+	var pubKey crypto.PublicKey
+	switch {
+	case s.identity.Certificate != nil:
+		pubKey = s.identity.Certificate.PublicKey
+	case s.identity.PrivateKey != nil:
+		signer, ok := s.identity.PrivateKey.(crypto.Signer)
+		if !ok {
+			return nil, "", fmt.Errorf("private key does not implement crypto.Signer (got %T)", s.identity.PrivateKey)
+		}
+		pubKey = signer.Public()
+	default:
+		return nil, "", fmt.Errorf("no public key material available")
+	}
+	spkiDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal PKIX public key: %w", err)
+	}
+	sum := sha256.Sum256(spkiDER)
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: spkiDER}), hex.EncodeToString(sum[:]), nil
+}
+
+// SPKIFingerprint computes the hex-encoded SHA-256 of a public key's PKIX
+// SubjectPublicKeyInfo encoding. Exported so the Stop gate can compute
+// fingerprints of envelope-embedded certs and compare them to the pin
+// recorded in session state.
+func SPKIFingerprint(pub crypto.PublicKey) (string, error) {
+	spkiDER, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("marshal PKIX public key: %w", err)
+	}
+	sum := sha256.Sum256(spkiDER)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // Close releases resources and securely wipes ephemeral key material from
 // memory. The wipe is best-effort — the Go runtime may have copied the key
 // bytes during GC or stack growth — but it eliminates the most common heap
@@ -154,17 +267,51 @@ type Subject struct {
 
 // ActionPredicate is the predicate for aflock action attestations.
 type ActionPredicate struct {
-	Action        string                 `json:"action"`
-	SessionID     string                 `json:"sessionId"`
-	ToolName      string                 `json:"toolName"`
-	ToolUseID     string                 `json:"toolUseId"`
-	ToolInput     map[string]interface{} `json:"toolInput,omitempty"`
-	Decision      string                 `json:"decision"`
-	Reason        string                 `json:"reason,omitempty"`
-	Timestamp     time.Time              `json:"timestamp"`
-	AgentID       string                 `json:"agentId,omitempty"`
-	AgentIdentity *TransitiveIdentity    `json:"agentIdentity,omitempty"`
-	Metrics       *MetricsPredicate      `json:"metrics,omitempty"`
+	Action           string                 `json:"action"`
+	SessionID        string                 `json:"sessionId"`
+	ToolName         string                 `json:"toolName"`
+	ToolUseID        string                 `json:"toolUseId"`
+	ToolInput        map[string]interface{} `json:"toolInput,omitempty"`
+	Decision         string                 `json:"decision"`
+	Reason           string                 `json:"reason,omitempty"`
+	Timestamp        time.Time              `json:"timestamp"`
+	AgentID          string                 `json:"agentId,omitempty"`
+	AgentIdentity    *TransitiveIdentity    `json:"agentIdentity,omitempty"`
+	Metrics          *MetricsPredicate      `json:"metrics,omitempty"`
+	JWTBinding       *JWTBinding            `json:"jwtBinding,omitempty"`
+	SublayoutBinding *SublayoutBinding      `json:"sublayoutBinding,omitempty"`
+}
+
+// SublayoutBinding records the parent-declared sublayout this child session
+// was matched to at spawn time (issue #26 gap 1). Verifiers can use the
+// prefix to group child attestations under the right sublayout slot when
+// reporting and to confirm a child stayed within the delegated scope.
+type SublayoutBinding struct {
+	// Name is the matched Sublayout.Name from the parent policy.
+	Name string `json:"name"`
+	// Prefix is the parent's Sublayout.AttestationPrefix — the namespace
+	// label by which audit tools group these attestations. Empty when the
+	// parent's sublayout declaration did not set a prefix; consumers should
+	// fall back to Name in that case.
+	Prefix string `json:"prefix,omitempty"`
+	// ParentSessionID closes the loop back to the parent session whose
+	// PreToolUse decided the binding.
+	ParentSessionID string `json:"parentSessionId,omitempty"`
+}
+
+// JWTBinding records the authorization context that permitted this action,
+// closing the issue #40 gap where JWT claims were not embedded in the
+// resulting attestation. A reviewer can prove the action was signed only
+// because the agent presented a token with the listed scope, and can
+// cross-reference the token digest with their own audit log.
+type JWTBinding struct {
+	SessionID    string   `json:"sessionId"`
+	JTI          string   `json:"jti"`
+	KeyID        string   `json:"kid,omitempty"`
+	PolicyDigest string   `json:"policyDigest,omitempty"`
+	TokenSHA256  string   `json:"tokenSha256"` // hex digest, NOT the token
+	AllowedTools []string `json:"allowedTools,omitempty"`
+	DeniedTools  []string `json:"deniedTools,omitempty"`
 }
 
 // TransitiveIdentity represents the full transitive agent identity.
@@ -201,14 +348,37 @@ type Signature struct {
 	Certificate string `json:"certificate,omitempty"` // PEM-encoded signing certificate
 }
 
+// AttestationContext bundles the optional per-action bindings that get
+// embedded in the predicate. Nil-safe — callers may pass nil for either
+// field or for the whole struct. Introduced when SublayoutBinding was added
+// alongside JWTBinding (issue #26 gap 1); replaces the prior single-purpose
+// variadic JWTBinding argument.
+type AttestationContext struct {
+	JWT       *JWTBinding
+	Sublayout *SublayoutBinding
+}
+
 // CreateActionAttestation creates an attestation for an action.
+//
+// actx is optional (nil-safe). When set, its JWT/Sublayout bindings are
+// embedded in the predicate so verifiers can confirm the action was signed
+// under the listed token scope (issue #40) and bound to the declared
+// sublayout (issue #26).
 func (s *Signer) CreateActionAttestation(
 	ctx context.Context,
 	record aflock.ActionRecord,
 	sessionID string,
 	metrics *aflock.SessionMetrics,
 	agentIdentity *identity.AgentIdentity,
+	actx *AttestationContext,
 ) (*Envelope, error) {
+	var jwtBinding *JWTBinding
+	var sublayoutBinding *SublayoutBinding
+	if actx != nil {
+		jwtBinding = actx.JWT
+		sublayoutBinding = actx.Sublayout
+	}
+
 	// Parse tool input (best-effort, ignore errors)
 	var toolInput map[string]interface{}
 	if record.ToolInput != nil {
@@ -217,14 +387,16 @@ func (s *Signer) CreateActionAttestation(
 
 	// Build predicate
 	predicate := ActionPredicate{
-		Action:    "tool_call",
-		SessionID: sessionID,
-		ToolName:  record.ToolName,
-		ToolUseID: record.ToolUseID,
-		ToolInput: toolInput,
-		Decision:  record.Decision,
-		Reason:    record.Reason,
-		Timestamp: record.Timestamp,
+		Action:           "tool_call",
+		SessionID:        sessionID,
+		ToolName:         record.ToolName,
+		ToolUseID:        record.ToolUseID,
+		ToolInput:        toolInput,
+		Decision:         record.Decision,
+		Reason:           record.Reason,
+		Timestamp:        record.Timestamp,
+		JWTBinding:       jwtBinding,
+		SublayoutBinding: sublayoutBinding,
 	}
 
 	if s.identity != nil {
@@ -240,7 +412,18 @@ func (s *Signer) CreateActionAttestation(
 			IdentityHash: agentIdentity.IdentityHash,
 		}
 		if agentIdentity.Binary != nil {
-			predicate.AgentIdentity.Binary = fmt.Sprintf("%s@%s", agentIdentity.Binary.Name, agentIdentity.Binary.Version)
+			// Format as "<name>@<version>", but only when both halves
+			// exist. Two edge cases the predicate must not produce:
+			//   - kernel-attested peer-cred path leaves Version empty
+			//     (digest is the authoritative version), so we'd otherwise
+			//     emit "socat1@" with a dangling @
+			//   - if Name resolution failed but Version was defaulted, we'd
+			//     otherwise emit a leading "@0.0.0"
+			binary := agentIdentity.Binary.Name
+			if binary != "" && agentIdentity.Binary.Version != "" {
+				binary = binary + "@" + agentIdentity.Binary.Version
+			}
+			predicate.AgentIdentity.Binary = binary
 			predicate.AgentIdentity.BinaryHash = agentIdentity.Binary.Digest
 		}
 		if agentIdentity.Environment != nil {

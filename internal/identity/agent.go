@@ -145,7 +145,15 @@ func (a *AgentIdentity) canonicalEnv() string {
 	}
 
 	if a.Binary != nil {
-		add("binary", a.Binary.Name+"@"+a.Binary.Version)
+		// Elide the "@version" suffix when version is empty so the
+		// peer-cred path (where the digest is the authoritative version)
+		// doesn't emit a stray trailing "@". Heuristic-mode callers that
+		// pass a real version still get "name@version" as before.
+		bin := a.Binary.Name
+		if a.Binary.Version != "" {
+			bin = a.Binary.Name + "@" + a.Binary.Version
+		}
+		add("binary", bin)
 		add("binary_path", a.Binary.Path)
 		add("binary_digest", a.Binary.Digest)
 	}
@@ -212,12 +220,54 @@ func (a *AgentIdentity) ToSPIFFEID(trustDomain string) (spiffeid.ID, error) {
 }
 
 // DiscoverAgentIdentity discovers the current agent's identity from the environment.
-// Uses PID-based discovery to trace the Claude process and session.
+// Uses PID-based discovery (os.Getppid()) to trace the Claude process and session.
+// For kernel-attested identity over a Unix-domain-socket transport, use
+// DiscoverAgentIdentityFromPeer with credentials extracted from
+// SO_PEERCRED/LOCAL_PEERPID on the accepted connection.
 func DiscoverAgentIdentity() (*AgentIdentity, error) {
+	return discoverAgentIdentity(DiscoverFromMCPSocket, nil)
+}
+
+// DiscoverAgentIdentityFromPID discovers the agent identity starting from a
+// kernel-attested peer PID (e.g. obtained via SO_PEERCRED on Linux or
+// LOCAL_PEERPID on macOS for an accepted UDS connection).
+//
+// Deprecated: use DiscoverAgentIdentityFromPeer to also bind kernel-attested
+// UID/GID and read peer-derived binary/container/env data per paper §3.1.
+// Retained for callers that only have a PID.
+func DiscoverAgentIdentityFromPID(peerPID int) (*AgentIdentity, error) {
+	return discoverAgentIdentity(func() (string, *ProcessMetadata, error) {
+		return DiscoverFromPID(peerPID)
+	}, nil)
+}
+
+// DiscoverAgentIdentityFromPeer is the paper §3.1 entrypoint: identity is
+// derived entirely from peer-side data attested by the kernel. The peer
+// PID, UID, and GID must come from SO_PEERCRED (Linux) or LOCAL_PEERPID +
+// LOCAL_PEERCRED (macOS) on an accepted UDS connection. Binary path and
+// digest are read from /proc/<pid>/exe (Linux) or libproc-via-lsof
+// (macOS), container ID from /proc/<pid>/cgroup, environment from
+// /proc/<pid>/environ — never from aflock's own process state.
+//
+// Returns an error if peer-binary attestation fails (e.g. PID recycled
+// during introspection, /proc/<pid>/exe unreadable). Callers MUST refuse
+// to serve the connection on error rather than fall back to heuristic
+// identity — the whole point of the kernel-attested path is that we
+// don't lie about identity when we can't prove it.
+func DiscoverAgentIdentityFromPeer(pid int, uid, gid uint32) (*AgentIdentity, error) {
+	peer, err := IntrospectPeer(pid, uid, gid)
+	if err != nil {
+		return nil, fmt.Errorf("introspect peer pid=%d: %w", pid, err)
+	}
+	return discoverAgentIdentity(func() (string, *ProcessMetadata, error) {
+		return DiscoverFromPeer(peer)
+	}, &peer)
+}
+
+func discoverAgentIdentity(discover func() (string, *ProcessMetadata, error), peer *PeerInfo) (*AgentIdentity, error) {
 	identity := &AgentIdentity{}
 
-	// Use comprehensive PID-based discovery
-	model, meta, err := DiscoverFromMCPSocket()
+	model, meta, err := discover()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] PID-based discovery failed: %v\n", err)
 		identity.Model = "unknown"
@@ -230,14 +280,13 @@ func DiscoverAgentIdentity() (*AgentIdentity, error) {
 	}
 
 	identity.ModelVersion = parseModelVersion(identity.Model)
-
-	// Discover binary
-	identity.Binary = discoverBinary()
-
-	// Discover environment
-	identity.Environment = discoverEnvironment()
-
-	// Compute identity hash
+	if peer != nil {
+		identity.Binary = peerBinaryIdentity(peer)
+		identity.Environment = peerEnvironmentIdentity(peer)
+	} else {
+		identity.Binary = discoverBinary()
+		identity.Environment = discoverEnvironment()
+	}
 	identity.DeriveIdentity()
 
 	return identity, nil

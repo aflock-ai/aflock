@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/open-policy-agent/opa/ast"  //nolint:staticcheck // TODO: migrate to opa/v1
@@ -74,7 +75,7 @@ type Policy struct {
 
 // evaluateOne runs a single Rego policy against the input.
 func evaluateOne(pol Policy, input interface{}) (*EvalResult, error) {
-	parsedModule, err := ast.ParseModule(pol.Name, pol.Module)
+	parsedModule, err := ast.ParseModule(pol.Name, autoWrap(pol.Module))
 	if err != nil {
 		return nil, fmt.Errorf("parse rego module: %w", err)
 	}
@@ -124,6 +125,45 @@ func evaluateOne(pol Policy, input interface{}) (*EvalResult, error) {
 		Passed:  len(denyReasons) == 0,
 		Reasons: denyReasons,
 	}, nil
+}
+
+// autoWrapHeader is prepended to fragment-style Rego policies that omit
+// a package declaration. It uses a default package name and pulls in the
+// future.keywords imports so users can write either legacy
+// (`deny[msg] { ... }`) or v1 (`deny contains msg if { ... }`) syntax.
+const autoWrapHeader = `package aflock.evaluator
+
+import future.keywords.contains
+import future.keywords.if
+import future.keywords.in
+
+`
+
+// hasPackageDeclaration reports whether the given Rego source already
+// starts with a `package` declaration. It skips leading whitespace and
+// `#` line comments (Rego has no block comments).
+func hasPackageDeclaration(src string) bool {
+	for line := range strings.SplitSeq(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		return trimmed == "package" ||
+			strings.HasPrefix(trimmed, "package ") ||
+			strings.HasPrefix(trimmed, "package\t")
+	}
+	return false
+}
+
+// autoWrap prepends a default package declaration and standard imports if
+// the source omits them, letting users write fragment-style policies as
+// shown in the docs and paper without needing to know OPA's module structure.
+// Sources that already declare a package are returned unchanged.
+func autoWrap(src string) string {
+	if hasPackageDeclaration(src) {
+		return src
+	}
+	return autoWrapHeader + src
 }
 
 // unsafeBuiltins blocks dangerous OPA builtins that could allow

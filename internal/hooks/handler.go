@@ -3,8 +3,11 @@ package hooks
 
 import (
 	"context"
+	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -21,6 +24,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/verify"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -137,11 +141,17 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		return nil
 	}
 
-	// Validate identity against policy constraints (skip if model is unknown in development)
-	if pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
-		if agentIdentity.Model != "unknown" && !agentIdentity.Matches(pol.Identity.AllowedModels, nil) {
-			output.ExitWithError(fmt.Sprintf("[aflock] Agent model '%s' not in allowed models: %v",
-				agentIdentity.Model, pol.Identity.AllowedModels))
+	// Enforce full identity policy (allowedModels + allowedEnvironments) at the
+	// runtime gate, not only at post-hoc verify time (issue #121).
+	// Skip if the model wasn't discovered ("unknown") so local dev keeps working.
+	if pol.Identity != nil && agentIdentity.Model != "unknown" {
+		id := verify.IdentityFields{Model: agentIdentity.Model}
+		if agentIdentity.Environment != nil {
+			id.Environment = agentIdentity.Environment.Type
+		}
+		// Tools usage isn't known yet — verifyIdentityConstraints skips requiredTools when Tools==nil.
+		if errs := verify.VerifyIdentityConstraints(id, pol.Identity); len(errs) > 0 {
+			output.ExitWithError(fmt.Sprintf("[aflock] Identity policy violation: %s", strings.Join(errs, "; ")))
 			return nil
 		}
 	}
@@ -174,13 +184,15 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to read propagation: %v\n", propErr)
 	} else if prop != nil {
 		sessionState.ParentSessionID = prop.ParentSessionID
+		sessionState.ParentSublayoutName = prop.SublayoutName
+		sessionState.AttestationPrefix = prop.AttestationPrefix
 		sessionState.Materials = prop.Materials
 		if prop.ParentLimits != nil && prop.ParentMetrics != nil {
 			sessionState.Policy.Limits = attenuateLimits(
 				sessionState.Policy.Limits, prop.ParentLimits, prop.ParentMetrics)
 		}
-		fmt.Fprintf(os.Stderr, "[aflock] Inherited %d materials from parent session %s\n",
-			len(prop.Materials), prop.ParentSessionID)
+		fmt.Fprintf(os.Stderr, "[aflock] Inherited %d materials from parent session %s (sublayout=%q)\n",
+			len(prop.Materials), prop.ParentSessionID, prop.SublayoutName)
 	}
 
 	// Issue JWT for this session — binds agent identity, policy, and grants
@@ -209,8 +221,30 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		} else {
 			sessionState.AuthToken = token
 			fmt.Fprintf(os.Stderr, "[aflock] JWT issued for session %s (ttl=%s)\n", input.SessionID, ttl)
+
+			// Persist the public key alongside the session so PreToolUse — a
+			// separate subprocess that has no in-memory access to the signer —
+			// can validate this token (issue #48). Best-effort: a write failure
+			// downgrades to policy-only enforcement, with a stderr warning.
+			if pubPEM, marshalErr := issuer.MarshalPublicKey(); marshalErr != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal JWT public key: %v\n", marshalErr)
+			} else {
+				sessionDir := h.stateManager.SessionDir(input.SessionID)
+				if mkErr := os.MkdirAll(sessionDir, 0700); mkErr != nil {
+					fmt.Fprintf(os.Stderr, "[aflock] Warning: create session dir for JWT pubkey: %v\n", mkErr)
+				} else if writeErr := os.WriteFile(filepath.Join(sessionDir, "jwt-pubkey.pem"), pubPEM, 0600); writeErr != nil {
+					fmt.Fprintf(os.Stderr, "[aflock] Warning: write JWT public key: %v\n", writeErr)
+				}
+			}
 		}
 	}
+
+	// Establish the per-session attestation signing key and pin its pubkey
+	// fingerprint to session state (issue #68). Subsequent PostToolUse
+	// invocations reuse this key instead of minting one per attestation, and
+	// the Stop gate verifies attestations against the pinned pubkey rather
+	// than the envelope-embedded cert.
+	h.establishSessionSigner(sessionState, agentIdentity)
 
 	if err := h.stateManager.Save(sessionState); err != nil {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
@@ -220,6 +254,73 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	// Build context to inject
 	context := h.buildPolicyContext(pol, agentIdentity)
 	return output.Write(output.SessionStartContext(context))
+}
+
+// establishSessionSigner initializes the per-session attestation signer and
+// persists material that PostToolUse and the Stop gate need:
+//
+//   - signer-pubkey.pem (0600) — pubkey used by the Stop gate for verification
+//   - signer-key.pem (0600) — ephemeral private key reloaded by PostToolUse
+//     subprocesses so every attestation in the session is signed by the same
+//     pinned key
+//
+// Hooks mode is intentionally ephemeral-only. SPIRE and Fulcio are not
+// selected here because (a) Fulcio mints a fresh cert per InitializeFulcio
+// call, so its pubkey wouldn't match the SessionStart pin and the Stop gate
+// would reject every attestation, and (b) hooks-mode SPIRE/Fulcio doesn't
+// give real key separation anyway — the key lives in the same trust domain
+// as the agent (issue #62). MCP-mode still uses the SPIRE → Fulcio →
+// ephemeral fallback because that path has its own verification pipeline.
+//
+// Failures here are non-fatal: SessionStart still completes, but
+// SignerPubKeyFingerprint stays empty and the Stop gate will deny any
+// required-attestation check (fail-closed, issue #68).
+func (h *Handler) establishSessionSigner(sessionState *aflock.SessionState, agentIdentity *identity.AgentIdentity) {
+	if sessionState == nil || sessionState.SessionID == "" {
+		return
+	}
+
+	signer := attestation.NewSigner("")
+	defer signer.Close() //nolint:errcheck // best-effort cleanup
+
+	identityHash := ""
+	if agentIdentity != nil {
+		identityHash = agentIdentity.IdentityHash
+	}
+	if err := signer.InitializeEphemeral(identityHash); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: signer init failed at SessionStart: %v\n", err)
+		return
+	}
+
+	pubPEM, fingerprint, err := signer.MarshalSigningPublicKey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal signer pubkey: %v\n", err)
+		return
+	}
+	keyPEM, keyErr := signer.MarshalEphemeralKey()
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: marshal ephemeral signer key: %v\n", keyErr)
+		return
+	}
+
+	sessionDir := h.stateManager.SessionDir(sessionState.SessionID)
+	if mkErr := os.MkdirAll(sessionDir, 0700); mkErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: create session dir for signer pubkey: %v\n", mkErr)
+		return
+	}
+	if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-pubkey.pem"), pubPEM, 0600); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write signer pubkey: %v\n", writeErr)
+		return
+	}
+	// The persisted private key is the durable session signing material —
+	// 0600 keeps it owner-only; broader permissions defeat the pin entirely.
+	if writeErr := os.WriteFile(filepath.Join(sessionDir, "signer-key.pem"), keyPEM, 0600); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: write ephemeral signer key: %v\n", writeErr)
+		return
+	}
+
+	sessionState.SignerPubKeyFingerprint = fingerprint
+	sessionState.SigningMode = "ephemeral"
 }
 
 // buildPolicyContext creates context string describing the active policy.
@@ -355,6 +456,56 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 	if pol.IsExpired() {
 		return output.Write(output.PreToolUseDeny(fmt.Sprintf("[aflock] BLOCKED: policy '%s' expired at %s", pol.Name, pol.Expires.Format(time.RFC3339))))
 	}
+
+	// Defense in depth: re-check identity constraints against the persisted
+	// AgentIdentityMeta. SessionStart already enforced this, but state could
+	// have been tampered with between hooks (issue #121).
+	if pol.Identity != nil && sessionState.AgentIdentityMeta != nil &&
+		sessionState.AgentIdentityMeta.Model != "" && sessionState.AgentIdentityMeta.Model != "unknown" {
+		id := verify.IdentityFields{
+			Model:       sessionState.AgentIdentityMeta.Model,
+			Environment: sessionState.AgentIdentityMeta.Environment,
+		}
+		if errs := verify.VerifyIdentityConstraints(id, pol.Identity); len(errs) > 0 {
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] BLOCKED: identity policy violation: %s", strings.Join(errs, "; "))))
+		}
+	}
+
+	// Validate the session JWT (#48). The signing key dies with the
+	// SessionStart subprocess, so we reconstruct a validation-only issuer
+	// from the public key persisted next to state.json. If the pubkey file
+	// is missing — pre-existing sessions, or SessionStart failed to write
+	// it — we fall through to policy-only enforcement (preserves backward
+	// compatibility on upgrade). All other failures are deny.
+	if sessionState.AuthToken != "" && input.SessionID != "" {
+		pubKeyPath := filepath.Join(h.stateManager.SessionDir(input.SessionID), "jwt-pubkey.pem")
+		pubPEM, readErr := os.ReadFile(pubKeyPath) //nolint:gosec // G304: path under managed state dir
+		switch {
+		case os.IsNotExist(readErr):
+			// Legacy session — fall through, no JWT enforcement.
+		case readErr != nil:
+			return output.Write(output.PreToolUseDeny(
+				fmt.Sprintf("[aflock] BLOCKED: read JWT public key: %v", readErr)))
+		default:
+			validator, valErr := auth.NewTokenIssuerFromPublicKey(pubPEM)
+			if valErr != nil {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: parse JWT public key: %v", valErr)))
+			}
+			claims, valErr := validator.ValidateTokenForSessionAndPolicy(
+				sessionState.AuthToken, input.SessionID, auth.ComputePolicyDigest(pol))
+			if valErr != nil {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: JWT validation failed: %v", valErr)))
+			}
+			if !auth.IsToolAllowed(input.ToolName, claims.AllowedTools, claims.DeniedTools) {
+				return output.Write(output.PreToolUseDeny(
+					fmt.Sprintf("[aflock] BLOCKED: tool '%s' not permitted by JWT scope", input.ToolName)))
+			}
+		}
+	}
+
 	// Use cwd as projectRoot when policy path is outside cwd (e.g., AFLOCK_POLICY env var
 	// pointing to a tenant-specific policy in a subdirectory). Otherwise use the policy
 	// file's directory (standard case where .aflock is at project root).
@@ -414,11 +565,32 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
 	}
 
-	// If this is a subagent spawn, write propagation file so the child
-	// session inherits materials and attenuated limits (Section 5: sublayout delegation).
-	if isSubagentSpawn(input.ToolName) && sessionState.PolicyPath != "" {
-		if err := h.stateManager.WritePropagation(sessionState); err != nil {
-			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+	// If this is a subagent spawn, match it against declared sublayouts and
+	// either refuse or bind propagation accordingly (issue #26 gaps 4 + 5).
+	if isSubagentSpawn(input.ToolName) && sessionState.PolicyPath != "" && sessionState.Policy != nil {
+		matched, hasDecl := matchSublayoutForSpawn(input.ToolName, input.ToolInput, sessionState.Policy.Sublayouts)
+		switch {
+		case hasDecl && matched == nil:
+			// Sublayouts declared but spawn does not match any of them — R3-291.
+			return output.Write(output.PreToolUseDeny(fmt.Sprintf(
+				"[aflock] BLOCKED: subagent spawn does not match any declared sublayout (tool=%s)",
+				input.ToolName)))
+		case hasDecl && matched != nil:
+			// Sublayout limits must already attenuate vs parent's limits;
+			// refusing at spawn time means a bad policy can't slip through.
+			if violations := policy.AttenuationViolations(sessionState.Policy.Limits, matched.Limits); len(violations) > 0 {
+				return output.Write(output.PreToolUseDeny(fmt.Sprintf(
+					"[aflock] BLOCKED: sublayout %q violates parent attenuation: %s",
+					matched.Name, strings.Join(violations, "; "))))
+			}
+			if err := h.stateManager.WritePropagationForSublayout(sessionState, matched); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+			}
+		default:
+			// No sublayout declarations — keep legacy unconstrained behavior.
+			if err := h.stateManager.WritePropagation(sessionState); err != nil {
+				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to write propagation: %v\n", err)
+			}
 		}
 	}
 
@@ -479,6 +651,15 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		if exceeded {
 			return output.Write(output.PostToolUseBlock(
 				fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+		}
+		// maxWallTimeSeconds isn't represented in SessionMetrics, so check it
+		// against StartedAt separately (issue #120).
+		if !sessionState.StartedAt.IsZero() {
+			elapsed := time.Since(sessionState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "fail-fast"); exceeded {
+				return output.Write(output.PostToolUseBlock(
+					fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 	}
 
@@ -552,20 +733,36 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		}
 	}
 
-	// Create signer — try SPIRE first, then Fulcio keyless, fall back to ephemeral key
+	// Create signer. Hooks mode always uses the per-session ephemeral key
+	// established at SessionStart (issue #68) — no SPIRE/Fulcio branches here
+	// because those mint fresh keys per call and would fail the SPKI pin.
 	signer := attestation.NewSigner("")
-	if err := signer.Initialize(context.Background()); err != nil {
-		// SPIRE not available — try Fulcio keyless (CI/CD environments with OIDC)
-		if fulcioErr := signer.InitializeFulcio(context.Background()); fulcioErr != nil {
-			// Fulcio not available — use ephemeral key
-			identityHash := ""
-			if agentIdentity != nil {
-				identityHash = agentIdentity.IdentityHash
-			}
-			if err := signer.InitializeEphemeral(identityHash); err != nil {
-				fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable: %v\n", err)
-				return
-			}
+	signerInitialized := false
+	keyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "signer-key.pem")
+	if keyPEM, readErr := os.ReadFile(keyPath); readErr == nil { //nolint:gosec // G304: keyPath is under SessionDir
+		identityHash := ""
+		if agentIdentity != nil {
+			identityHash = agentIdentity.IdentityHash
+		}
+		if err := signer.InitializeFromPersistedKey(keyPEM, identityHash); err == nil {
+			signerInitialized = true
+		} else {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: load persisted signer key: %v\n", err)
+		}
+	}
+	if !signerInitialized {
+		// Last-resort fallback: pre-pinning sessions, or a SessionStart that
+		// failed to persist a key. Mint a fresh ephemeral key — the Stop gate
+		// will not be able to pin this key, so required-attestation enforcement
+		// will fail closed for the session, but PostToolUse still produces an
+		// attestation record on disk for forensic value.
+		identityHash := ""
+		if agentIdentity != nil {
+			identityHash = agentIdentity.IdentityHash
+		}
+		if err := signer.InitializeEphemeral(identityHash); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation signing unavailable: %v\n", err)
+			return
 		}
 	}
 	defer signer.Close() //nolint:errcheck // best-effort cleanup
@@ -584,6 +781,33 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		Decision:  "allow",
 	}
 
+	// Build the JWT binding for the attestation predicate (#40). PreToolUse
+	// already validated the token (#48); we re-validate here so the binding
+	// reflects ground truth at signing time, not state captured upstream.
+	jwtBinding := h.buildJWTBindingForSession(sessionState)
+
+	// Issue #40 hardening: if SessionStart issued a JWT for this session
+	// (the normal path), refuse to sign without a successful JWT binding.
+	// Sessions without an AuthToken (legacy / no-policy) keep the old
+	// behavior so this is not a backward-incompatible break.
+	if sessionState.AuthToken != "" && jwtBinding == nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Skipping attestation: JWT validation failed at signing time (issue #40)\n")
+		return
+	}
+
+	// Issue #26 gap 1: when this session was spawned under a parent's
+	// declared sublayout, stamp every attestation with the sublayout name +
+	// AttestationPrefix so audit/verify tools can group child attestations
+	// under their delegated slot.
+	var sublayoutBinding *attestation.SublayoutBinding
+	if sessionState.ParentSublayoutName != "" {
+		sublayoutBinding = &attestation.SublayoutBinding{
+			Name:            sessionState.ParentSublayoutName,
+			Prefix:          sessionState.AttestationPrefix,
+			ParentSessionID: sessionState.ParentSessionID,
+		}
+	}
+
 	// Create signed attestation
 	envelope, err := signer.CreateActionAttestation(
 		context.Background(),
@@ -591,6 +815,7 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 		sessionState.SessionID,
 		sessionState.Metrics,
 		agentIdentity,
+		&attestation.AttestationContext{JWT: jwtBinding, Sublayout: sublayoutBinding},
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: attestation creation failed: %v\n", err)
@@ -627,6 +852,46 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 	}
 
 	fmt.Fprintf(os.Stderr, "[aflock] Attestation signed: %s\n", filename)
+}
+
+// buildJWTBindingForSession constructs an attestation predicate binding
+// from the session's stored JWT, validated against the public key
+// persisted at SessionStart (#48). Returns nil on any failure — missing
+// pubkey, missing token, or validation error — so the attestation is
+// still produced. Validation failures are logged but do not block.
+func (h *Handler) buildJWTBindingForSession(sessionState *aflock.SessionState) *attestation.JWTBinding {
+	if sessionState == nil || sessionState.AuthToken == "" || sessionState.SessionID == "" {
+		return nil
+	}
+	pubKeyPath := filepath.Join(h.stateManager.SessionDir(sessionState.SessionID), "jwt-pubkey.pem")
+	pubPEM, err := os.ReadFile(pubKeyPath) //nolint:gosec // G304: managed state dir
+	if err != nil {
+		return nil // legacy session or absent pubkey — skip binding silently
+	}
+	validator, err := auth.NewTokenIssuerFromPublicKey(pubPEM)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: parse JWT public key for binding: %v\n", err)
+		return nil
+	}
+	currentDigest := ""
+	if sessionState.Policy != nil {
+		currentDigest = auth.ComputePolicyDigest(sessionState.Policy)
+	}
+	claims, err := validator.ValidateTokenForSessionAndPolicy(
+		sessionState.AuthToken, sessionState.SessionID, currentDigest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: JWT failed validation at signing time: %v\n", err)
+		return nil
+	}
+	digest := sha256.Sum256([]byte(sessionState.AuthToken))
+	return &attestation.JWTBinding{
+		SessionID:    sessionState.SessionID,
+		JTI:          claims.ID,
+		PolicyDigest: claims.PolicyDigest,
+		TokenSHA256:  hex.EncodeToString(digest[:]),
+		AllowedTools: claims.AllowedTools,
+		DeniedTools:  claims.DeniedTools,
+	}
 }
 
 // handlePermissionRequest auto-approves or denies based on policy.
@@ -712,6 +977,25 @@ func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *af
 		usedToolUseIDs[action.ToolName] = append(usedToolUseIDs[action.ToolName], action.ToolUseID)
 	}
 
+	// Load the per-session signing pubkey pin established at SessionStart.
+	// Without this pin we cannot tell "real attestation" from "attacker-dropped
+	// envelope signed with the attacker's own key" (issue #68). Fail-closed:
+	// if the pin is missing or doesn't match what's recorded in state, every
+	// required attestation reports as missing.
+	pin, pinErr := h.loadSessionSignerPin(sessionID, sessionState)
+	if pinErr != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Cannot verify required attestations: %v\n", pinErr)
+		var missing []string
+		for tool := range usedToolUseIDs {
+			for _, required := range sessionState.Policy.RequiredAttestations {
+				if tool == required {
+					missing = append(missing, required)
+				}
+			}
+		}
+		return missing
+	}
+
 	attestDir := h.stateManager.AttestationsDir(sessionID)
 	var missing []string
 	for _, required := range sessionState.Policy.RequiredAttestations {
@@ -719,11 +1003,52 @@ func (h *Handler) missingRequiredAttestations(sessionID string, sessionState *af
 		if !used {
 			continue // tool wasn't used → no attestation needed
 		}
-		if !findVerifiedAttestation(attestDir, sessionID, required, toolUseIDs) {
+		if !findVerifiedAttestation(attestDir, sessionID, required, toolUseIDs, pin) {
 			missing = append(missing, required)
 		}
 	}
 	return missing
+}
+
+// sessionSignerPin captures the trust anchor for required-attestation
+// verification within a session: the pinned public key and the expected SPKI
+// fingerprint recorded in state.json at SessionStart. Stop / SubagentStop
+// refuse any envelope whose embedded cert does not present this exact key.
+type sessionSignerPin struct {
+	pub         crypto.PublicKey
+	fingerprint string
+}
+
+// loadSessionSignerPin reads <session-dir>/signer-pubkey.pem and verifies the
+// SPKI fingerprint matches what was recorded in session state at
+// SessionStart. Any mismatch — missing file, missing recorded fingerprint,
+// fingerprint divergence — is treated as a tampered or pre-pinning session
+// and yields an error so the caller fails closed.
+func (h *Handler) loadSessionSignerPin(sessionID string, sessionState *aflock.SessionState) (*sessionSignerPin, error) {
+	if sessionState == nil || sessionState.SignerPubKeyFingerprint == "" {
+		return nil, fmt.Errorf("session %s has no pinned signer fingerprint — restart the session to re-establish the pin", sessionID)
+	}
+	pubPath := filepath.Join(h.stateManager.SessionDir(sessionID), "signer-pubkey.pem")
+	pubPEM, err := os.ReadFile(pubPath) //nolint:gosec // G304: path under SessionDir
+	if err != nil {
+		return nil, fmt.Errorf("read pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	block, _ := pem.Decode(pubPEM)
+	if block == nil {
+		return nil, fmt.Errorf("decode pinned signer pubkey for session %s: no PEM block", sessionID)
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	fp, err := attestation.SPKIFingerprint(pub)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint pinned signer pubkey for session %s: %w", sessionID, err)
+	}
+	if fp != sessionState.SignerPubKeyFingerprint {
+		return nil, fmt.Errorf("signer pin fingerprint mismatch for session %s (signer-pubkey.pem or state.json was tampered with)", sessionID)
+	}
+	return &sessionSignerPin{pub: pub, fingerprint: fp}, nil
 }
 
 // handleStop checks if required attestations are complete.
@@ -806,6 +1131,13 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 			return output.Write(output.StopBlock(
 				fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
 		}
+		if !childState.StartedAt.IsZero() {
+			elapsed := time.Since(childState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "post-hoc"); exceeded {
+				return output.Write(output.StopBlock(
+					fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			}
+		}
 	}
 
 	return output.Write(output.StopAllow())
@@ -831,10 +1163,8 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 	// Check post-hoc limits
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
-		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
-		if exceeded {
+		recordPostHoc := func(limitName, msg string) {
 			fmt.Fprintf(os.Stderr, "[aflock] Post-hoc limit exceeded: %s - %s\n", limitName, msg)
-			// Record the violation in session state for audit trail
 			h.stateManager.RecordAction(sessionState, aflock.ActionRecord{
 				Timestamp: time.Now(),
 				ToolName:  "SessionEnd",
@@ -844,6 +1174,26 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 			if err := h.stateManager.Save(sessionState); err != nil {
 				fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
 			}
+		}
+		if exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc"); exceeded {
+			recordPostHoc(limitName, msg)
+		}
+		if !sessionState.StartedAt.IsZero() {
+			elapsed := time.Since(sessionState.StartedAt)
+			if exceeded, limitName, msg := evaluator.CheckWallTime(elapsed, "post-hoc"); exceeded {
+				recordPostHoc(limitName, msg)
+			}
+		}
+	}
+
+	// Auto-populate the session Merkle root so Phase 3 verification fires on
+	// real sessions without the policy author having to set
+	// materialsFrom.session.merkleRoot ahead of time (issue #119).
+	if err := h.stateManager.ComputeSessionMerkleRoot(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: compute session merkle root: %v\n", err)
+	} else if sessionState.SessionMerkleRoot != "" {
+		if err := h.stateManager.Save(sessionState); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: save session merkle root: %v\n", err)
 		}
 	}
 
@@ -877,14 +1227,15 @@ func (h *Handler) handlePreCompact(_ *aflock.HookInput) error {
 //  3. Payload binds to THIS session (sessionID) and THIS tool (toolName)
 //  4. Payload's toolUseID appears in the session's recorded "allow" actions
 //
-// The embedded cert is trusted by virtue of "whoever signed this had the
-// private key at the time" — which is exactly what keeps a file-drop
-// attacker without key access from forging evidence. Chain validation to an
-// external root (SPIRE/Fulcio) is a stronger mode reserved for the
-// `aflock verify` command; at runtime we use the lighter self-attested
-// signature check because the signing key that produced these files is the
-// hook process's own key, and we want to reject files NOT signed by it.
-func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs []string) bool {
+// The trust anchor is the per-session signing pubkey pinned at SessionStart
+// (issue #68). Envelopes whose embedded cert's SPKI does not match the pin
+// are rejected outright — closes the "drop a self-signed forgery in the
+// attestations dir" attack. Chain validation against an external root
+// (SPIRE/Fulcio) remains the stronger mode used by `aflock verify`.
+func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs []string, pin *sessionSignerPin) bool {
+	if pin == nil {
+		return false
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
@@ -901,7 +1252,7 @@ func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs 
 		if !validateAttestationIntegrity(p) {
 			continue
 		}
-		if cryptographicallyVerifyAttestation(p, sessionID, toolName, allowed) {
+		if cryptographicallyVerifyAttestation(p, sessionID, toolName, allowed, pin) {
 			return true
 		}
 	}
@@ -909,9 +1260,13 @@ func findVerifiedAttestation(dir, sessionID, toolName string, allowedToolUseIDs 
 }
 
 // cryptographicallyVerifyAttestation does the heavy lifting for
-// findVerifiedAttestation. Returns true only when the signature verifies and
-// the payload binds to the expected session and tool use.
-func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowedToolUseIDs map[string]bool) bool {
+// findVerifiedAttestation. Returns true only when the envelope was signed by
+// the per-session pinned key (issue #68) AND the payload binds to the
+// expected session and tool use.
+func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowedToolUseIDs map[string]bool, pin *sessionSignerPin) bool {
+	if pin == nil {
+		return false
+	}
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path from AttestationsDir
 	if err != nil {
 		return false
@@ -921,28 +1276,15 @@ func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowe
 		return false
 	}
 
-	// Extract each signature's embedded leaf cert and treat them as the
-	// trusted set for this file. VerifyEnvelope handles PAE + Ed25519 /
-	// ECDSA / RSA selection and tries both spec + legacy PAE encodings.
-	var leafCerts []*x509.Certificate
-	for _, sig := range envelope.Signatures {
-		if sig.Certificate == "" {
-			continue
-		}
-		block, _ := pem.Decode([]byte(sig.Certificate))
-		if block == nil {
-			continue
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
-		}
-		leafCerts = append(leafCerts, cert)
-	}
-	if len(leafCerts) == 0 {
+	// Only accept envelopes whose embedded cert encodes the pinned pubkey.
+	// Without this gate the verifier trusts whatever key the envelope ships
+	// with, which is exactly the issue #68 forgery path (any attacker with
+	// write access to the attestations dir generates their own keypair).
+	pinnedCerts := envelopeCertsMatchingPin(&envelope, pin)
+	if len(pinnedCerts) == 0 {
 		return false
 	}
-	if err := attestation.VerifyEnvelope(&envelope, leafCerts); err != nil {
+	if err := attestation.VerifyEnvelope(&envelope, pinnedCerts); err != nil {
 		return false
 	}
 
@@ -982,6 +1324,37 @@ func cryptographicallyVerifyAttestation(path, sessionID, toolName string, allowe
 		}
 	}
 	return true
+}
+
+// envelopeCertsMatchingPin returns the subset of certificates embedded in the
+// envelope whose SPKI hash matches the pinned fingerprint. Used by the Stop
+// gate to confine VerifyEnvelope's trusted-cert set to the session's pinned
+// key (issue #68) — without this filter VerifyEnvelope would trust whichever
+// key the envelope shipped with, which is the vulnerability we're closing.
+func envelopeCertsMatchingPin(envelope *attestation.Envelope, pin *sessionSignerPin) []*x509.Certificate {
+	if pin == nil {
+		return nil
+	}
+	var matched []*x509.Certificate
+	for _, sig := range envelope.Signatures {
+		if sig.Certificate == "" {
+			continue
+		}
+		block, _ := pem.Decode([]byte(sig.Certificate))
+		if block == nil {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		fp, err := attestation.SPKIFingerprint(cert.PublicKey)
+		if err != nil || fp != pin.fingerprint {
+			continue
+		}
+		matched = append(matched, cert)
+	}
+	return matched
 }
 
 // findAttestation checks if a structurally valid attestation file exists for the given name.
@@ -1162,6 +1535,41 @@ func isSubagentSpawn(toolName string) bool {
 	return toolName == "Agent" || toolName == "Task"
 }
 
+// matchSublayoutForSpawn finds the declared sublayout this spawn should bind
+// to (issue #26 gap 5). Match key is the Task tool's subagent_type field
+// against Sublayout.Name; Agent spawns without a typed sub_agent_type don't
+// carry a binding signal today and match nothing.
+//
+// Returns (matched, hasDeclarations):
+//   - hasDeclarations=false when the parent policy declared no sublayouts —
+//     keeps the pre-issue-#26 behavior (unconstrained delegation, propagation
+//     written with parent's own limits).
+//   - hasDeclarations=true, matched=nil when sublayouts exist but the spawn
+//     didn't match any of them — PreToolUse refuses the spawn (R3-291).
+//   - hasDeclarations=true, matched!=nil when a sublayout name matches —
+//     propagation uses the sublayout's promised limits.
+func matchSublayoutForSpawn(toolName string, toolInput json.RawMessage, sublayouts []aflock.Sublayout) (matched *aflock.Sublayout, hasDeclarations bool) {
+	if len(sublayouts) == 0 {
+		return nil, false
+	}
+	subagentType := ""
+	if (toolName == "Task" || toolName == "Agent") && len(toolInput) > 0 {
+		var t aflock.TaskToolInput
+		if err := json.Unmarshal(toolInput, &t); err == nil {
+			subagentType = t.SubagentType
+		}
+	}
+	if subagentType == "" {
+		return nil, true
+	}
+	for i := range sublayouts {
+		if sublayouts[i].Name == subagentType {
+			return &sublayouts[i], true
+		}
+	}
+	return nil, true
+}
+
 // attenuateLimits computes effective limits for a child session.
 // For each limit field: child effective = min(child policy limit, parent remaining).
 // If a parent has exhausted its budget, the child gets 0.
@@ -1210,11 +1618,21 @@ func attenuateLimits(childLimits, parentLimits *aflock.LimitsPolicy, parentMetri
 
 // mergeChildIntoParent merges the child session's actions, metrics, and
 // materials back into the parent session state.
+//
+// Child actions are renumbered to extend the parent's contiguous Seq
+// sequence (issue #146): the merged parent's Actions slice must satisfy
+// Seq[i] == int64(i) so verify's Distance proof fires correctly.
+// Without this, the merged child actions carry their child-local Seq
+// (which restarts at 0) and the parent's distance check would treat
+// the post-merge tail as a "legacy/mixed" session and silently skip.
+// The child's original state file retains its own Seq sequence and is
+// verified independently via Phase 6 sublayout recursion.
 func mergeChildIntoParent(parent, child *aflock.SessionState) {
-	// Annotate and append child actions
+	// Annotate, renumber, and append child actions
 	for _, action := range child.Actions {
 		annotated := action
 		annotated.Reason = fmt.Sprintf("[subagent:%s] %s", child.SessionID, action.Reason)
+		annotated.Seq = int64(len(parent.Actions))
 		parent.Actions = append(parent.Actions, annotated)
 	}
 

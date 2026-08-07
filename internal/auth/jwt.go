@@ -16,8 +16,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"time"
 
@@ -113,6 +115,83 @@ func (ti *TokenIssuer) IssueToken(
 	token.Header["kid"] = ti.keyID
 
 	return token.SignedString(ti.signingKey)
+}
+
+// MintChildToken issues a JWT for a child session bound to a parent
+// sublayout. The token's scope is the intersection of the parent
+// policy with the sublayout: parent tools (unchanged — sublayouts
+// don't broaden tool access), sublayout limits where declared
+// (falling back to the parent's limit otherwise), and a fresh
+// PolicyDigest computed over the attenuated policy so verification
+// can't replay this token against the parent or any other sublayout.
+//
+// Used by `aflock_delegate` (issue #117) to mirror, in MCP mode,
+// the spawn-time binding that hooks-mode performs in
+// internal/hooks/handler.go:matchSublayoutForSpawn.
+func (ti *TokenIssuer) MintChildToken(
+	parentPolicy *aflock.Policy,
+	sub *aflock.Sublayout,
+	childSessionID string,
+	agentID string,
+	identityHash string,
+	ttl time.Duration,
+) (string, error) {
+	if parentPolicy == nil {
+		return "", fmt.Errorf("mint child token: nil parent policy")
+	}
+	if sub == nil {
+		return "", fmt.Errorf("mint child token: nil sublayout")
+	}
+	child := attenuateChildPolicy(parentPolicy, sub)
+	return ti.IssueToken(childSessionID, agentID, identityHash, child, ttl)
+}
+
+// attenuateChildPolicy builds an attenuated policy for a sublayout
+// child. Tools and grants are carried from the parent (the sublayout
+// is a delegation, not a broadening); limits are merged field-by-field
+// with the sublayout taking precedence where present.
+func attenuateChildPolicy(parent *aflock.Policy, sub *aflock.Sublayout) *aflock.Policy {
+	child := &aflock.Policy{
+		Name:    sub.Name,
+		Version: parent.Version,
+		Tools:   parent.Tools,
+	}
+	child.Limits = mergeLimits(parent.Limits, sub.Limits)
+	return child
+}
+
+// mergeLimits returns a new LimitsPolicy where each field is the
+// sublayout's value if set, otherwise the parent's value. Caller is
+// responsible for attenuation validation (sub <= parent) before
+// calling this — mergeLimits trusts its inputs.
+func mergeLimits(parent, sub *aflock.LimitsPolicy) *aflock.LimitsPolicy {
+	if parent == nil && sub == nil {
+		return nil
+	}
+	out := &aflock.LimitsPolicy{}
+	pick := func(p, s *aflock.Limit) *aflock.Limit {
+		if s != nil {
+			return s
+		}
+		return p
+	}
+	if parent != nil {
+		out.MaxSpendUSD = parent.MaxSpendUSD
+		out.MaxTokensIn = parent.MaxTokensIn
+		out.MaxTokensOut = parent.MaxTokensOut
+		out.MaxTurns = parent.MaxTurns
+		out.MaxWallTimeSeconds = parent.MaxWallTimeSeconds
+		out.MaxToolCalls = parent.MaxToolCalls
+	}
+	if sub != nil {
+		out.MaxSpendUSD = pick(out.MaxSpendUSD, sub.MaxSpendUSD)
+		out.MaxTokensIn = pick(out.MaxTokensIn, sub.MaxTokensIn)
+		out.MaxTokensOut = pick(out.MaxTokensOut, sub.MaxTokensOut)
+		out.MaxTurns = pick(out.MaxTurns, sub.MaxTurns)
+		out.MaxWallTimeSeconds = pick(out.MaxWallTimeSeconds, sub.MaxWallTimeSeconds)
+		out.MaxToolCalls = pick(out.MaxToolCalls, sub.MaxToolCalls)
+	}
+	return out
 }
 
 // ValidateToken verifies signature, expiry, issuer, and parses claims.
@@ -248,6 +327,36 @@ func ComputePolicyDigest(pol *aflock.Policy) string {
 // PublicKey returns the issuer's public key (useful for testing/debugging).
 func (ti *TokenIssuer) PublicKey() crypto.PublicKey {
 	return ti.publicKey
+}
+
+// MarshalPublicKey returns the issuer's public key as PEM-encoded PKIX bytes.
+// Used by hooks mode to persist the validation key across PreToolUse
+// subprocesses — the private key dies with the SessionStart process, but the
+// public key on disk lets a separate hook process validate the JWT (issue #48).
+func (ti *TokenIssuer) MarshalPublicKey() ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(ti.publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
+// NewTokenIssuerFromPublicKey reconstructs a validation-only TokenIssuer from
+// PEM-encoded public key bytes produced by MarshalPublicKey. The returned
+// issuer can validate tokens but cannot sign new ones (no private key).
+func NewTokenIssuerFromPublicKey(pemData []byte) (*TokenIssuer, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in public key data")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse public key: %w", err)
+	}
+	if _, ok := pub.(*ecdsa.PublicKey); !ok {
+		return nil, fmt.Errorf("public key is not ECDSA: %T", pub)
+	}
+	return &TokenIssuer{publicKey: pub}, nil
 }
 
 // KeyID returns the key identifier.

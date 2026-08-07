@@ -14,8 +14,15 @@ import (
 )
 
 // newTestHandler creates a Handler with state rooted in a temp directory.
+//
+// Note: propagation files live at ~/.aflock/propagation/ regardless of the
+// test's tmp state dir (see internal/state/propagation.go). Pointing HOME at
+// a per-test temp dir keeps that directory hermetic — tests can't see each
+// other's leftovers (PR #114 accumulate-per-write semantics) and never touch
+// the developer's real ~/.aflock. Requires non-parallel tests (t.Setenv).
 func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	h := &Handler{
 		stateManager: state.NewManager(tmpDir),
@@ -23,10 +30,13 @@ func newTestHandler(t *testing.T) *Handler {
 	return h
 }
 
-// seedSession initializes a session with the given policy and returns the session state.
+// seedSession initializes a session with the given policy and returns the
+// session state. It also establishes the per-session signing pin (issue #68)
+// the same way SessionStart does, so Stop-gate tests see realistic state.
 func seedSession(t *testing.T, h *Handler, sessionID string, pol *aflock.Policy) *aflock.SessionState {
 	t.Helper()
 	ss := h.stateManager.Initialize(sessionID, pol, "/fake/policy.aflock")
+	h.establishSessionSigner(ss, nil)
 	if err := h.stateManager.Save(ss); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -456,6 +466,44 @@ func TestHandlePostToolUse_NoSession(t *testing.T) {
 
 	if got != "{}" {
 		t.Errorf("expected empty JSON, got: %s", got)
+	}
+}
+
+// Issue #120: maxWallTimeSeconds must block at PostToolUse when fail-fast and
+// the session has run longer than the limit — previously the field only set
+// the JWT TTL and never gated tool execution.
+func TestHandlePostToolUse_MaxWallTime_FailFast_Blocks(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name: "walltime",
+		Limits: &aflock.LimitsPolicy{
+			MaxWallTimeSeconds: &aflock.Limit{Value: 1, Enforcement: "fail-fast"},
+		},
+	}
+	ss := seedSession(t, h, "session-walltime", pol)
+	ss.StartedAt = time.Now().Add(-2 * time.Minute)
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePostToolUse(&aflock.HookInput{
+			SessionID: "session-walltime", ToolName: "Read",
+			ToolInput: json.RawMessage(`{"file_path": "/tmp/x"}`),
+		}); err != nil {
+			t.Fatalf("handlePostToolUse: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.Decision != "block" {
+		t.Fatalf("expected block decision, got %q (raw=%s)", out.Decision, got)
+	}
+	if !strings.Contains(out.Reason, "maxWallTimeSeconds") {
+		t.Errorf("expected maxWallTimeSeconds in reason, got: %s", out.Reason)
 	}
 }
 
@@ -1278,6 +1326,36 @@ func TestHandleSessionEnd_PrintsMetrics(t *testing.T) {
 
 	if got != "{}" {
 		t.Errorf("expected empty JSON, got: %s", got)
+	}
+}
+
+// Issue #119: SessionEnd must auto-compute and persist the session Merkle root
+// over recorded actions so verify-time Phase 3 has something to bind to.
+func TestHandleSessionEnd_PopulatesSessionMerkleRoot(t *testing.T) {
+	h := newTestHandler(t)
+	ss := seedSession(t, h, "session-merkle-end", &aflock.Policy{Name: "test"})
+	h.stateManager.RecordAction(ss, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Read", ToolUseID: "a1", Decision: "allow",
+	})
+	h.stateManager.RecordAction(ss, aflock.ActionRecord{
+		Timestamp: time.Now(), ToolName: "Edit", ToolUseID: "a2", Decision: "allow",
+	})
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	captureStdout(t, func() {
+		if err := h.handleSessionEnd(&aflock.HookInput{SessionID: "session-merkle-end"}); err != nil {
+			t.Fatalf("handleSessionEnd: %v", err)
+		}
+	})
+
+	reloaded, err := h.stateManager.Load("session-merkle-end")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if reloaded.SessionMerkleRoot == "" {
+		t.Fatal("expected non-empty SessionMerkleRoot after SessionEnd, got empty")
 	}
 }
 
@@ -2281,6 +2359,50 @@ func TestHandlePreToolUse_IdentityConstraints_NoSessionStart_Denies(t *testing.T
 	}
 	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "identity verification") {
 		t.Errorf("expected reason about identity verification, got: %s", out.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+// Issue #121: PreToolUse must re-check identity policy against the persisted
+// AgentIdentityMeta as defense-in-depth, not only at post-hoc verify time.
+func TestHandlePreToolUse_IdentityConstraints_EnvironmentMismatch_Denies(t *testing.T) {
+	h := newTestHandler(t)
+	pol := &aflock.Policy{
+		Name: "identity-env",
+		Identity: &aflock.IdentityPolicy{
+			AllowedModels:       []string{"claude-*"},
+			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
+		},
+		Tools: &aflock.ToolsPolicy{Allow: []string{"*"}},
+	}
+	ss := seedSession(t, h, "sess-id-env", pol)
+	ss.AgentIdentityMeta = &aflock.AgentIdentityMeta{
+		Model:       "claude-opus-4-5-20251101",
+		Environment: "container:docker.io/evil/image",
+	}
+	if err := h.stateManager.Save(ss); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got := captureStdout(t, func() {
+		if err := h.handlePreToolUse(&aflock.HookInput{
+			SessionID: "sess-id-env", ToolName: "Read",
+			ToolInput: json.RawMessage(`{"file_path":"/tmp/x"}`),
+		}); err != nil {
+			t.Fatalf("handlePreToolUse: %v", err)
+		}
+	})
+
+	var out aflock.HookOutput
+	if err := json.Unmarshal([]byte(got), &out); err != nil {
+		t.Fatalf("parse: %v (raw: %s)", err, got)
+	}
+	if out.HookSpecificOutput.PermissionDecision != aflock.DecisionDeny {
+		t.Fatalf("expected deny on environment mismatch, got %s (reason=%s)",
+			out.HookSpecificOutput.PermissionDecision, out.HookSpecificOutput.PermissionDecisionReason)
+	}
+	if !strings.Contains(out.HookSpecificOutput.PermissionDecisionReason, "identity policy violation") {
+		t.Errorf("expected identity-policy-violation reason, got: %s",
+			out.HookSpecificOutput.PermissionDecisionReason)
 	}
 }
 

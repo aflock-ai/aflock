@@ -3,8 +3,10 @@ package verify
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,11 +14,11 @@ import (
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
-// ---- Unit tests for verifyIdentityConstraints ----
+// ---- Unit tests for VerifyIdentityConstraints ----
 
 func TestVerifyIdentityConstraints_NilPolicy(t *testing.T) {
 	id := IdentityFields{Model: "claude-opus-4-5-20251101", Environment: "local"}
-	errors := verifyIdentityConstraints(id, nil)
+	errors := VerifyIdentityConstraints(id, nil)
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for nil policy, got %v", errors)
 	}
@@ -24,7 +26,7 @@ func TestVerifyIdentityConstraints_NilPolicy(t *testing.T) {
 
 func TestVerifyIdentityConstraints_EmptyPolicy(t *testing.T) {
 	id := IdentityFields{Model: "claude-opus-4-5-20251101", Environment: "local"}
-	errors := verifyIdentityConstraints(id, &aflock.IdentityPolicy{})
+	errors := VerifyIdentityConstraints(id, &aflock.IdentityPolicy{})
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for empty policy, got %v", errors)
 	}
@@ -85,7 +87,7 @@ func TestVerifyIdentityConstraints_ModelMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Model: tt.model}
 			pol := &aflock.IdentityPolicy{AllowedModels: tt.allowedModels}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -145,7 +147,7 @@ func TestVerifyIdentityConstraints_EnvironmentMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Environment: tt.environment}
 			pol := &aflock.IdentityPolicy{AllowedEnvironments: tt.allowed}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -215,7 +217,7 @@ func TestVerifyIdentityConstraints_RequiredTools(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			id := IdentityFields{Tools: tt.tools}
 			pol := &aflock.IdentityPolicy{RequiredTools: tt.requiredTools}
-			errors := verifyIdentityConstraints(id, pol)
+			errors := VerifyIdentityConstraints(id, pol)
 			if tt.wantPass && len(errors) != 0 {
 				t.Errorf("Expected pass, got errors: %v", errors)
 			}
@@ -243,7 +245,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
 			RequiredTools:       []string{"Read", "Edit"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		if len(errors) != 0 {
 			t.Errorf("Expected pass, got errors: %v", errors)
 		}
@@ -258,7 +260,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedModels:       []string{"claude-opus-*"},
 			AllowedEnvironments: []string{"local"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		if len(errors) != 1 {
 			t.Errorf("Expected 1 error (model mismatch), got %d: %v", len(errors), errors)
 		}
@@ -275,7 +277,7 @@ func TestVerifyIdentityConstraints_MultipleConstraints(t *testing.T) {
 			AllowedEnvironments: []string{"container:ghcr.io/org/*"},
 			RequiredTools:       []string{"Read", "Edit"},
 		}
-		errors := verifyIdentityConstraints(id, pol)
+		errors := VerifyIdentityConstraints(id, pol)
 		// Should have: model mismatch + env mismatch + 2 missing tools = 4 errors
 		if len(errors) != 4 {
 			t.Errorf("Expected 4 errors, got %d: %v", len(errors), errors)
@@ -287,7 +289,7 @@ func TestVerifyIdentityConstraints_EmptyModel(t *testing.T) {
 	// Empty model with allowedModels should not error (graceful for missing data)
 	id := IdentityFields{Model: ""}
 	pol := &aflock.IdentityPolicy{AllowedModels: []string{"claude-opus-*"}}
-	errors := verifyIdentityConstraints(id, pol)
+	errors := VerifyIdentityConstraints(id, pol)
 	if len(errors) != 0 {
 		t.Errorf("Expected no errors for empty model, got %v", errors)
 	}
@@ -690,6 +692,52 @@ deny[msg] {
 	}
 }
 
+// Regression for issue #122: a whole-number CostUSD (e.g. 5.00) gets marshaled
+// as "5" and OPA reads it as an int, breaking "%.2f" in Rego sprintf with the
+// "%!f(int=N)" debug marker. The verifier patches the JSON before handing it
+// to OPA, so the deny reason must come back cleanly formatted.
+func TestVerifySession_RegoDeny_WholeNumberCost(t *testing.T) {
+	tmpDir := t.TempDir()
+	ss := &aflock.SessionState{
+		SessionID: "sess-rego-whole-cost",
+		StartedAt: time.Now().Add(-5 * time.Minute),
+		Policy: &aflock.Policy{
+			Name:    "rego-test",
+			Version: "1.0",
+			Evaluators: &aflock.EvaluatorsPolicy{
+				Rego: []aflock.RegoEvaluator{{
+					Name: "spend-limit",
+					Policy: `package aflock
+deny[msg] {
+  input.metrics.costUSD > 2.0
+  msg := sprintf("Child spend $%.2f exceeds $2.00 budget", [input.metrics.costUSD])
+}`,
+				}},
+			},
+		},
+		Actions: []aflock.ActionRecord{
+			{Timestamp: time.Now(), ToolName: "Read", ToolUseID: "tu_1", Decision: "allow"},
+		},
+		Metrics: &aflock.SessionMetrics{CostUSD: 5.00},
+	}
+	writeSessionState(t, tmpDir, "sess-rego-whole-cost", ss)
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-rego-whole-cost")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if result.Success {
+		t.Fatal("Expected rego deny")
+	}
+	joined := strings.Join(result.Errors, " | ")
+	if strings.Contains(joined, "%!f") {
+		t.Errorf("deny reason has sprintf format bug: %s", joined)
+	}
+	if !strings.Contains(joined, "$5.00") {
+		t.Errorf("expected formatted $5.00 in deny reason, got: %s", joined)
+	}
+}
+
 func TestVerifySession_NoRegoPolicy(t *testing.T) {
 	tmpDir := t.TempDir()
 	ss := &aflock.SessionState{
@@ -759,6 +807,58 @@ func TestVerifySession_RegoMultiplePolicies(t *testing.T) {
 	}
 }
 
+// Issue #118 / paper §4.5.1: Rego evaluators must see attestations under
+// input.attestations and raw envelopes under input.envelopes. Before this PR
+// both keys were absent so the paper's sample cross-step Rego always saw an
+// empty list. Write two DSSE envelopes to the session's attestations dir and
+// run a Rego policy that counts them.
+func TestVerifySession_RegoSeesAttestations(t *testing.T) {
+	tmpDir := t.TempDir()
+	ss := &aflock.SessionState{
+		SessionID: "sess-rego-attest",
+		StartedAt: time.Now().Add(-5 * time.Minute),
+		Policy: &aflock.Policy{
+			Name: "rego-attest", Version: "1.0",
+			Evaluators: &aflock.EvaluatorsPolicy{
+				Rego: []aflock.RegoEvaluator{{
+					Name: "expect-attestations",
+					Policy: `package aflock
+deny[msg] {
+  count(input.attestations) < 2
+  msg := sprintf("expected >= 2 attestations, got %d", [count(input.attestations)])
+}
+deny[msg] {
+  count(input.envelopes) < 2
+  msg := sprintf("expected >= 2 envelopes, got %d", [count(input.envelopes)])
+}`,
+				}},
+			},
+		},
+		Metrics: &aflock.SessionMetrics{},
+	}
+	writeSessionState(t, tmpDir, "sess-rego-attest", ss)
+
+	attestDir := filepath.Join(tmpDir, "sess-rego-attest", "attestations")
+	if err := os.MkdirAll(attestDir, 0755); err != nil {
+		t.Fatalf("mkdir attestations: %v", err)
+	}
+	for i, tool := range []string{"Read", "Edit"} {
+		envBytes := makeDSSEEnvelope(t, tool, "sess-rego-attest")
+		fname := filepath.Join(attestDir, fmt.Sprintf("a%d.intoto.json", i))
+		if err := os.WriteFile(fname, envBytes, 0644); err != nil {
+			t.Fatalf("write %s: %v", fname, err)
+		}
+	}
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-rego-attest")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Rego saw fewer attestations than expected: errors=%v", result.Errors)
+	}
+}
+
 // ---- Phase 3: Materials Binding (Merkle Tree) ----
 
 // buildMerkleRootFromActions computes the Merkle root from action records for test setup.
@@ -820,6 +920,46 @@ func TestVerifySession_MerklePass(t *testing.T) {
 	}
 	if !found {
 		t.Error("Expected passing materials:merkle check")
+	}
+}
+
+// Issue #119: when SessionEnd auto-populated sessionState.SessionMerkleRoot
+// the verifier must run Phase 3 against that root, even without policy
+// declaring materialsFrom — closing the "Phase 3 never fires on real sessions"
+// gap. Tampering with state.json afterwards must surface here.
+func TestVerifySession_MerklePass_AutoPopulatedRoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	actions := []aflock.ActionRecord{
+		{Timestamp: time.Now(), ToolName: "Read", ToolUseID: "tu_1", Decision: "allow"},
+		{Timestamp: time.Now(), ToolName: "Edit", ToolUseID: "tu_2", Decision: "allow"},
+	}
+	root := buildMerkleRootFromActions(t, actions)
+
+	ss := &aflock.SessionState{
+		SessionID:         "sess-merkle-auto",
+		StartedAt:         time.Now().Add(-5 * time.Minute),
+		Policy:            &aflock.Policy{Name: "no-materialsFrom", Version: "1.0"},
+		Actions:           actions,
+		Metrics:           &aflock.SessionMetrics{},
+		SessionMerkleRoot: root, // simulates SessionEnd auto-populate
+	}
+	writeSessionState(t, tmpDir, "sess-merkle-auto", ss)
+
+	result, err := newTestVerifier(tmpDir).VerifySession("sess-merkle-auto")
+	if err != nil {
+		t.Fatalf("VerifySession: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got errors: %v", result.Errors)
+	}
+	found := false
+	for _, c := range result.Checks {
+		if c.Name == "materials:merkle" && c.Passed {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected materials:merkle check to fire from auto-populated root")
 	}
 }
 
