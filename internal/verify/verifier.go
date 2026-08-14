@@ -376,6 +376,31 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 		Message: fmt.Sprintf("%d total actions, %d blocked", len(sessionState.Actions), deniedCount),
 	})
 
+	// Check 4b: Subagent trust-boundary crossings (#100). A spawned subagent's
+	// native tools route through Claude Code, not aflock, so aflock cannot
+	// attest what the child actually did. Surface permitted Task/Agent spawns so
+	// an auditor knows the session delegated work outside the enforcement plane.
+	// Advisory (delegation may be intended) — not a failure. The matching
+	// attestations carry predicate.trustBoundaryCrossing for external tooling.
+	spawnCount := 0
+	for _, action := range sessionState.Actions {
+		if aflock.IsSubagentSpawn(action.ToolName) && action.Decision != "deny" {
+			spawnCount++
+		}
+	}
+	if spawnCount > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"%d permitted subagent spawn(s) (Task/Agent) cross aflock's enforcement boundary; "+
+				"the subagent's native tools run outside aflock (issue #100) — audit the child "+
+				"out-of-band. Absence of this warning does not prove no delegation occurred.",
+			spawnCount))
+		result.Checks = append(result.Checks, CheckResult{
+			Name:    "subagent-trust-boundary",
+			Passed:  true,
+			Message: fmt.Sprintf("%d permitted subagent spawn(s) cross aflock's enforcement boundary", spawnCount),
+		})
+	}
+
 	// Check 5: Sublayout recursion (Phase 6)
 	if len(sessionState.Policy.Sublayouts) > 0 && len(sessionState.ChildSessionIDs) > 0 {
 		sublayoutErrors := v.verifySublayouts(sessionState, depth)

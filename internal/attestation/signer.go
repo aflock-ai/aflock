@@ -280,6 +280,14 @@ type ActionPredicate struct {
 	Metrics          *MetricsPredicate      `json:"metrics,omitempty"`
 	JWTBinding       *JWTBinding            `json:"jwtBinding,omitempty"`
 	SublayoutBinding *SublayoutBinding      `json:"sublayoutBinding,omitempty"`
+	// TrustBoundaryCrossing marks an attestation for a subagent-spawning tool
+	// (Task/Agent). The spawned subagent runs native tools that route through
+	// Claude Code, not aflock, so aflock cannot attest the child's own actions
+	// (issue #100). Auditors should treat a session containing this tag as
+	// having delegated work out of aflock's enforcement plane — but its ABSENCE
+	// is NOT proof that no delegation occurred. omitempty so non-spawn tools and
+	// legacy attestations carry no field and verifiers treat it as false.
+	TrustBoundaryCrossing bool `json:"trustBoundaryCrossing,omitempty"`
 }
 
 // SublayoutBinding records the parent-declared sublayout this child session
@@ -398,6 +406,11 @@ func (s *Signer) CreateActionAttestation(
 		JWTBinding:       jwtBinding,
 		SublayoutBinding: sublayoutBinding,
 	}
+
+	// Tag subagent spawns (Task/Agent) as a trust-boundary crossing (#100): the
+	// child's native tools execute outside aflock's enforcement plane, so this
+	// attestation marks where the audited scope is delegated away.
+	predicate.TrustBoundaryCrossing = aflock.IsSubagentSpawn(record.ToolName)
 
 	if s.identity != nil {
 		predicate.AgentID = s.identity.SPIFFEID.String()

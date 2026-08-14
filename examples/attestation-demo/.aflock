@@ -3,7 +3,7 @@
   "name": "attestation-demo",
   "tools": {
     "allow": ["Read", "Bash", "Edit", "Glob", "Grep"],
-    "deny": ["Task"]
+    "deny": ["Task", "Agent"]
   },
   "files": {
     "allow": ["src/**", "tests/**", "README.md"],

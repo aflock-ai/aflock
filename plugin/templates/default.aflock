@@ -1,6 +1,7 @@
 {
   "version": "1.0",
   "name": "default-policy",
+  "description": "Default aflock policy. NOTE: 'Task' and 'Agent' (subagent-spawning tools) are denied. A spawned subagent gets native Bash/Write/Edit that route through Claude Code's harness, NOT through aflock, so its actions fall outside aflock's enforcement (issue #100). Denying both keeps the enforcement boundary complete. To allow constrained delegation instead, declare sublayouts and run in hook mode; see docs/concepts/policies.md.",
 
   "limits": {
     "maxSpendUSD": { "value": 10.00, "enforcement": "fail-fast" },
@@ -10,7 +11,7 @@
 
   "tools": {
     "allow": ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "LSP", "WebFetch", "WebSearch"],
-    "deny": ["Task"],
+    "deny": ["Task", "Agent"],
     "requireApproval": [
       "Bash:rm -rf *",
       "Bash:git push --force",

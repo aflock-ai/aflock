@@ -551,12 +551,19 @@ type MaterialClassification struct {
 
 // SessionState represents the runtime state for a session.
 type SessionState struct {
-	SessionID  string          `json:"session_id"`
-	StartedAt  time.Time       `json:"started_at"`
-	Policy     *Policy         `json:"policy,omitempty"`
-	PolicyPath string          `json:"policy_path,omitempty"`
-	Metrics    *SessionMetrics `json:"metrics"`
-	Actions    []ActionRecord  `json:"actions,omitempty"`
+	SessionID  string    `json:"session_id"`
+	StartedAt  time.Time `json:"started_at"`
+	Policy     *Policy   `json:"policy,omitempty"`
+	PolicyPath string    `json:"policy_path,omitempty"`
+	// PolicyDigest is the SHA-256 hex digest of the raw on-disk policy file
+	// bytes captured at session init. PreToolUse re-hashes the file on every
+	// call and denies everything on mismatch, so an agent that rewrites its
+	// own .aflock mid-session gains nothing from the edit (issue #100).
+	// Empty for sessions initialized before this check existed — the check
+	// is skipped then.
+	PolicyDigest string          `json:"policy_digest,omitempty"`
+	Metrics      *SessionMetrics `json:"metrics"`
+	Actions      []ActionRecord  `json:"actions,omitempty"`
 	// Materials tracks accessed data sources with their classifications for provenance
 	Materials []MaterialClassification `json:"materials,omitempty"`
 	// ParentSessionID is set when this session was spawned by a parent agent

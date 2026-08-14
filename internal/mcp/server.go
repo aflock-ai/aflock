@@ -44,6 +44,14 @@ type Server struct {
 	agentIdentity *identity.AgentIdentity
 	sessionID     string
 
+	// policyFileDigest is the SHA-256 of the raw on-disk policy file bytes,
+	// captured at load. Every tool call re-hashes the file and denies on
+	// mismatch, so a mid-session rewrite of .aflock gains the agent nothing
+	// (issue #100). Distinct from policy.RawDigest: for signed policies
+	// RawDigest hashes the inner payload while this hashes the file as it
+	// sits on disk — which is what a tampering agent would overwrite.
+	policyFileDigest string
+
 	// (`mu` + `materials` were dead code after issue #61 / M7 removed the
 	// duplicate in-memory data-flow evaluation in handleBash. Removed
 	// entirely to satisfy golangci-lint's unused check.)
@@ -268,10 +276,17 @@ func (s *Server) Serve(policyPath string) error {
 		}
 	}
 
+	s.capturePolicyFileDigest()
+
 	// Refuse to start with an already-expired policy (#136). Mirrors hooks
 	// mode (handler.go) and verify CLI; MCP mode previously skipped this and
 	// served past Expires.
 	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
 		return err
 	}
 
@@ -344,8 +359,15 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 		}
 	}
 
+	s.capturePolicyFileDigest()
+
 	// Refuse to start with an already-expired policy (#136).
 	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
 		return err
 	}
 
@@ -499,8 +521,15 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 		}
 	}
 
+	s.capturePolicyFileDigest()
+
 	// Refuse to start with an already-expired policy (#136).
 	if err := s.errPolicyExpired(); err != nil {
+		return err
+	}
+
+	// Subagent-bypass guardrail (#100).
+	if err := s.warnSubagentMisconfig(); err != nil {
 		return err
 	}
 
@@ -629,6 +658,58 @@ func (s *Server) errPolicyExpired() error {
 		return nil
 	}
 	return fmt.Errorf("policy %q expired at %s", s.policy.Name, s.policy.Expires.Format(time.RFC3339))
+}
+
+// capturePolicyFileDigest freezes the SHA-256 of the on-disk policy file at
+// load time. errPolicyTampered re-hashes the file on every tool call and
+// denies on mismatch (issue #100). Called from Serve/ServeHTTP/ServeUnix
+// right after the policy load block.
+func (s *Server) capturePolicyFileDigest() {
+	if s.policyPath == "" {
+		return
+	}
+	if digest, err := policy.HashPolicyFile(s.policyPath); err == nil {
+		s.policyFileDigest = digest
+	}
+}
+
+// errPolicyTampered returns an error when the on-disk policy file no longer
+// matches the digest captured at load — the MCP-mode counterpart of the hooks
+// PreToolUse tamper check. Fails closed on read errors; an empty captured
+// digest (no policy loaded, or in-memory test policies) skips the check
+// (issue #100).
+func (s *Server) errPolicyTampered() error {
+	if denied, reason := policy.CheckPolicyTamper(s.policyPath, s.policyFileDigest); denied {
+		return fmt.Errorf("%s", reason)
+	}
+	return nil
+}
+
+// checkSelfProtect applies the guardrail-file write guard (issue #100) to an
+// MCP tool call before policy evaluation, so even a policy that allows Write
+// cannot permit modifying aflock's own policy or hook wiring.
+func (s *Server) checkSelfProtect(toolName string, toolInput map[string]interface{}) (bool, string) {
+	cwd, _ := os.Getwd()
+	protected := policy.ProtectedPaths(s.policyPath, cwd)
+	return policy.CheckSelfProtect(toolName, toolInput, protected)
+}
+
+// warnSubagentMisconfig logs a startup WARNING (or, with AFLOCK_STRICT=1,
+// returns an error to refuse startup) when the loaded policy permits spawning
+// an unconstrained subagent — the issue #100 enforcement bypass. In MCP mode a
+// subagent's native Bash/Write/Edit never route through aflock at all, so this
+// startup notice is the only point aflock can flag the misconfiguration to the
+// operator (deny Task/Agent in .claude/settings.local.json too).
+func (s *Server) warnSubagentMisconfig() error {
+	warn, msg := policy.CheckSubagentMisconfig(s.policy)
+	if !warn {
+		return nil
+	}
+	if os.Getenv("AFLOCK_STRICT") == "1" {
+		return fmt.Errorf("[aflock] %s (AFLOCK_STRICT=1)", msg)
+	}
+	fmt.Fprintf(os.Stderr, "[aflock] WARNING (#100): %s\n", msg)
+	return nil
 }
 
 // computePolicyDigest returns the SHA-256 digest of the loaded policy.
@@ -1079,6 +1160,33 @@ func (s *Server) handleCheckTool(ctx context.Context, request mcp.CallToolReques
 		return mcp.NewToolResultText(string(data)), nil
 	}
 
+	// Mid-session tamper detection (issue #100): same shape as the expired
+	// check above — a rewritten policy file denies everything.
+	if err := s.errPolicyTampered(); err != nil {
+		result := map[string]any{
+			"allowed":  false,
+			"decision": string(aflock.DecisionDeny),
+			"reason":   err.Error(),
+		}
+		data, _ := json.MarshalIndent(result, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
+
+	// Guardrail self-protection (issue #100): report denies for tool calls
+	// that would modify aflock's own policy or hook wiring, before policy
+	// evaluation — so aflock_authorize cannot green-light them.
+	if inputMap, ok := toolInputMap.(map[string]any); ok {
+		if denied, guardReason := s.checkSelfProtect(toolName, inputMap); denied {
+			result := map[string]any{
+				"allowed":  false,
+				"decision": string(aflock.DecisionDeny),
+				"reason":   guardReason,
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		}
+	}
+
 	inputJSON, _ := json.Marshal(toolInputMap)
 	evaluator := policy.NewEvaluator(s.policy, s.projectRoot())
 	decision, reason := evaluator.EvaluatePreToolUse(toolName, inputJSON)
@@ -1130,6 +1238,30 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 		"step":    step,
 		"reason":  reason,
 	})
+
+	// Mid-session tamper detection (issue #100): a rewritten policy file
+	// denies everything, before any policy evaluation.
+	if err := s.errPolicyTampered(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Guardrail self-protection (issue #100): commands that would modify
+	// aflock's own policy or hook wiring are denied before policy evaluation.
+	if denied, guardReason := s.checkSelfProtect("Bash", map[string]any{"command": command}); denied {
+		record := aflock.ActionRecord{
+			Timestamp: time.Now(),
+			ToolName:  "Bash",
+			ToolUseID: toolUseID,
+			ToolInput: inputJSON,
+			Decision:  string(aflock.DecisionDeny),
+			Reason:    guardReason,
+		}
+		s.recordAction("Bash", "deny", guardReason)
+		if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
+		}
+		return mcp.NewToolResultError(guardReason), nil
+	}
 
 	// Check policy
 	if s.policy != nil { //nolint:nestif
@@ -1368,6 +1500,12 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 	toolUseID := uuid.New().String()
 	inputJSON, _ := json.Marshal(map[string]string{"file_path": filePath})
 
+	// Mid-session tamper detection (issue #100): a rewritten policy file
+	// denies everything, reads included.
+	if err := s.errPolicyTampered(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Check policy
 	if s.policy != nil { //nolint:nestif
 		evaluator := policy.NewEvaluator(s.policy, s.projectRoot())
@@ -1463,6 +1601,31 @@ func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolReques
 	// Generate tool use ID for this invocation
 	toolUseID := uuid.New().String()
 	inputJSON, _ := json.Marshal(map[string]string{"file_path": filePath, "content_length": fmt.Sprintf("%d", len(content))})
+
+	// Mid-session tamper detection (issue #100): a rewritten policy file
+	// denies everything, before any policy evaluation.
+	if err := s.errPolicyTampered(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Guardrail self-protection (issue #100): writes to aflock's own policy
+	// or hook wiring are denied before policy evaluation, so even a policy
+	// that allows Write cannot permit them.
+	if denied, guardReason := s.checkSelfProtect("Write", map[string]any{"file_path": filePath}); denied {
+		record := aflock.ActionRecord{
+			Timestamp: time.Now(),
+			ToolName:  "Write",
+			ToolUseID: toolUseID,
+			ToolInput: inputJSON,
+			Decision:  string(aflock.DecisionDeny),
+			Reason:    guardReason,
+		}
+		s.recordAction("Write", "deny", guardReason)
+		if err := s.signAndStoreAttestation(ctx, record, jwtBinding); err != nil {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to sign attestation: %v\n", err)
+		}
+		return mcp.NewToolResultError(guardReason), nil
+	}
 
 	// Check policy
 	if s.policy != nil { //nolint:nestif

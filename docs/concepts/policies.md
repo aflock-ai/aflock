@@ -91,15 +91,33 @@ Follow the principle of least privilege — all access denied unless explicitly 
 {
   "tools": {
     "allow": ["Read", "Edit", "Bash", "Glob", "Grep"],
-    "deny": ["Task"],
+    "deny": ["Task", "Agent"],
     "requireApproval": ["Bash:rm -rf *", "Bash:git push --force"]
   }
 }
 ```
 
-- `allow`: Tools the agent can use freely
-- `deny`: Tools that are always blocked
-- `requireApproval`: Patterns that require human confirmation
+- `allow`: tools the agent can use freely. A non-empty `allow` list is itself a restriction — any tool not listed is denied.
+- `deny`: tools that are always blocked.
+- `requireApproval`: patterns that require human confirmation.
+
+**Precedence:** `deny` > `requireApproval` > `allow`. A tool in both `allow` and `deny` is denied.
+
+**Matching:** entries are glob-matched. A wildcard-free literal (e.g. `Task`) matches only that exact tool name — so `deny: ["Task"]` does **not** cover `Agent`. Use `Tool:pattern` to scope by command/argument (e.g. `Bash:rm -rf *`).
+
+### Subagent trust boundary (issue #100)
+
+`Task` and `Agent` are **subagent-spawning** tools, and they are two distinct names — deny **both**. This boundary matters because a spawned subagent runs Claude Code's **native** `Bash`/`Write`/`Edit`, which route through Claude Code's harness, **not** through aflock:
+
+- **MCP mode** (`aflock serve`): a native subagent tool call never reaches aflock at all, so aflock cannot see or block it. `tools.deny` is moot for a native spawn here — deny `Task`/`Agent` in `.claude/settings.local.json` (`permissions.deny`) so Claude Code itself refuses the spawn.
+- **Hook mode** (`aflock hook`): aflock's `PreToolUse` can **deny the spawn** outright, or — if the policy declares [sublayouts](sublayouts.md) — require the spawn to match a declared, attenuated sublayout, and it accounts for the child after the fact at `SubagentStop`. It does **not** intercept the subagent's individual native tool calls in real time: Claude Code does not fire parent hooks inside subagents ([claude-code#27661](https://github.com/anthropics/claude-code/issues/27661), [#34692](https://github.com/anthropics/claude-code/issues/34692)).
+
+**Safe patterns:**
+
+- **Forbid delegation (airtight):** deny `Task` and `Agent` in the policy and, for MCP mode, in `.claude/settings.local.json`. No spawn means no bypass.
+- **Constrained delegation:** allow the spawn but declare `sublayouts` (hook mode) so the child is attenuated and bound to a named slot. The child's native calls are still not enforced in real time — only delegate to subagents you trust, and audit them via the child's own attestations.
+
+aflock surfaces this trap two ways: it logs a startup **WARNING** (`AFLOCK_STRICT=1` refuses to start) when a policy permits `Task`/`Agent` without declaring sublayouts, and it tags `Task`/`Agent` attestations with `trustBoundaryCrossing` so `aflock verify` flags a session that delegated work out of the enforcement plane. The tag's *absence* does not prove no delegation occurred.
 
 ## File Access
 
