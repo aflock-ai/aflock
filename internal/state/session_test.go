@@ -88,6 +88,65 @@ func TestManagerSaveLoad(t *testing.T) {
 	}
 }
 
+// TestManagerListChildSessions verifies the enumeration used by the
+// parent-side fail-fast rollup (issue #135). The directory layout is
+// flat: every session is a sibling, and ParentSessionID is the only link.
+func TestManagerListChildSessions(t *testing.T) {
+	tmpDir := t.TempDir()
+	m := NewManager(tmpDir)
+
+	pol := &aflock.Policy{Name: "p", Version: "1"}
+
+	// Parent.
+	parent := m.Initialize("parent-A", pol, "/test/.aflock")
+	if err := m.Save(parent); err != nil {
+		t.Fatalf("save parent: %v", err)
+	}
+
+	// Two children of parent-A.
+	c1 := m.Initialize("child-A1", pol, "/test/.aflock")
+	c1.ParentSessionID = "parent-A"
+	if err := m.Save(c1); err != nil {
+		t.Fatalf("save c1: %v", err)
+	}
+	c2 := m.Initialize("child-A2", pol, "/test/.aflock")
+	c2.ParentSessionID = "parent-A"
+	if err := m.Save(c2); err != nil {
+		t.Fatalf("save c2: %v", err)
+	}
+
+	// Unrelated session (different parent) — must not be returned.
+	other := m.Initialize("child-of-other", pol, "/test/.aflock")
+	other.ParentSessionID = "parent-B"
+	if err := m.Save(other); err != nil {
+		t.Fatalf("save other: %v", err)
+	}
+
+	children, err := m.ListChildSessions("parent-A")
+	if err != nil {
+		t.Fatalf("ListChildSessions: %v", err)
+	}
+	if got, want := len(children), 2; got != want {
+		t.Fatalf("got %d children, want %d", got, want)
+	}
+	seen := map[string]bool{}
+	for _, c := range children {
+		seen[c.SessionID] = true
+		if c.ParentSessionID != "parent-A" {
+			t.Errorf("child %q has wrong ParentSessionID: %q", c.SessionID, c.ParentSessionID)
+		}
+	}
+	if !seen["child-A1"] || !seen["child-A2"] {
+		t.Errorf("missing expected children, got %v", seen)
+	}
+	if seen["child-of-other"] {
+		t.Error("ListChildSessions returned an unrelated session")
+	}
+	if seen["parent-A"] {
+		t.Error("ListChildSessions returned the parent itself")
+	}
+}
+
 func TestManagerLoadNonexistent(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(tmpDir)

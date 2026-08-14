@@ -251,6 +251,51 @@ func expandPath(path string) string {
 	return path
 }
 
+// ListChildSessions returns all sessions whose ParentSessionID equals
+// parentID. Used by handlePostToolUse to roll up in-flight subagent spend
+// into the parent's fail-fast check (paper §5 invariant #2, issue #135):
+// without this, a child's tokens/cost only land in the parent at
+// SubagentStop, leaving a window where the parent can pass fail-fast while
+// concurrent children blow through the ceiling.
+//
+// Lock-free: Save uses atomic rename, so each child state.json is read
+// either as the previous full version or the next full version, never
+// partial. Callers should treat the snapshot as point-in-time.
+//
+// Unreadable or malformed child state files are skipped silently — one
+// broken neighbor must not block the parent's rollup. The parent's own
+// state is filtered out so a parent can never be rolled up into itself.
+func (m *Manager) ListChildSessions(parentID string) ([]*aflock.SessionState, error) {
+	entries, err := os.ReadDir(m.stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read state dir: %w", err)
+	}
+	var children []*aflock.SessionState
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		sid := entry.Name()
+		if sid == parentID {
+			continue
+		}
+		if err := validateSessionID(sid); err != nil {
+			continue
+		}
+		state, loadErr := m.Load(sid)
+		if loadErr != nil || state == nil {
+			continue
+		}
+		if state.ParentSessionID == parentID {
+			children = append(children, state)
+		}
+	}
+	return children, nil
+}
+
 // LoadMetrics loads just the metrics from session state.
 func (m *Manager) LoadMetrics(sessionID string) (*aflock.SessionMetrics, error) {
 	state, err := m.Load(sessionID)

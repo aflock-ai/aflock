@@ -20,6 +20,7 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
+	"github.com/aflock-ai/aflock/internal/auth/claudeauth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/output"
 	"github.com/aflock-ai/aflock/internal/policy"
@@ -158,6 +159,19 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 
 	// Initialize session state
 	sessionState := h.stateManager.Initialize(input.SessionID, pol, policyPath)
+
+	// Capture which claude-code auth path is active. Cost-based limits
+	// downgrade to advisory unless this is api_key — see
+	// internal/auth/claudeauth/detect.go for the why.
+	sessionState.AuthMode = string(claudeauth.Detect())
+
+	// Surface the auth-mode posture up front so users see the
+	// limitation before any tool runs, not only when a limit trips
+	// at PostToolUse (issue #111). Token limits stay enforced under
+	// both modes — only maxSpendUSD goes advisory.
+	if msg := subscriptionAdvisoryWarning(pol, sessionState.AuthMode); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
 
 	// Save agent identity metadata for reuse in PostToolUse attestations
 	sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
@@ -639,6 +653,12 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// Refresh token/cost metrics from the claude-code transcript JSONL
+	// before evaluating limits. The in-process counters (Turns, Tokens,
+	// CostUSD) are only populated by this scan — without it, every
+	// cost-based limit would silently evaluate as 0.
+	refreshUsageFromTranscript(sessionState, input.TranscriptPath, sessionState.AuthMode)
+
 	// Save updated state
 	if err := h.stateManager.Save(sessionState); err != nil {
 		output.ExitWithWarning(fmt.Sprintf("Failed to save session state: %v", err))
@@ -647,10 +667,36 @@ func (h *Handler) handlePostToolUse(input *aflock.HookInput) error {
 	// Check fail-fast limits after tool execution
 	if sessionState.Policy != nil && sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
-		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "fail-fast")
+
+		// Roll up in-flight subagent metrics into a transient effective view
+		// before the limit check (paper §5 invariant #2, issue #135). Without
+		// this, the parent's fail-fast sees only its own spend; a child
+		// running concurrently can push the combined total past the ceiling
+		// before SubagentStop ever fires and merges. The race window narrows
+		// to one child-tool-call delta, which the issue explicitly accepts.
+		metricsForLimits := sessionState.Metrics
+		if children, listErr := h.stateManager.ListChildSessions(sessionState.SessionID); listErr == nil {
+			rolled, included := rollupUnmergedChildren(sessionState, children)
+			if len(included) > 0 {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Subagent rollup: including %d in-flight child(ren) %v in fail-fast limit check\n",
+					len(included), included)
+				metricsForLimits = rolled
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: list child sessions for rollup: %v\n", listErr)
+		}
+
+		exceeded, limitName, msg := evaluator.CheckLimits(metricsForLimits, "fail-fast")
 		if exceeded {
-			return output.Write(output.PostToolUseBlock(
-				fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, metricsForLimits.CostMeasured) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced — JSONL-derived cost is approximate under non-api_key sessions): %s\n",
+					limitName, sessionState.AuthMode, msg)
+			} else {
+				return output.Write(output.PostToolUseBlock(
+					fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 		// maxWallTimeSeconds isn't represented in SessionMetrics, so check it
 		// against StartedAt separately (issue #120).
@@ -1123,13 +1169,21 @@ func (h *Handler) handleSubagentStop(input *aflock.HookInput) error {
 			fmt.Sprintf("[aflock] Subagent cannot stop: missing attestations for used tools: %v", missing)))
 	}
 
-	// Check post-hoc limits on the child session
+	// Check post-hoc limits on the child session. Cost-based limits are
+	// downgraded to advisory unless this is an api_key session — same
+	// rationale as the top-level SessionEnd path.
 	if childState.Policy != nil && childState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(childState.Policy, filepath.Dir(childState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(childState.Metrics, "post-hoc")
 		if exceeded {
-			return output.Write(output.StopBlock(
-				fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			if evaluator.IsAdvisoryLimit(limitName, childState.AuthMode, childState.Metrics.CostMeasured) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: subagent %s exceeded under auth_mode=%s (not enforced): %s\n",
+					limitName, childState.AuthMode, msg)
+			} else {
+				return output.Write(output.StopBlock(
+					fmt.Sprintf("[aflock] Subagent limit exceeded: %s - %s", limitName, msg)))
+			}
 		}
 		if !childState.StartedAt.IsZero() {
 			elapsed := time.Since(childState.StartedAt)
@@ -1160,6 +1214,14 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 		return output.WriteEmpty()
 	}
 
+	// Settle the trailing turn into metrics: PostToolUse runs before the
+	// model's final assistant turn lands in the JSONL, so without this
+	// the last turn's tokens never make it into post-hoc enforcement.
+	refreshUsageFromTranscript(sessionState, input.TranscriptPath, sessionState.AuthMode)
+	if err := h.stateManager.Save(sessionState); err != nil {
+		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session state: %v\n", err)
+	}
+
 	// Check post-hoc limits
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
@@ -1176,7 +1238,13 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 			}
 		}
 		if exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc"); exceeded {
-			recordPostHoc(limitName, msg)
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) {
+				fmt.Fprintf(os.Stderr,
+					"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced): %s\n",
+					limitName, sessionState.AuthMode, msg)
+			} else {
+				recordPostHoc(limitName, msg)
+			}
 		}
 		if !sessionState.StartedAt.IsZero() {
 			elapsed := time.Since(sessionState.StartedAt)
@@ -1198,8 +1266,10 @@ func (h *Handler) handleSessionEnd(input *aflock.HookInput) error {
 	}
 
 	// Log final metrics
-	fmt.Fprintf(os.Stderr, "[aflock] Session ended. Metrics: turns=%d, toolCalls=%d\n",
-		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls)
+	fmt.Fprintf(os.Stderr, "[aflock] Session ended. Metrics: turns=%d, toolCalls=%d, tokensIn=%d, tokensOut=%d, costUSD=%.4f (auth_mode=%s)\n",
+		sessionState.Metrics.Turns, sessionState.Metrics.ToolCalls,
+		sessionState.Metrics.TokensIn, sessionState.Metrics.TokensOut,
+		sessionState.Metrics.CostUSD, sessionState.AuthMode)
 
 	return output.WriteEmpty()
 }
@@ -1570,6 +1640,26 @@ func matchSublayoutForSpawn(toolName string, toolInput json.RawMessage, sublayou
 	return nil, true
 }
 
+// subscriptionAdvisoryWarning returns the one-line stderr message
+// handleSessionStart emits when the policy declares a cost-derived
+// limit that downgrades to advisory under the current auth mode
+// (issue #111). Returns "" when no warning applies — i.e. when the
+// caller is on api_key billing, or when the policy doesn't declare
+// any limit affected by the auth mode. Token/turn limits remain
+// enforced regardless of mode, so they don't trigger a warning here.
+func subscriptionAdvisoryWarning(pol *aflock.Policy, authMode string) string {
+	if pol == nil || pol.Limits == nil || pol.Limits.MaxSpendUSD == nil {
+		return ""
+	}
+	if authMode == string(claudeauth.ModeAPIKey) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[aflock] Warning: auth_mode=%s — maxSpendUSD is advisory only (set ANTHROPIC_API_KEY for authoritative cost accounting). Token/turn limits remain enforced.",
+		authMode)
+}
+
+
 // attenuateLimits computes effective limits for a child session.
 // For each limit field: child effective = min(child policy limit, parent remaining).
 // If a parent has exhausted its budget, the child gets 0.
@@ -1614,6 +1704,56 @@ func attenuateLimits(childLimits, parentLimits *aflock.LimitsPolicy, parentMetri
 	}
 
 	return result
+}
+
+// rollupUnmergedChildren returns effective metrics that include in-flight
+// children whose SubagentStop hasn't yet fired. Children already present in
+// parent.ChildSessionIDs are skipped — their metrics were merged into
+// parent.Metrics at SubagentStop and counting them again would double-count
+// (paper §5 invariant #2, issue #135).
+//
+// Mirrors the merge field set in mergeChildIntoParent: TokensIn, TokensOut,
+// CostUSD, ToolCalls. Turns are deliberately not composed across the
+// boundary (each session has its own conversation-turn counter; summing
+// them isn't meaningful and the existing merge also skips them).
+//
+// Returns a new SessionMetrics — does NOT mutate parent.Metrics, because
+// SubagentStop will perform the durable merge later.
+func rollupUnmergedChildren(parent *aflock.SessionState, children []*aflock.SessionState) (*aflock.SessionMetrics, []string) {
+	if parent == nil || parent.Metrics == nil {
+		return nil, nil
+	}
+	merged := make(map[string]bool, len(parent.ChildSessionIDs))
+	for _, cid := range parent.ChildSessionIDs {
+		merged[cid] = true
+	}
+
+	effective := *parent.Metrics
+	if effective.Tools != nil {
+		// Copy the Tools map so callers writing through the returned metrics
+		// can't accidentally mutate the parent's persisted state.
+		copied := make(map[string]int, len(effective.Tools))
+		for k, v := range effective.Tools {
+			copied[k] = v
+		}
+		effective.Tools = copied
+	}
+
+	var included []string
+	for _, child := range children {
+		if child == nil || child.Metrics == nil {
+			continue
+		}
+		if merged[child.SessionID] {
+			continue
+		}
+		effective.TokensIn += child.Metrics.TokensIn
+		effective.TokensOut += child.Metrics.TokensOut
+		effective.CostUSD += child.Metrics.CostUSD
+		effective.ToolCalls += child.Metrics.ToolCalls
+		included = append(included, child.SessionID)
+	}
+	return &effective, included
 }
 
 // mergeChildIntoParent merges the child session's actions, metrics, and

@@ -997,6 +997,31 @@ func matchGrantPattern(value string, patterns []string) (bool, string) {
 	return false, ""
 }
 
+// IsAdvisoryLimit reports whether a named limit must be downgraded
+// from enforce to advisory. Cost-derived limits (maxSpendUSD) are
+// advisory unless we have an authoritative dollar figure, which means
+// BOTH: api_key billing (the JSONL cost matches the bill) AND every
+// model in the session was priceable (costMeasured). An unpriced model
+// computes as $0, so enforcing against that number would silently let
+// a session blow past maxSpendUSD — costMeasured=false keeps the cap
+// advisory instead of falsely enforcing an under-count. Token limits
+// (maxTokensIn/Out, maxTurns, maxToolCalls) stay enforced under every
+// mode because transcript token counts are accurate regardless of how
+// the session is billed; costMeasured does not affect them.
+//
+// Empty authMode preserves the legacy enforce-everything behavior for
+// sessions/tests that predate auth-mode capture.
+func (e *Evaluator) IsAdvisoryLimit(limitName, authMode string, costMeasured bool) bool {
+	if authMode == "" {
+		return false
+	}
+	switch limitName {
+	case "maxSpendUSD":
+		return authMode != "api_key" || !costMeasured
+	}
+	return false
+}
+
 // CheckLimits checks if cumulative metrics exceed policy limits.
 // Returns (exceeded, limitName, message).
 // CheckWallTime reports whether the session has exceeded maxWallTimeSeconds

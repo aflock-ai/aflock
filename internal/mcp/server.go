@@ -28,10 +28,12 @@ import (
 
 	"github.com/aflock-ai/aflock/internal/attestation"
 	"github.com/aflock-ai/aflock/internal/auth"
+	"github.com/aflock-ai/aflock/internal/auth/claudeauth"
 	"github.com/aflock-ai/aflock/internal/identity"
 	"github.com/aflock-ai/aflock/internal/identity/peercred"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/state"
+	"github.com/aflock-ai/aflock/internal/usage"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
 
@@ -291,6 +293,7 @@ func (s *Server) Serve(policyPath string) error {
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
@@ -368,6 +371,7 @@ func (s *Server) ServeHTTP(policyPath string, port int) error {
 	// Initialize session state if we have a policy
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
@@ -600,6 +604,7 @@ func (s *Server) ServeUnix(policyPath, socketPath string) error {
 
 	if s.policy != nil {
 		sessionState := s.stateManager.Initialize(s.sessionID, s.policy, s.policyPath)
+		sessionState.AuthMode = string(claudeauth.Detect())
 		if err := s.stateManager.Save(sessionState); err != nil {
 			fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to save session: %v\n", err)
 		}
@@ -1105,6 +1110,11 @@ func (s *Server) handleBash(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 	jwtBinding := s.buildJWTBinding(request, claims)
 
+	// Enforce token/cost fail-fast limits from transcript usage (#72).
+	if denied := s.refreshAndEnforceLimits(); denied != nil {
+		return denied, nil
+	}
+
 	command := request.GetString("command", "")
 	timeoutSec := request.GetFloat("timeout", 30)
 	workdir := request.GetString("workdir", "")
@@ -1356,6 +1366,11 @@ func (s *Server) handleReadFile(ctx context.Context, request mcp.CallToolRequest
 	}
 	jwtBinding := s.buildJWTBinding(request, claims)
 
+	// Enforce token/cost fail-fast limits from transcript usage (#72).
+	if denied := s.refreshAndEnforceLimits(); denied != nil {
+		return denied, nil
+	}
+
 	filePath := request.GetString("path", "")
 
 	// Resolve path
@@ -1450,6 +1465,11 @@ func (s *Server) handleWriteFile(ctx context.Context, request mcp.CallToolReques
 		return mcp.NewToolResultError("Authorization denied: tool 'Write' not permitted by token scope"), nil
 	}
 	jwtBinding := s.buildJWTBinding(request, claims)
+
+	// Enforce token/cost fail-fast limits from transcript usage (#72).
+	if denied := s.refreshAndEnforceLimits(); denied != nil {
+		return denied, nil
+	}
 
 	filePath := request.GetString("path", "")
 	content := request.GetString("content", "")
@@ -1566,20 +1586,30 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 	}
 
 	metrics := map[string]any{
-		"turns":        0,
-		"toolCalls":    0,
-		"tokensIn":     0,
-		"tokensOut":    0,
-		"costUSD":      0.0,
-		"filesRead":    0,
-		"filesWritten": 0,
+		"turns":              0,
+		"toolCalls":          0,
+		"tokensIn":           0,
+		"tokensOut":          0,
+		"cacheReadTokens":    0,
+		"cacheWrite5mTokens": 0,
+		"cacheWrite1hTokens": 0,
+		"costUSD":            0.0,
+		"costMeasured":       false,
+		"usageSource":        "",
+		"filesRead":          0,
+		"filesWritten":       0,
 	}
 	if sessionState.Metrics != nil {
 		metrics["turns"] = sessionState.Metrics.Turns
 		metrics["toolCalls"] = sessionState.Metrics.ToolCalls
 		metrics["tokensIn"] = sessionState.Metrics.TokensIn
 		metrics["tokensOut"] = sessionState.Metrics.TokensOut
+		metrics["cacheReadTokens"] = sessionState.Metrics.CacheReadTokens
+		metrics["cacheWrite5mTokens"] = sessionState.Metrics.CacheWrite5mTokens
+		metrics["cacheWrite1hTokens"] = sessionState.Metrics.CacheWrite1hTokens
 		metrics["costUSD"] = sessionState.Metrics.CostUSD
+		metrics["costMeasured"] = sessionState.Metrics.CostMeasured
+		metrics["usageSource"] = sessionState.Metrics.UsageSource
 		metrics["filesRead"] = len(sessionState.Metrics.FilesRead)
 		metrics["filesWritten"] = len(sessionState.Metrics.FilesWritten)
 	}
@@ -1588,6 +1618,7 @@ func (s *Server) handleGetSession(ctx context.Context, request mcp.CallToolReque
 		"sessionId":    s.sessionID,
 		"policyName":   policyName,
 		"startedAt":    sessionState.StartedAt,
+		"authMode":     sessionState.AuthMode,
 		"metrics":      metrics,
 		"actionsCount": len(sessionState.Actions),
 	}
@@ -1696,6 +1727,10 @@ func (s *Server) handleCheckLimits(ctx context.Context, request mcp.CallToolRequ
 	if s.policy == nil || s.policy.Limits == nil {
 		return mcp.NewToolResultText(`{"limits": {}}`), nil
 	}
+
+	// Fold in the latest transcript usage so remaining budget is current
+	// rather than whatever was last persisted (#72).
+	s.refreshMetricsFromTranscript()
 
 	sessionState, err := s.stateManager.Load(s.sessionID)
 	if err != nil {
@@ -1953,6 +1988,73 @@ func (s *Server) recordAction(toolName, decision, reason string) {
 	}
 	s.stateManager.RecordAction(sessionState, record)
 	_ = s.stateManager.Save(sessionState)
+}
+
+// refreshAndEnforceLimits refreshes token/cost metrics from the Claude
+// transcript JSONL and enforces fail-fast limits in MCP mode (issue
+// #72). Before this, MCP-mode metrics stayed 0 — maxSpendUSD /
+// maxTokensIn never fired because aflock isn't on the Anthropic API
+// path. We recover the numbers the same way hooks PostToolUse does, by
+// scanning the transcript that the workspace dir maps to.
+//
+// Returns a deny result when a non-advisory fail-fast limit has already
+// been breached (so this call is the one blocked), nil otherwise.
+// Best-effort: if the transcript can't be located it leaves metrics
+// untouched and returns nil (fails open on discovery only — never
+// fabricates a pass once metrics are loaded).
+func (s *Server) refreshAndEnforceLimits() *mcp.CallToolResult {
+	if s.policy == nil || s.policy.Limits == nil {
+		return nil
+	}
+	s.refreshMetricsFromTranscript()
+
+	state, _ := s.stateManager.Load(s.sessionID)
+	if state == nil || state.Metrics == nil {
+		return nil
+	}
+	eval := policy.NewEvaluator(s.policy, s.projectRoot())
+	exceeded, limitName, msg := eval.CheckLimits(state.Metrics, "fail-fast")
+	if !exceeded {
+		return nil
+	}
+	if eval.IsAdvisoryLimit(limitName, state.AuthMode, state.Metrics.CostMeasured) {
+		fmt.Fprintf(os.Stderr,
+			"[aflock] Advisory: %s exceeded under auth_mode=%s (not enforced): %s\n",
+			limitName, state.AuthMode, msg)
+		return nil
+	}
+	return mcp.NewToolResultError(fmt.Sprintf("[aflock] Limit exceeded: %s - %s", limitName, msg))
+}
+
+// refreshMetricsFromTranscript discovers the workspace's Claude
+// transcript and folds its token/cost usage into the persisted session
+// metrics. No enforcement — callers that need it run CheckLimits after.
+// Best-effort: a missing transcript leaves metrics untouched.
+func (s *Server) refreshMetricsFromTranscript() {
+	if s.policy == nil {
+		return
+	}
+	_, transcriptPath, err := identity.FindTranscriptForWorkDir(s.projectRoot())
+	if err != nil || transcriptPath == "" {
+		return
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	unlock, lockErr := s.stateManager.LockSession(s.sessionID)
+	if lockErr != nil {
+		return
+	}
+	defer unlock()
+
+	state, _ := s.stateManager.Load(s.sessionID)
+	if state == nil || state.Metrics == nil {
+		return
+	}
+	// Filter "" accepts every assistant row: the discovered file is
+	// already this session's transcript, so its rows all belong here and
+	// the aflock session id (mcp-…) would never match the Claude id.
+	usage.RefreshSessionMetrics(state, transcriptPath, "", state.AuthMode)
+	_ = s.stateManager.Save(state)
 }
 
 // trackFile tracks a file access in the session state.

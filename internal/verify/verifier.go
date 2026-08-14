@@ -297,18 +297,30 @@ func (v *Verifier) verifySessionWithDepth(sessionID string, depth int) (*Result,
 		}
 	}
 
-	// Check 1: Policy limits (post-hoc)
+	// Check 1: Policy limits (post-hoc). Cost-based limits stay advisory
+	// under non-api_key sessions (the JSONL-derived dollar number is
+	// systematically wrong without claude-code's internal helper calls).
 	if sessionState.Policy.Limits != nil {
 		evaluator := policy.NewEvaluator(sessionState.Policy, filepath.Dir(sessionState.PolicyPath))
 		exceeded, limitName, msg := evaluator.CheckLimits(sessionState.Metrics, "post-hoc")
 		if exceeded {
-			result.Success = false
-			result.Checks = append(result.Checks, CheckResult{
-				Name:    "limits:" + limitName,
-				Passed:  false,
-				Message: msg,
-			})
-			result.Errors = append(result.Errors, msg)
+			if evaluator.IsAdvisoryLimit(limitName, sessionState.AuthMode, sessionState.Metrics.CostMeasured) {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("advisory: %s exceeded under auth_mode=%s — %s", limitName, sessionState.AuthMode, msg))
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "limits:" + limitName,
+					Passed:  true,
+					Message: "advisory (non-api_key auth)",
+				})
+			} else {
+				result.Success = false
+				result.Checks = append(result.Checks, CheckResult{
+					Name:    "limits:" + limitName,
+					Passed:  false,
+					Message: msg,
+				})
+				result.Errors = append(result.Errors, msg)
+			}
 		} else {
 			result.Checks = append(result.Checks, CheckResult{
 				Name:   "limits:post-hoc",

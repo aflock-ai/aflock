@@ -673,6 +673,17 @@ func discoverModelWithSessionFromPID(startPID int) (model, sessionID, sessionPat
 	return "", "", "", fmt.Errorf("could not discover model from process chain")
 }
 
+// FindTranscriptForWorkDir resolves the Claude session id and transcript
+// JSONL path for a given working directory, without walking the process
+// tree. The MCP server uses this (issue #72): it runs as a long-lived
+// daemon whose parent is the shell, not claude, so the getppid-based
+// DiscoverModelWithSession can't reach the claude process — but the
+// workspace dir maps deterministically to ~/.claude/projects/<slug>.
+func FindTranscriptForWorkDir(workDir string) (sessionID, transcriptPath string, err error) {
+	_, sessionID, transcriptPath, err = findModelAndSessionFromWorkingDir(workDir)
+	return sessionID, transcriptPath, err
+}
+
 // findModelAndSessionFromWorkingDir finds model and session info from working directory.
 func findModelAndSessionFromWorkingDir(workDir string) (model, sessionID, sessionPath string, err error) {
 	homeDir, err := os.UserHomeDir()
