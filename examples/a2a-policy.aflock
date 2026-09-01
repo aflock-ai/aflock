@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "name": "a2a-gated-agent",
+
+  "tools": {
+    "allow": ["Read", "Grep", "Glob", "WebFetch", "Bash"]
+  },
+
+  "domains": {
+    "allow": ["api.anthropic.com", "agents.partner.example"]
+  },
+
+  "roots": {
+    "partner-ca": "certs/partner-fulcio-root.pem"
+  },
+
+  "agents": {
+    "endpoints": ["https://agents.partner.example/*", "agents.partner.example"],
+    "requireSignedCard": true,
+    "cards": {
+      "partner-triage": "cards/partner-triage.signed.json"
+    },
+    "issuers": ["https://token.actions.githubusercontent.com"],
+    "allow": [
+      "agent:spiffe://judge.testifysec.com/tenant/acme/agent/*",
+      "workflow:https://github.com/partner-org/*"
+    ],
+    "deny": [
+      "human:*"
+    ]
+  }
+}

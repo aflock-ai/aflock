@@ -148,6 +148,7 @@ type Policy struct {
 	Tools      *ToolsPolicy    `json:"tools,omitempty"`
 	Files      *FilesPolicy    `json:"files,omitempty"`
 	Domains    *DomainsPolicy  `json:"domains,omitempty"`
+	Agents     *AgentsPolicy   `json:"agents,omitempty"`
 	DataFlow   *DataFlowPolicy `json:"dataFlow,omitempty"`
 	Hooks      *HooksConfig    `json:"hooks,omitempty"`
 	Sublayouts []Sublayout     `json:"sublayouts,omitempty"`
@@ -405,6 +406,37 @@ type FilesPolicy struct {
 type DomainsPolicy struct {
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+}
+
+// AgentsPolicy governs agent-to-agent connections: which outbound endpoints
+// count as "talking to another agent", and which peer principals — verified
+// from signed A2A AgentCards — the agent is allowed to talk to.
+//
+// Peer identity patterns in Allow/Deny may be prefixed with a principal kind
+// ("agent:", "human:", "workflow:") that must match the SAN taxonomy of the
+// card's signing certificate; the remainder is a glob matched against the
+// principal ID (SPIFFE URI, email, or workflow URI). Example:
+//
+//	"allow": ["agent:spiffe://judge.testifysec.com/tenant/acme/agent/*"]
+type AgentsPolicy struct {
+	// Endpoints are URL globs (matched against the full URL and its host)
+	// that classify a network tool call as an agent-to-agent connection.
+	// Empty means the agents gate never fires.
+	Endpoints []string `json:"endpoints,omitempty"`
+	// Allow / Deny are peer principal patterns. Deny wins; a non-empty
+	// Allow means the peer must match one of its patterns.
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+	// RequireSignedCard, when true, denies agent connections whose endpoint
+	// has no pinned, verifiable AgentCard.
+	RequireSignedCard bool `json:"requireSignedCard,omitempty"`
+	// Cards maps a name to the path of a pinned signed AgentCard file
+	// (relative paths resolve against the project root). A card vouches for
+	// the endpoint named in its agentCard.url.
+	Cards map[string]string `json:"cards,omitempty"`
+	// Issuers, when non-empty, are glob patterns the card signer's Fulcio
+	// OIDC issuer extension must match.
+	Issuers []string `json:"issuers,omitempty"`
 }
 
 // MaterialsPolicy defines materials binding for provenance.

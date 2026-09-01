@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/aflock-ai/aflock/internal/a2a"
 	"github.com/aflock-ai/aflock/internal/hooks"
 	"github.com/aflock-ai/aflock/internal/mcp"
 	"github.com/aflock-ai/aflock/internal/plan"
@@ -318,6 +319,63 @@ stdout on success.`,
 	},
 }
 
+// agent command flags
+var (
+	agentCardIdentities []string
+	agentCardIssuers    []string
+	agentCardRoots      []string
+)
+
+var agentCmd = &cobra.Command{
+	Use:   "agent",
+	Short: "Agent-to-agent identity commands",
+}
+
+var agentVerifyCardCmd = &cobra.Command{
+	Use:   "verify-card <signed-card.json>",
+	Short: "Verify a signed A2A AgentCard and print the signing principal",
+	Long: `Verify a sigstore-a2a signed AgentCard: DSSE signature, certificate
+chain to the trust roots (default: the Sigstore public Fulcio root), and the
+card's binding to the signed statement's subject digest.
+
+Prints the card metadata and the signing principal — kind (agent / human /
+workflow, by SAN taxonomy), identity, and OIDC issuer — as JSON. Exits 1 if
+verification fails or the principal does not match --identity/--issuer.`,
+	Args: cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		data, err := os.ReadFile(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Read card: %v\n", err)
+			os.Exit(1)
+		}
+		rootMap := map[string]aflock.Root{}
+		for i, path := range agentCardRoots {
+			rootMap[fmt.Sprintf("root-%d", i)] = aflock.Root{Certificate: path}
+		}
+		roots, err := a2a.LoadRoots(rootMap, "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Load roots: %v\n", err)
+			os.Exit(1)
+		}
+		res, err := a2a.VerifySignedCard(data, a2a.Options{Roots: roots, Issuers: agentCardIssuers})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Verification failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(agentCardIdentities) > 0 && !res.Principal.MatchIdentity(agentCardIdentities) {
+			fmt.Fprintf(os.Stderr, "Verification failed: principal %s:%s does not match --identity constraints\n",
+				res.Principal.Kind, res.Principal.ID)
+			os.Exit(1)
+		}
+		out, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Marshal result: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+	},
+}
+
 // plan-to-policy command flags
 var (
 	planPath       string
@@ -617,12 +675,19 @@ func init() {
 	rootCmd.AddCommand(signCmd)
 	rootCmd.AddCommand(policyCmd)
 	policyCmd.AddCommand(policyVerifyCmd)
+	rootCmd.AddCommand(agentCmd)
+	agentCmd.AddCommand(agentVerifyCardCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(planToPolicyCmd)
 	rootCmd.AddCommand(replayCmd)
 
 	// Add --hook flag as alternative to hook subcommand for backwards compatibility
 	rootCmd.Flags().StringVar(&hookFlag, "hook", "", "Hook event to handle (alternative to 'hook' subcommand)")
+
+	// Agent verify-card flags
+	agentVerifyCardCmd.Flags().StringArrayVar(&agentCardIdentities, "identity", nil, "Required principal pattern (repeatable; optional kind prefix agent:/human:/workflow:)")
+	agentVerifyCardCmd.Flags().StringArrayVar(&agentCardIssuers, "issuer", nil, "Allowed Fulcio OIDC issuer glob (repeatable)")
+	agentVerifyCardCmd.Flags().StringArrayVar(&agentCardRoots, "root", nil, "Trust root PEM file (repeatable; default: Sigstore public Fulcio root)")
 
 	// Verify command flags
 	verifyCmd.Flags().StringVarP(&verifyPolicyPath, "policy", "p", "", "Path to .aflock policy file (enables step-based verification)")
