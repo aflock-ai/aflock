@@ -611,6 +611,12 @@ type AgentIdentityMeta struct {
 	Environment  string `json:"environment,omitempty"`
 	PolicyDigest string `json:"policy_digest,omitempty"`
 	IdentityHash string `json:"identity_hash"`
+	// ModelSource records how Model was attributed: "transcript_path" (exact,
+	// read from the hook's own transcript file), "pid_trace" (machine-global
+	// process-tree + mtime heuristic — can be wrong when multiple Claude
+	// instances run concurrently, so PostToolUse keeps re-resolving it), or
+	// "" (state written by an older aflock build).
+	ModelSource string `json:"model_source,omitempty"`
 }
 
 // PropagationRecord is written by a parent session's PreToolUse(Agent) hook
@@ -633,6 +639,13 @@ type PropagationRecord struct {
 	// over to the child so its PostToolUse attestations can stamp it into
 	// the predicate (issue #26 gap 1).
 	AttestationPrefix string `json:"attestation_prefix,omitempty"`
+	// ParentPID is the OS process ID of the Claude process that spawned the
+	// child (the writing hook's os.Getppid()). Consumers verify this PID is
+	// in their own process ancestry before claiming the record, so a
+	// concurrent, unrelated session cannot steal another parent's handoff
+	// (multi-Claude safety). Zero in records written by older aflock builds —
+	// those are accepted for backward compatibility.
+	ParentPID int `json:"parent_pid,omitempty"`
 }
 
 // IsExpiredPropagation checks if the propagation record has exceeded the given TTL.

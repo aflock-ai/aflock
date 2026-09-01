@@ -494,7 +494,7 @@ type ProcessInfo struct {
 //
 //nolint:gocognit,gocyclo // MCP socket discovery requires complex process parsing
 func DiscoverFromMCPSocket() (string, *ProcessMetadata, error) {
-	return discoverFromPID(os.Getppid(), "pid_trace", nil)
+	return discoverFromPID(os.Getppid(), DiscoveryMethodPIDTrace, nil)
 }
 
 // DiscoverFromPID discovers the agent model and collects process metadata
@@ -950,4 +950,86 @@ func getProcessEnvironmentMacOS(pid int) (map[string]string, error) {
 	}
 
 	return env, nil
+}
+
+// Discovery method markers recorded in ProcessMetadata.DiscoveryMethod and
+// surfaced as AgentIdentity.DiscoverySource.
+const (
+	// DiscoveryMethodTranscript marks model attribution read from the hook's
+	// own transcript file — exact even with concurrent Claude instances.
+	DiscoveryMethodTranscript = "transcript_path"
+	// DiscoveryMethodPIDTrace marks the machine-global process-tree + mtime
+	// heuristic — ambiguous when multiple Claude instances run concurrently.
+	DiscoveryMethodPIDTrace = "pid_trace"
+)
+
+// ProcessChain returns the chain of PIDs from startPID up toward init (max
+// 10 levels). Exported for callers that need to verify process ancestry,
+// e.g. matching a propagation record's ParentPID against the consumer's own
+// ancestors (multi-Claude safety).
+func ProcessChain(startPID int) []int {
+	return getProcessChain(startPID)
+}
+
+// DiscoverForSession resolves the model and session info for a specific hook
+// invocation using the transcript path Claude Code supplied on stdin. Unlike
+// the PID/mtime heuristics above, this is exact under concurrent Claude
+// instances: the transcript file *is* the calling session, so a neighbouring
+// session's more recently flushed transcript can never be mis-attributed.
+//
+// When the transcript has no model yet (a fresh session before the first
+// assistant turn) it falls back to the machine-global heuristic, but keeps
+// the hook's own session identity and marks the result DiscoveryMethodPIDTrace
+// so callers can re-resolve later.
+func DiscoverForSession(sessionID, transcriptPath string) (string, *ProcessMetadata, error) {
+	if transcriptPath != "" {
+		if model, err := extractModelFromSession(transcriptPath); err == nil && model != "" {
+			meta := &ProcessMetadata{
+				AflockPID:       os.Getpid(),
+				ParentPID:       os.Getppid(),
+				SessionID:       sessionID,
+				SessionPath:     transcriptPath,
+				Model:           model,
+				DiscoveryMethod: DiscoveryMethodTranscript,
+				UserID:          os.Getuid(),
+			}
+			if meta.SessionID == "" {
+				meta.SessionID = strings.TrimSuffix(filepath.Base(transcriptPath), ".jsonl")
+			}
+			meta.Hostname, _ = os.Hostname()
+			// Best-effort process chain for attestation metadata only — the
+			// model attribution above never depends on it.
+			for _, pid := range getProcessChain(os.Getppid()) {
+				cmd, cmdErr := getProcessCommand(pid)
+				if cmdErr != nil {
+					continue
+				}
+				info := ProcessInfo{PID: pid, Command: cmd}
+				if strings.Contains(cmd, "claude") && !strings.Contains(cmd, "node") {
+					info.IsClaude = true
+					if meta.ClaudePID == 0 {
+						meta.ClaudePID = pid
+					}
+				}
+				meta.ProcessChain = append(meta.ProcessChain, info)
+			}
+			return model, meta, nil
+		}
+		fmt.Fprintf(os.Stderr, "[aflock] Transcript %s has no model yet; falling back to PID heuristic (ambiguous with concurrent Claude instances)\n", transcriptPath)
+	}
+
+	// Fallback: machine-global heuristic. Keep the hook's own session
+	// identity — only the model is a hint here — and the DiscoveryMethod
+	// marker lets PostToolUse re-resolve from the transcript once the first
+	// assistant turn lands.
+	model, meta, err := DiscoverFromMCPSocket()
+	if meta != nil {
+		if sessionID != "" {
+			meta.SessionID = sessionID
+		}
+		if transcriptPath != "" {
+			meta.SessionPath = transcriptPath
+		}
+	}
+	return model, meta, err
 }

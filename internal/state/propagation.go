@@ -82,8 +82,14 @@ func (m *Manager) writePropagationRecord(parentState *aflock.SessionState, sub *
 		return fmt.Errorf("create propagation dir: %w", err)
 	}
 
+	// Housekeeping: purge long-expired records and orphaned consumption
+	// markers so the shared directory doesn't accumulate stale entries that
+	// widen the window for wrong FIFO picks.
+	m.CleanStalePropagation()
+
 	rec := aflock.PropagationRecord{
 		ParentSessionID: parentState.SessionID,
+		ParentPID:       os.Getppid(),
 		PolicyPath:      parentState.PolicyPath,
 		Materials:       parentState.Materials,
 		ParentMetrics:   parentState.Metrics,
@@ -116,17 +122,39 @@ func (m *Manager) writePropagationRecord(parentState *aflock.SessionState, sub *
 }
 
 // ReadPropagation reads and consumes a single propagation file for the
-// given policy path. Returns nil if no file exists or all that exist are
-// expired.
+// given policy path, with no ancestry filtering (any live record for the
+// policy matches). Prefer ReadPropagationForChild in hook consumers so a
+// concurrent, unrelated session cannot claim another parent's record.
+func (m *Manager) ReadPropagation(policyPath string) (*aflock.PropagationRecord, error) {
+	return m.readPropagation(policyPath, nil)
+}
+
+// ReadPropagationForChild reads and consumes a single propagation file for
+// the given policy path, but only claims records whose ParentPID appears in
+// ancestorPIDs — the consumer's own process ancestry. Records written by
+// other parents are left on disk for their rightful children, so multiple
+// concurrent Claude sessions sharing one policy path cannot steal each
+// other's handoffs (and then corrupt each other's state when SubagentStop
+// merges the wrong child into a live, unrelated parent). Records with
+// ParentPID == 0 (older aflock builds) are accepted for compatibility.
+func (m *Manager) ReadPropagationForChild(policyPath string, ancestorPIDs []int) (*aflock.PropagationRecord, error) {
+	return m.readPropagation(policyPath, ancestorPIDs)
+}
+
+// readPropagation implements ReadPropagation / ReadPropagationForChild.
+// Returns nil if no file exists or all that exist are expired or belong to
+// a different parent.
 //
 // Multi-file claim: parents may have written several files (issue #26 gap
-// 6), one per spawn. ReadPropagation enumerates all files matching the
-// policy prefix, picks the oldest first (FIFO so children consume in
-// spawn order), and atomically claims it via rename. Concurrent readers
-// racing on the same file resolve via rename's atomicity — only one wins,
-// the other tries the next file. Expired records are removed in passing so
-// stale state doesn't block fresh children indefinitely.
-func (m *Manager) ReadPropagation(policyPath string) (*aflock.PropagationRecord, error) {
+// 6), one per spawn. readPropagation enumerates all files matching the
+// policy prefix, oldest first (FIFO so children consume in spawn order),
+// reads each candidate BEFORE claiming so non-matching records can be left
+// intact for their rightful child, then atomically claims the chosen one
+// via rename. Concurrent readers racing on the same file resolve via
+// rename's atomicity — only one wins, the other tries the next file.
+// Records are write-once under unique nonce filenames, so content cannot
+// change between the read and the claim.
+func (m *Manager) readPropagation(policyPath string, ancestorPIDs []int) (*aflock.PropagationRecord, error) {
 	prefix := propagationKeyPrefix(policyPath)
 	dir := propagationBaseDir()
 
@@ -171,6 +199,33 @@ func (m *Manager) ReadPropagation(policyPath string) (*aflock.PropagationRecord,
 
 	for _, c := range candidates {
 		path := filepath.Join(dir, c.name)
+
+		data, err := os.ReadFile(path) //nolint:gosec // G304: path derived from validated entry under propagation dir
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Another reader claimed this file — try the next one.
+				continue
+			}
+			return nil, fmt.Errorf("read propagation: %w", err)
+		}
+
+		var rec aflock.PropagationRecord
+		parseErr := json.Unmarshal(data, &rec)
+		if parseErr == nil {
+			// Expired records are silently skipped — don't waste a fresh
+			// spawn on stale state. Remove best-effort and keep scanning.
+			if rec.IsExpiredPropagation(PropagationTTL) {
+				_ = os.Remove(path)
+				continue
+			}
+			// Ancestry gate (multi-Claude safety): when the consumer supplied
+			// its process chain and the record names its writer's Claude PID,
+			// only claim records written by one of our own ancestors.
+			if ancestorPIDs != nil && rec.ParentPID != 0 && !containsPID(ancestorPIDs, rec.ParentPID) {
+				continue
+			}
+		}
+
 		claimed := filepath.Join(dir, fmt.Sprintf("%s.consumed.%d.%d", c.name, os.Getpid(), time.Now().UnixNano()))
 		if err := os.Rename(path, claimed); err != nil {
 			if os.IsNotExist(err) {
@@ -179,30 +234,25 @@ func (m *Manager) ReadPropagation(policyPath string) (*aflock.PropagationRecord,
 			}
 			return nil, fmt.Errorf("claim propagation: %w", err)
 		}
-
-		data, err := os.ReadFile(claimed) //nolint:gosec // G304: path derived from validated entry under propagation dir
-		if err != nil {
-			_ = os.Remove(claimed)
-			return nil, fmt.Errorf("read propagation: %w", err)
-		}
-
-		var rec aflock.PropagationRecord
-		if err := json.Unmarshal(data, &rec); err != nil {
-			_ = os.Remove(claimed)
-			return nil, fmt.Errorf("parse propagation: %w", err)
-		}
-
 		_ = os.Remove(claimed)
 
-		// Expired records are silently skipped — don't waste a fresh spawn
-		// on stale state. Continue scanning for a live one.
-		if rec.IsExpiredPropagation(PropagationTTL) {
-			continue
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse propagation: %w", parseErr)
 		}
 		return &rec, nil
 	}
 
 	return nil, nil
+}
+
+// containsPID reports whether pid appears in pids.
+func containsPID(pids []int, pid int) bool {
+	for _, p := range pids {
+		if p == pid {
+			return true
+		}
+	}
+	return false
 }
 
 // containsConsumedMarker reports whether the filename has the ".consumed."
