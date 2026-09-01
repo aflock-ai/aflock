@@ -541,6 +541,22 @@ func (h *Handler) handlePreToolUse(input *aflock.HookInput) error {
 		}
 	}
 
+	// If tool is allowed, gate agent-to-agent connections (policy.agents):
+	// verify the pinned signed AgentCard for the endpoint and match its
+	// signing principal against the allow/deny patterns. Verified peers are
+	// recorded as materials so the session carries a receipt of who was
+	// contacted.
+	if decision == aflock.DecisionAllow && pol.Agents != nil {
+		agentDecision, agentReason, peerMaterial := evaluator.EvaluateAgentConnection(input.ToolName, input.ToolInput)
+		if agentDecision != aflock.DecisionAllow {
+			decision = agentDecision
+			reason = agentReason
+		} else if peerMaterial != nil {
+			peerMaterial.Timestamp = time.Now()
+			sessionState.Materials = append(sessionState.Materials, *peerMaterial)
+		}
+	}
+
 	// If tool is allowed, also check data flow rules
 	if decision == aflock.DecisionAllow {
 		flowDecision, flowReason, newMaterial := evaluator.EvaluateDataFlow(

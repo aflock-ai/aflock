@@ -30,6 +30,10 @@ type Evaluator struct {
 	matcher      *Matcher
 	bashAnalyzer *BashAnalyzer
 	projectRoot  string // absolute path to project root (where .aflock lives)
+
+	// a2aState lazily caches verified AgentCards + trust roots for the
+	// agents gate (see agents.go).
+	a2aState *agentGateState
 }
 
 // NewEvaluator creates a new policy evaluator.
