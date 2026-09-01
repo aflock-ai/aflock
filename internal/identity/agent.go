@@ -58,6 +58,11 @@ type AgentIdentity struct {
 	// IdentityHash is the computed transitive identity hash
 	IdentityHash string `json:"identityHash,omitempty"`
 
+	// DiscoverySource records which mechanism attributed the Model (see the
+	// DiscoveryMethod* constants). Metadata only — not part of the identity
+	// hash derivation.
+	DiscoverySource string `json:"discoverySource,omitempty"`
+
 	// SPIFFEID is the SPIFFE ID derived from this identity
 	SPIFFEID spiffeid.ID `json:"-"`
 
@@ -228,6 +233,18 @@ func DiscoverAgentIdentity() (*AgentIdentity, error) {
 	return discoverAgentIdentity(DiscoverFromMCPSocket, nil)
 }
 
+// DiscoverAgentIdentityForSession discovers the agent identity for a
+// specific hook invocation, preferring the transcript path Claude Code
+// supplied in the hook input over the machine-global "most recently
+// modified session file" heuristic. With multiple Claude instances running
+// concurrently the heuristic frequently attributes another session's model;
+// the transcript path is exact — it is the calling session's own file.
+func DiscoverAgentIdentityForSession(sessionID, transcriptPath string) (*AgentIdentity, error) {
+	return discoverAgentIdentity(func() (string, *ProcessMetadata, error) {
+		return DiscoverForSession(sessionID, transcriptPath)
+	}, nil)
+}
+
 // DiscoverAgentIdentityFromPID discovers the agent identity starting from a
 // kernel-attested peer PID (e.g. obtained via SO_PEERCRED on Linux or
 // LOCAL_PEERPID on macOS for an accepted UDS connection).
@@ -277,6 +294,7 @@ func discoverAgentIdentity(discover func() (string, *ProcessMetadata, error), pe
 		identity.SessionPath = meta.SessionPath
 		identity.ClaudePID = meta.ClaudePID
 		identity.ProcessChain = meta.ProcessChain
+		identity.DiscoverySource = meta.DiscoveryMethod
 	}
 
 	identity.ModelVersion = parseModelVersion(identity.Model)

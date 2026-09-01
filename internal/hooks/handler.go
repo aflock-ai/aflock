@@ -131,7 +131,7 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	// Discover agent identity. If the policy has identity constraints
 	// (AllowedModels), a discovery failure must block the session — otherwise
 	// the constraint is silently bypassed (issue #60 / H7).
-	agentIdentity, err := identity.DiscoverAgentIdentity()
+	agentIdentity, err := identity.DiscoverAgentIdentityForSession(input.SessionID, input.TranscriptPath)
 	if err != nil {
 		if pol != nil && pol.Identity != nil && len(pol.Identity.AllowedModels) > 0 {
 			output.ExitWithError(fmt.Sprintf("[aflock] Identity discovery failed and policy requires allowedModels: %v", err))
@@ -165,6 +165,7 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 		ModelVersion: agentIdentity.ModelVersion,
 		IdentityHash: agentIdentity.IdentityHash,
 		PolicyDigest: agentIdentity.PolicyDigest,
+		ModelSource:  agentIdentity.DiscoverySource,
 		Environment: func() string {
 			if agentIdentity.Environment != nil {
 				return agentIdentity.Environment.Type
@@ -179,8 +180,12 @@ func (h *Handler) handleSessionStart(input *aflock.HookInput) error {
 	}
 
 	// Check for propagation from a parent session (sublayout delegation).
-	// If found, inherit materials and attenuate limits.
-	if prop, propErr := h.stateManager.ReadPropagation(policyPath); propErr != nil {
+	// If found, inherit materials and attenuate limits. Only records written
+	// by one of this process's own ancestors are consumed — with several
+	// Claude instances running concurrently, an unrelated session's
+	// SessionStart must not steal another parent's handoff (which would also
+	// corrupt that parent's state when SubagentStop merges the wrong child).
+	if prop, propErr := h.stateManager.ReadPropagationForChild(policyPath, identity.ProcessChain(os.Getppid())); propErr != nil {
 		fmt.Fprintf(os.Stderr, "[aflock] Warning: failed to read propagation: %v\n", propErr)
 	} else if prop != nil {
 		sessionState.ParentSessionID = prop.ParentSessionID
@@ -683,8 +688,13 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 	// If the saved model is "unknown", try re-discovering — SessionStart may
 	// have failed to find the model (e.g., new project with no session files)
 	// but PostToolUse might succeed if Claude session files now exist.
+	// Likewise when the model was attributed by the machine-global PID/mtime
+	// heuristic (ModelSource == pid_trace): with concurrent Claude instances
+	// that guess can be wrong, so keep re-resolving from this session's own
+	// transcript until exact attribution lands.
 	var agentIdentity *identity.AgentIdentity
-	if meta := sessionState.AgentIdentityMeta; meta != nil && meta.Model != "" && meta.Model != "unknown" {
+	if meta := sessionState.AgentIdentityMeta; meta != nil && meta.Model != "" && meta.Model != "unknown" &&
+		meta.ModelSource != identity.DiscoveryMethodPIDTrace {
 		agentIdentity = &identity.AgentIdentity{
 			Model:        meta.Model,
 			ModelVersion: meta.ModelVersion,
@@ -704,17 +714,22 @@ func (h *Handler) createAttestation(sessionState *aflock.SessionState, input *af
 			}
 		}
 	} else {
-		// Saved identity has unknown model — try fresh discovery
-		agentIdentity, _ = identity.DiscoverAgentIdentity()
+		// Saved identity is unknown or heuristically attributed — try fresh
+		// discovery scoped to this session's own transcript.
+		agentIdentity, _ = identity.DiscoverAgentIdentityForSession(input.SessionID, input.TranscriptPath)
 
 		// Persist re-discovered identity back to session state so state.json
 		// stays consistent with attestations (fixes "unknown" model lingering).
-		if agentIdentity != nil && agentIdentity.Model != "" && agentIdentity.Model != "unknown" {
+		if agentIdentity != nil && agentIdentity.Model != "" && agentIdentity.Model != "unknown" &&
+			(sessionState.AgentIdentityMeta == nil ||
+				sessionState.AgentIdentityMeta.Model != agentIdentity.Model ||
+				sessionState.AgentIdentityMeta.ModelSource != agentIdentity.DiscoverySource) {
 			sessionState.AgentIdentityMeta = &aflock.AgentIdentityMeta{
 				Model:        agentIdentity.Model,
 				ModelVersion: agentIdentity.ModelVersion,
 				IdentityHash: agentIdentity.IdentityHash,
 				PolicyDigest: agentIdentity.PolicyDigest,
+				ModelSource:  agentIdentity.DiscoverySource,
 				Environment: func() string {
 					if agentIdentity.Environment != nil {
 						return agentIdentity.Environment.Type
