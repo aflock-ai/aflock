@@ -14,6 +14,7 @@ import (
 	"github.com/aflock-ai/aflock/internal/plan"
 	"github.com/aflock-ai/aflock/internal/policy"
 	"github.com/aflock-ai/aflock/internal/replay"
+	"github.com/aflock-ai/aflock/internal/sandbox"
 	"github.com/aflock-ai/aflock/internal/verify"
 	"github.com/aflock-ai/aflock/pkg/aflock"
 )
@@ -315,6 +316,71 @@ stdout on success.`,
 			os.Exit(1)
 		}
 		fmt.Println(string(out))
+	},
+}
+
+// exec command flags
+var (
+	execPolicyPath string
+	execStrict     bool
+)
+
+var execCmd = &cobra.Command{
+	Use:   "exec [flags] -- <command> [args...]",
+	Short: "Run an agent under a kernel-enforced sandbox derived from the policy",
+	Long: `Launch an agent (e.g. claude) inside a kernel sandbox derived from the
+.aflock policy. Kernel sandboxes are inherited by EVERY descendant process
+and cannot be dropped or widened by children — a subagent five levels deep
+is exactly as constrained as the agent itself (issue #100).
+
+What is enforced:
+  - the policy file, its signed variant, aflock-trust.json, and pinned
+    AgentCards are write-protected for the whole process tree;
+  - on macOS (Seatbelt), files.deny globs are also unreadable at any depth;
+  - on Linux (Landlock, kernel 5.13+), write access is granted only to the
+    files.allow prefixes plus runtime dirs (state, transcripts, tmp).
+
+This complements hook enforcement — hooks still see, decide, and attest
+every tool call; the kernel guarantees what the hooks never saw also could
+not touch the protected surface.`,
+	Args: cobra.MinimumNArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		searchPath := execPolicyPath
+		if searchPath == "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Getwd: %v\n", err)
+				os.Exit(1)
+			}
+			searchPath = cwd
+		}
+		pol, policyPath, err := policy.Load(searchPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Load policy: %v\n", err)
+			os.Exit(1)
+		}
+		plan, err := sandbox.BuildPlan(pol, policyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Build sandbox plan: %v\n", err)
+			os.Exit(1)
+		}
+		plan.Strict = execStrict
+		if !sandbox.Available() {
+			if execStrict {
+				fmt.Fprintf(os.Stderr, "[aflock] Kernel sandbox unavailable and --strict set — refusing to launch\n")
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "[aflock] Warning: kernel sandbox unavailable on this platform — launching without it\n")
+		}
+		fmt.Fprintf(os.Stderr, "[aflock] Kernel sandbox: %d protected file(s), %d deny glob(s)\n",
+			len(plan.ProtectedFiles), len(plan.DenyReadGlobs))
+		for _, note := range sandbox.GapNotes(plan) {
+			fmt.Fprintf(os.Stderr, "[aflock] Sandbox gap: %s\n", note)
+		}
+		if err := sandbox.Exec(plan, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Exec under sandbox: %v\n", err)
+			os.Exit(1)
+		}
 	},
 }
 
@@ -620,9 +686,14 @@ func init() {
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(planToPolicyCmd)
 	rootCmd.AddCommand(replayCmd)
+	rootCmd.AddCommand(execCmd)
 
 	// Add --hook flag as alternative to hook subcommand for backwards compatibility
 	rootCmd.Flags().StringVar(&hookFlag, "hook", "", "Hook event to handle (alternative to 'hook' subcommand)")
+
+	// Exec command flags
+	execCmd.Flags().StringVarP(&execPolicyPath, "policy", "p", "", "Path to .aflock policy (default: discover from cwd)")
+	execCmd.Flags().BoolVar(&execStrict, "strict", false, "Fail instead of degrading when the kernel sandbox is unavailable")
 
 	// Verify command flags
 	verifyCmd.Flags().StringVarP(&verifyPolicyPath, "policy", "p", "", "Path to .aflock policy file (enables step-based verification)")
